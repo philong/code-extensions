@@ -871,7 +871,7 @@ def handle_config(args, config):
 
         target_type, ext_id, prop = parse_config_key(args.key)
         if target_type == "global":
-            val = config.get(ext_id)
+            val = config.get(ext_id.replace("-", "_"))
             if val is not None:
                 print(val)
             else:
@@ -882,7 +882,7 @@ def handle_config(args, config):
                 sys.exit(1)
         else:
             exts = config.get("extensions", {})
-            val = exts.get(ext_id, {}).get(prop)
+            val = exts.get(ext_id.lower(), {}).get(prop.replace("-", "_"))
             if val is not None:
                 print(val)
             else:
@@ -1002,6 +1002,17 @@ def get_vsix_download_url(
     if platform and platform != "universal":
         url += f"?targetPlatform={platform}"
     return url
+
+
+def resolve_update_url(update, service_url):
+    return update.get("eligible_download_url") or get_vsix_download_url(
+        {},
+        update["publisher"],
+        update["name"],
+        update["eligible"],
+        update["eligible_platform"],
+        service_url,
+    )
 
 
 def vsix_filename(pub_name, ext_name, version, platform):
@@ -1985,7 +1996,7 @@ def print_updates_table(updates):
         )
 
 
-def select_updates(updates):
+def select_updates(updates, action_label="Install"):
     if not HAS_TTY or not sys.stdin.isatty() or not sys.stdout.isatty():
         return updates
 
@@ -2027,7 +2038,7 @@ def select_updates(updates):
                         ("Space", "Toggle", Colors.CYAN),
                         ("a", "Toggle All", Colors.CYAN),
                         ("↑/↓", "Move", Colors.CYAN),
-                        ("Enter", "Install", Colors.GREEN),
+                        ("Enter", action_label, Colors.GREEN),
                         ("q/Esc", "Exit", Colors.RED),
                     ]
                 )
@@ -2180,6 +2191,7 @@ def handle_update(args, config):
         args.no_code_version_check, config, "no_code_version_check", False
     )
     yes = resolve_option(args.yes, config, "yes", False)
+    dry_run = bool(getattr(args, "dry_run", None))
     min_release_age_str = resolve_option(
         args.min_release_age, config, "min_release_age", "24h"
     )
@@ -2251,23 +2263,44 @@ def handle_update(args, config):
             return
         selected_updates = eligible_updates
     elif HAS_TTY and sys.stdin.isatty() and sys.stdout.isatty():
-        selected_updates = select_updates(updates)
+        selected_updates = select_updates(
+            updates, action_label="Dry Run" if dry_run else "Install"
+        )
         if not selected_updates:
-            print("No updates selected for installation.")
+            print(
+                "No updates selected for dry run."
+                if dry_run
+                else "No updates selected for installation."
+            )
             return
     else:
         print(f"{Colors.GREEN}{Colors.BOLD}Updates available:{Colors.ENDC}")
         print_updates_table(updates)
         selected_updates = [u for u in updates if u["eligible"]]
 
+    if dry_run:
+        print()
+        print(
+            f"{Colors.YELLOW}{Colors.BOLD}[Dry-run] Would update {len(selected_updates)} extension(s):{Colors.ENDC}"
+        )
+        for update in selected_updates:
+            version = update["eligible"]
+            platform = update["eligible_platform"]
+            print(
+                f"  {Colors.CYAN}{update['id']}{Colors.ENDC}: {Colors.YELLOW}{update['installed']}{Colors.ENDC} -> {Colors.GREEN}{version}{Colors.ENDC} ({platform})"
+            )
+            print(f"    Download URL: {resolve_update_url(update, service_url)}")
+        print(
+            f"\n{Colors.YELLOW}[Dry-run] No extensions were downloaded or installed.{Colors.ENDC}"
+        )
+        return
+
     for update in selected_updates:
         pub_name = update["publisher"]
         ext_name = update["name"]
         version = update["eligible"]
         platform = update["eligible_platform"]
-        url = update.get("eligible_download_url") or get_vsix_download_url(
-            {}, pub_name, ext_name, version, platform, service_url
-        )
+        url = resolve_update_url(update, service_url)
         filepath = os.path.join(
             download_dir_resolved, vsix_filename(pub_name, ext_name, version, platform)
         )
@@ -3107,20 +3140,16 @@ complete -c code-extensions -n "__fish_seen_subcommand_from config" -a "list get
 complete -c code-extensions -n "__fish_seen_subcommand_from completion" -a "bash zsh fish powershell"
 
 complete -c code-extensions -n "__fish_seen_subcommand_from install" -s f -l file -d "File containing extension IDs" -r -F
-complete -c code-extensions -n "__fish_seen_subcommand_from install" -s p -l include-prerelease -d "Allow pre-release versions"
-complete -c code-extensions -n "__fish_seen_subcommand_from install" -s n -l no-code-version-check -d "Disable VS Code version check"
-complete -c code-extensions -n "__fish_seen_subcommand_from install" -s d -l download-dir -d "Download directory for VSIX files" -r -F
-complete -c code-extensions -n "__fish_seen_subcommand_from install" -s y -l yes -d "Non-interactive mode"
-complete -c code-extensions -n "__fish_seen_subcommand_from install" -s a -l min-release-age -d "Minimum release age threshold" -r
+complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade search" -s p -l include-prerelease -d "Allow pre-release versions"
+complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade search" -s V -l no-code-version-check -d "Disable VS Code version check"
+complete -c code-extensions -n "__fish_seen_subcommand_from update upgrade" -s n -l dry-run -d "Perform dry run without downloading or installing"
+complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade" -s d -l download-dir -d "Download directory for VSIX files" -r -F
+complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade" -s y -l yes -d "Non-interactive mode"
+complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade search" -s a -l min-release-age -d "Minimum release age threshold" -r
 complete -c code-extensions -n "__fish_seen_subcommand_from install" -l force -d "Force re-installation"
-
-complete -c code-extensions -n "__fish_seen_subcommand_from list ls" -s q -l quiet -d "Output raw extension IDs only"
-complete -c code-extensions -n "__fish_seen_subcommand_from list ls" -s u -l outdated -d "List extensions with updates available"
-
 complete -c code-extensions -n "__fish_seen_subcommand_from search" -s n -l max-results -d "Maximum search results" -r
-complete -c code-extensions -n "__fish_seen_subcommand_from search" -s q -l quiet -d "Output raw extension IDs only"
-complete -c code-extensions -n "__fish_seen_subcommand_from search" -s p -l include-prerelease -d "Allow pre-release versions"
-complete -c code-extensions -n "__fish_seen_subcommand_from search" -s a -l min-release-age -d "Minimum release age threshold" -r
+complete -c code-extensions -n "__fish_seen_subcommand_from list ls search" -s q -l quiet -d "Output raw extension IDs only"
+complete -c code-extensions -n "__fish_seen_subcommand_from list ls" -s u -l outdated -d "List extensions with updates available"
 
 complete -c code-extensions -n "__fish_seen_subcommand_from remove uninstall rm info show update upgrade" -a "(code-extensions list -q 2>/dev/null)"
 """
@@ -3166,11 +3195,11 @@ _code_extensions_completion() {
             fi
             ;;
         install)
-            COMPREPLY=( $(compgen -W "-f --file -p --include-prerelease -n --no-code-version-check -d --download-dir -y --yes -a --min-release-age --force -h --help" -- "$cur") )
+            COMPREPLY=( $(compgen -W "-f --file -p --include-prerelease -V --no-code-version-check -d --download-dir -y --yes -a --min-release-age --force -h --help" -- "$cur") )
             ;;
         update|upgrade)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-p --include-prerelease -n --no-code-version-check -d --download-dir -y --yes -a --min-release-age -h --help" -- "$cur") )
+                COMPREPLY=( $(compgen -W "-p --include-prerelease -n --dry-run -V --no-code-version-check -d --download-dir -y --yes -a --min-release-age -h --help" -- "$cur") )
             else
                 local installed
                 installed=$(code-extensions list -q 2>/dev/null)
@@ -3181,7 +3210,7 @@ _code_extensions_completion() {
             COMPREPLY=( $(compgen -W "-q --quiet -u --outdated -h --help" -- "$cur") )
             ;;
         search)
-            COMPREPLY=( $(compgen -W "-n --max-results -q --quiet -p --include-prerelease -a --min-release-age -h --help" -- "$cur") )
+            COMPREPLY=( $(compgen -W "-n --max-results -q --quiet -p --include-prerelease -V --no-code-version-check -a --min-release-age -h --help" -- "$cur") )
             ;;
         *)
             COMPREPLY=( $(compgen -W "-b --code-binary -s --service-url --open-vsx -h --help" -- "$cur") )
@@ -3239,16 +3268,28 @@ _code_extensions() {
                 completion)
                     _values 'shell' $shells
                     ;;
-                remove|uninstall|rm|info|show|update|upgrade)
+                remove|uninstall|rm|info|show)
                     local -a installed
                     installed=($(code-extensions list -q 2>/dev/null))
                     _values 'installed extensions' $installed
+                    ;;
+                update|upgrade)
+                    local -a installed
+                    installed=($(code-extensions list -q 2>/dev/null))
+                    _arguments \\
+                        '(-p --include-prerelease)'{-p,--include-prerelease}'[Allow pre-release versions]' \\
+                        '(-n --dry-run)'{-n,--dry-run}'[Perform dry run without downloading or installing]' \\
+                        '(-V --no-code-version-check)'{-V,--no-code-version-check}'[Disable VS Code version check]' \\
+                        '(-d --download-dir)'{-d,--download-dir}'[Download directory]:dir:_files -/' \\
+                        '(-y --yes)'{-y,--yes}'[Non-interactive mode]' \\
+                        '(-a --min-release-age)'{-a,--min-release-age}'[Minimum release age threshold]:age:' \\
+                        '*:installed extension:($installed)'
                     ;;
                 install)
                     _arguments \\
                         '(-f --file)'{-f,--file}'[File containing extension IDs]:file:_files' \\
                         '(-p --include-prerelease)'{-p,--include-prerelease}'[Allow pre-release versions]' \\
-                        '(-n --no-code-version-check)'{-n,--no-code-version-check}'[Disable VS Code version check]' \\
+                        '(-V --no-code-version-check)'{-V,--no-code-version-check}'[Disable VS Code version check]' \\
                         '(-d --download-dir)'{-d,--download-dir}'[Download directory]:dir:_files -/' \\
                         '(-y --yes)'{-y,--yes}'[Non-interactive mode]' \\
                         '(-a --min-release-age)'{-a,--min-release-age}'[Minimum release age threshold]:age:' \\
@@ -3264,6 +3305,7 @@ _code_extensions() {
                         '(-n --max-results)'{-n,--max-results}'[Maximum search results]:number:' \\
                         '(-q --quiet)'{-q,--quiet}'[Output raw extension IDs only]' \\
                         '(-p --include-prerelease)'{-p,--include-prerelease}'[Allow pre-release versions]' \\
+                        '(-V --no-code-version-check)'{-V,--no-code-version-check}'[Disable VS Code version check]' \\
                         '(-a --min-release-age)'{-a,--min-release-age}'[Minimum release age threshold]:age:'
                     ;;
             esac
@@ -3398,7 +3440,7 @@ def main():
         help="Allow pre-release versions",
     )
     parser_install.add_argument(
-        "-n",
+        "-V",
         "--no-code-version-check",
         action="store_true",
         default=None,
@@ -3451,7 +3493,15 @@ def main():
     )
     parser_update.add_argument(
         "-n",
+        "--dry-run",
+        action="store_true",
+        default=None,
+        help="Perform a dry run (show available updates without downloading or installing)",
+    )
+    parser_update.add_argument(
+        "-V",
         "--no-code-version-check",
+        dest="no_code_version_check",
         action="store_true",
         default=None,
         help="Disable VS Code version compatibility check",
@@ -3557,6 +3607,7 @@ def main():
         help="Allow pre-release versions",
     )
     parser_search.add_argument(
+        "-V",
         "--no-code-version-check",
         dest="no_code_version_check",
         action="store_true",

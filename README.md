@@ -58,7 +58,7 @@ code-extensions install [extension-id...] [options]
 **Options**:
 * `-f`, `--file <path>`: Text file containing extension IDs to install (one per line).
 * `-p`, `--include-prerelease`: Allow pre-release versions.
-* `-n`, `--no-code-version-check`: Disable VS Code host compatibility check.
+* `-V`, `--no-code-version-check`: Disable VS Code host compatibility check.
 * `-d`, `--download-dir <path>`: Directory for downloading `.vsix` files.
 * `-y`, `--yes`: Non-interactive mode.
 * `-a`, `--min-release-age <age>`: Minimum release age threshold (e.g. `24h`, `3d`, `0`).
@@ -75,7 +75,8 @@ code-extensions update [extensions...] [options]
 
 **Options**:
 * `-p`, `--include-prerelease`: Include pre-release versions in update check.
-* `-n`, `--no-code-version-check`: Disable VS Code host compatibility check.
+* `-n`, `--dry-run`: Perform a dry run (show available updates without downloading or installing).
+* `-V`, `--no-code-version-check`: Disable VS Code host compatibility check.
 * `-d`, `--download-dir <path>`: Download directory for `.vsix` files.
 * `-y`, `--yes`: Non-interactive auto-update.
 * `-a`, `--min-release-age <age>`: Minimum release age threshold (e.g. `24h`, `3d`, `0`).
@@ -105,6 +106,7 @@ code-extensions search <query> [options]
 * `-n`, `--max-results <N>`: Maximum number of search results (default: `15`).
 * `-q`, `--quiet`: Output raw extension IDs only (one per line, ideal for piping).
 * `-p`, `--include-prerelease`: Include pre-release versions.
+* `-V`, `--no-code-version-check`: Disable VS Code host compatibility check.
 * `-a`, `--min-release-age <age>`: Minimum release age threshold.
 
 ### 5. `info` / `show` Command
