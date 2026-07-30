@@ -751,12 +751,33 @@ def dump_toml(data):
     return "\n".join(lines).strip() + "\n"
 
 
+def restrict_to_owner(path, mode):
+    # POSIX modes are meaningless on Windows, where os.chmod only toggles the
+    # read-only attribute; skip it there instead of risking a read-only config.
+    if os.name == "nt":
+        return
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
 def save_config(config, config_path):
     dir_path = os.path.dirname(config_path)
     if dir_path:
-        os.makedirs(dir_path, mode=0o755, exist_ok=True)
+        existed = os.path.isdir(dir_path)
+        os.makedirs(dir_path, mode=0o700, exist_ok=True)
+        # makedirs ignores mode for a directory that already exists, so tighten
+        # explicitly - but only our own config dir, never an arbitrary working
+        # directory that happens to hold a config.toml.
+        if not existed or os.path.basename(dir_path) == "code-extensions":
+            restrict_to_owner(dir_path, 0o700)
     content = dump_toml(config)
-    with open(config_path, "w", encoding="utf-8") as f:
+    # The config can hold an API token, so restrict an existing file before
+    # writing and create a new one already restricted, never widening either.
+    restrict_to_owner(config_path, 0o600)
+    fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(content)
 
 
