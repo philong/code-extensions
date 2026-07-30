@@ -183,7 +183,7 @@ code-extensions remove [extension-id...] [options]
 
 ## Configuration File
 
-Set defaults and per-extension rules in `~/.config/code-extensions/config.toml`:
+Set defaults and per-extension rules in `~/.config/code-extensions/config.toml` (or `$XDG_CONFIG_HOME/code-extensions/config.toml` when that variable is set). A `config.toml` in the current working directory takes precedence over both:
 
 ```toml
 min-release-age = "12h"        # Default release age buffer (e.g., 24h, 3d, 0)

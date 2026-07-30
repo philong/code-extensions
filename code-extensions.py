@@ -692,7 +692,8 @@ def resolve_service_url(args, config):
 def get_default_config_path():
     if os.path.exists("./config.toml"):
         return os.path.abspath("./config.toml")
-    user_config_dir = os.path.expanduser("~/.config/code-extensions")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    user_config_dir = os.path.join(base, "code-extensions")
     return os.path.join(user_config_dir, "config.toml")
 
 
