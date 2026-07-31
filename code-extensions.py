@@ -2114,7 +2114,7 @@ def select_updates(updates, action_label="Install"):
             sys.stdout.flush()
 
             key = get_key()
-            if key in ("ctrl+c", "esc"):
+            if key in ("ctrl+c", "esc", "q", "Q"):
                 raise KeyboardInterrupt
             elif key == "up":
                 cursor_idx = (cursor_idx - 1) % n
@@ -2448,7 +2448,7 @@ def select_removals(installed_exts):
             sys.stdout.flush()
 
             key = get_key()
-            if key in ("ctrl+c", "esc"):
+            if key in ("ctrl+c", "esc", "q", "Q"):
                 raise KeyboardInterrupt
             elif key == "up":
                 cursor_idx = (cursor_idx - 1) % n
