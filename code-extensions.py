@@ -4005,7 +4005,7 @@ def main():
     )
 
     # Clean sub-parser
-    parser_clean = subparsers.add_parser(
+    subparsers.add_parser(
         "clean",
         parents=[parent_parser],
         help="Purge cached API response JSON files and temporary VSIX downloads",
