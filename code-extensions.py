@@ -2403,83 +2403,66 @@ def print_updates_table(updates):
         )
 
 
-def select_updates(updates, action_label="Install"):
-    if not HAS_TTY or not sys.stdin.isatty() or not sys.stdout.isatty():
-        return updates
+def run_list_picker(
+    count,
+    layout,
+    header,
+    row,
+    actions,
+    unit_label,
+    selected=None,
+    cursor_idx=0,
+    toggle_all=None,
+    extra_keys=(),
+):
+    """Drive a scrollable checkbox list until the user commits or leaves.
 
-    n = len(updates)
-    selected = [bool(u["eligible"]) for u in updates]
-    cursor_idx = 0
+    Shared by the update, removal and search screens, which differ only in their
+    columns, action bar and what a commit means. layout(cols) returns the column
+    widths for the current terminal plus the total row width; header and row
+    render with those widths. Returns (action, selected, cursor_idx) where action
+    is "confirm", "quit", or whichever of extra_keys was pressed, so the caller
+    can act and, if it wants, resume with the same selection.
+    """
+    if count <= 0:
+        # Nothing to show. The window height is clamped to at least one row, so
+        # rendering would index an empty list and the cursor arithmetic would
+        # divide by zero.
+        return "quit", [], 0
+
+    if selected is None:
+        selected = [False] * count
     top = 0
-
-    W_VER, W_DATE, W_PLAT = 12, 12, 12
-    OVERHEAD = 6 + 1 + (W_VER + 1) * 3 + (W_DATE + 1) + W_PLAT + 1
-
-    def visual_len(s):
-        return display_width(s)
-
     first_frame = True
     prev_lines = 0
 
     sys.stdout.write("\033[?25l")
     sys.stdout.flush()
-
     try:
         while True:
             cols, rows = shutil.get_terminal_size((80, 24))
-            id_w = max(12, cols - OVERHEAD)
-            row_width = OVERHEAD + id_w
+            widths, row_width = layout(cols)
             lines_per_row = max(1, -(-row_width // cols))
-            win = max(1, min(n, (rows - 5) // lines_per_row))
+            win = max(1, min(count, (rows - 5) // lines_per_row))
 
             if cursor_idx < top:
                 top = cursor_idx
             elif cursor_idx >= top + win:
                 top = cursor_idx - win + 1
-            top = max(0, min(top, max(0, n - win)))
+            top = max(0, min(top, max(0, count - win)))
 
-            out = []
-            out.append(
-                format_action_bar(
-                    [
-                        ("Space", "Toggle", Colors.CYAN),
-                        ("a", "Toggle All", Colors.CYAN),
-                        ("↑/↓", "Move", Colors.CYAN),
-                        ("Enter", action_label, Colors.GREEN),
-                        ("q/Esc", "Exit", Colors.RED),
-                    ]
-                )
-            )
-            out.append(
-                f"{Colors.BOLD}{'':6}{fit_column('Extension ID', id_w)} {fit_column('Installed', W_VER)} "
-                f"{fit_column('Eligible', W_VER)} {fit_column('Latest', W_VER)} {fit_column('Release', W_DATE)} {fit_column('Platform', W_PLAT)}{Colors.ENDC}"
-            )
-            out.append("-" * min(cols, row_width))
-
+            out = [
+                format_action_bar(actions),
+                header(widths),
+                "-" * min(cols, row_width),
+            ]
             for i in range(top, top + win):
-                update = updates[i]
-                prefix = ">" if i == cursor_idx else " "
-                if update["eligible"]:
-                    mark = f"{Colors.GREEN}x{Colors.ENDC}" if selected[i] else " "
-                    eligible_str = f"{Colors.GREEN}{fit_column(update['eligible'], W_VER)}{Colors.ENDC}"
-                else:
-                    mark = f"{Colors.YELLOW}!{Colors.ENDC}" if selected[i] else " "
-                    eligible_str = (
-                        f"{Colors.YELLOW}{fit_column('held back', W_VER)}{Colors.ENDC}"
-                    )
-                out.append(
-                    f"{prefix} [{mark}] {Colors.CYAN}{fit_column(update['id'], id_w)}{Colors.ENDC} "
-                    f"{Colors.YELLOW}{fit_column(update['installed'], W_VER)}{Colors.ENDC} "
-                    f"{eligible_str} "
-                    f"{Colors.BLUE}{fit_column(update['latest'], W_VER)}{Colors.ENDC} "
-                    f"{fit_column(update['latest_release_date'], W_DATE)} "
-                    f"{fit_column(update['eligible_platform'] or update['latest_platform'], W_PLAT)}"
-                )
+                out.append(row(i, widths, i == cursor_idx, selected[i]))
 
             status = (
-                f"[{top + 1}-{top + win}/{n}]  (scroll with ↑/↓)"
-                if win < n
-                else f"[{n} update{'s' if n != 1 else ''}]"
+                f"[{top + 1}-{top + win}/{count}]  (scroll with \u2191/\u2193)"
+                if win < count
+                else f"[{count} {unit_label}{'s' if count != 1 else ''}]"
             )
             out.append(f"{Colors.BOLD}{status}{Colors.ENDC}")
 
@@ -2492,52 +2475,112 @@ def select_updates(updates, action_label="Install"):
             else:
                 first_frame = False
 
-            total_lines = sum(max(1, -(-visual_len(line) // cols)) for line in out)
-            prev_lines = total_lines
+            prev_lines = sum(max(1, -(-display_width(line) // cols)) for line in out)
 
             sys.stdout.write("\n".join(out))
             sys.stdout.flush()
 
             key = get_key()
+            if key in extra_keys:
+                return key, selected, cursor_idx
             # None means stdin gave EOF (terminal went away); treat it as cancel
             # rather than looping on a dead descriptor.
             if key is None or key in ("ctrl+c", "esc", "q", "Q"):
-                raise KeyboardInterrupt
+                return "quit", selected, cursor_idx
             elif key == "up":
-                cursor_idx = (cursor_idx - 1) % n
+                cursor_idx = (cursor_idx - 1) % count
             elif key == "down":
-                cursor_idx = (cursor_idx + 1) % n
+                cursor_idx = (cursor_idx + 1) % count
             elif key == "space":
                 selected[cursor_idx] = not selected[cursor_idx]
             elif key in ("a", "A"):
-                selected = (
-                    [False] * n
-                    if any(selected)
-                    else [bool(u["eligible"]) for u in updates]
-                )
+                if any(selected):
+                    selected = [False] * count
+                else:
+                    selected = toggle_all() if toggle_all else [True] * count
             elif key == "enter":
-                break
-
+                return "confirm", selected, cursor_idx
+    finally:
         sys.stdout.write("\n\033[?25h")
         sys.stdout.flush()
 
-        chosen = []
-        for i in range(n):
-            if selected[i]:
-                update = updates[i]
-                if not update["eligible"]:
-                    update["eligible"] = update["latest"]
-                    update["eligible_platform"] = update["latest_platform"]
-                    update["eligible_release_date"] = update["latest_release_date"]
-                    update["eligible_download_url"] = update.get("latest_download_url")
-                chosen.append(update)
-        return chosen
 
+def select_updates(updates, action_label="Install"):
+    if not HAS_TTY or not sys.stdin.isatty() or not sys.stdout.isatty():
+        return updates
+
+    n = len(updates)
+    W_VER, W_DATE, W_PLAT = 12, 12, 12
+    OVERHEAD = 6 + 1 + (W_VER + 1) * 3 + (W_DATE + 1) + W_PLAT + 1
+
+    def layout(cols):
+        id_w = max(12, cols - OVERHEAD)
+        return {"id": id_w}, OVERHEAD + id_w
+
+    def header(widths):
+        return (
+            f"{Colors.BOLD}{'':6}{fit_column('Extension ID', widths['id'])} {fit_column('Installed', W_VER)} "
+            f"{fit_column('Eligible', W_VER)} {fit_column('Latest', W_VER)} {fit_column('Release', W_DATE)} {fit_column('Platform', W_PLAT)}{Colors.ENDC}"
+        )
+
+    def row(i, widths, is_cursor, is_selected):
+        update = updates[i]
+        prefix = ">" if is_cursor else " "
+        if update["eligible"]:
+            mark = f"{Colors.GREEN}x{Colors.ENDC}" if is_selected else " "
+            eligible_str = (
+                f"{Colors.GREEN}{fit_column(update['eligible'], W_VER)}{Colors.ENDC}"
+            )
+        else:
+            mark = f"{Colors.YELLOW}!{Colors.ENDC}" if is_selected else " "
+            eligible_str = (
+                f"{Colors.YELLOW}{fit_column('held back', W_VER)}{Colors.ENDC}"
+            )
+        return (
+            f"{prefix} [{mark}] {Colors.CYAN}{fit_column(update['id'], widths['id'])}{Colors.ENDC} "
+            f"{Colors.YELLOW}{fit_column(update['installed'], W_VER)}{Colors.ENDC} "
+            f"{eligible_str} "
+            f"{Colors.BLUE}{fit_column(update['latest'], W_VER)}{Colors.ENDC} "
+            f"{fit_column(update['latest_release_date'], W_DATE)} "
+            f"{fit_column(update['eligible_platform'] or update['latest_platform'], W_PLAT)}"
+        )
+
+    eligible_mask = [bool(u["eligible"]) for u in updates]
+    try:
+        action, selected, _cursor = run_list_picker(
+            n,
+            layout,
+            header,
+            row,
+            [
+                ("Space", "Toggle", Colors.CYAN),
+                ("a", "Toggle All", Colors.CYAN),
+                ("\u2191/\u2193", "Move", Colors.CYAN),
+                ("Enter", action_label, Colors.GREEN),
+                ("q/Esc", "Exit", Colors.RED),
+            ],
+            "update",
+            selected=list(eligible_mask),
+            toggle_all=lambda: list(eligible_mask),
+        )
     except KeyboardInterrupt:
-        sys.stdout.write("\n\033[?25h")
-        sys.stdout.flush()
+        action = "quit"
+
+    if action == "quit":
         print("Selection cancelled.")
         sys.exit(0)
+
+    chosen = []
+    for i in range(n):
+        if selected[i]:
+            update = updates[i]
+            if not update["eligible"]:
+                update["eligible"] = update["latest"]
+                update["eligible_platform"] = update["latest_platform"]
+                update["eligible_release_date"] = update["latest_release_date"]
+                update["eligible_download_url"] = update.get("latest_download_url")
+            chosen.append(update)
+    return chosen
 
 
 def resolve_update_targets(specs, installed_exts):
@@ -2746,110 +2789,51 @@ def select_removals(installed_exts):
     if n == 0:
         return []
 
-    selected = [False] * n
-    cursor_idx = 0
-    top = 0
-
     W_VER = 15
     OVERHEAD = 6 + 1 + W_VER + 1
 
-    def visual_len(s):
-        return display_width(s)
+    def layout(cols):
+        id_w = max(12, cols - OVERHEAD)
+        return {"id": id_w}, OVERHEAD + id_w
 
-    first_frame = True
-    prev_lines = 0
+    def header(widths):
+        return (
+            f"{Colors.BOLD}{'':6}{fit_column('Extension ID', widths['id'])} "
+            f"{fit_column('Version', W_VER)}{Colors.ENDC}"
+        )
 
-    sys.stdout.write("\033[?25l")
-    sys.stdout.flush()
+    def row(i, widths, is_cursor, is_selected):
+        ext_id, ver = ext_list[i]
+        prefix = ">" if is_cursor else " "
+        mark = f"{Colors.RED}x{Colors.ENDC}" if is_selected else " "
+        return (
+            f"{prefix} [{mark}] {Colors.CYAN}{fit_column(ext_id, widths['id'])}{Colors.ENDC} "
+            f"{Colors.YELLOW}{fit_column(ver, W_VER)}{Colors.ENDC}"
+        )
 
     try:
-        while True:
-            cols, rows = shutil.get_terminal_size((80, 24))
-            id_w = max(12, cols - OVERHEAD)
-            row_width = OVERHEAD + id_w
-            lines_per_row = max(1, -(-row_width // cols))
-            win = max(1, min(n, (rows - 5) // lines_per_row))
-
-            if cursor_idx < top:
-                top = cursor_idx
-            elif cursor_idx >= top + win:
-                top = cursor_idx - win + 1
-            top = max(0, min(top, max(0, n - win)))
-
-            out = []
-            out.append(
-                format_action_bar(
-                    [
-                        ("Space", "Toggle", Colors.CYAN),
-                        ("a", "Toggle All", Colors.CYAN),
-                        ("↑/↓", "Move", Colors.CYAN),
-                        ("Enter", "Uninstall", Colors.RED),
-                        ("q/Esc", "Exit", Colors.YELLOW),
-                    ]
-                )
-            )
-            out.append(
-                f"{Colors.BOLD}{'':6}{fit_column('Extension ID', id_w)} {fit_column('Version', W_VER)}{Colors.ENDC}"
-            )
-            out.append("-" * min(cols, row_width))
-
-            for i in range(top, top + win):
-                ext_id, ver = ext_list[i]
-                prefix = ">" if i == cursor_idx else " "
-                mark = f"{Colors.RED}x{Colors.ENDC}" if selected[i] else " "
-                out.append(
-                    f"{prefix} [{mark}] {Colors.CYAN}{fit_column(ext_id, id_w)}{Colors.ENDC} "
-                    f"{Colors.YELLOW}{fit_column(ver, W_VER)}{Colors.ENDC}"
-                )
-
-            status = (
-                f"[{top + 1}-{top + win}/{n}]  (scroll with ↑/↓)"
-                if win < n
-                else f"[{n} extension{'s' if n != 1 else ''}]"
-            )
-            out.append(f"{Colors.BOLD}{status}{Colors.ENDC}")
-
-            if not first_frame:
-                if prev_lines > 1:
-                    sys.stdout.write(f"\r\033[{prev_lines - 1}A")
-                else:
-                    sys.stdout.write("\r")
-                sys.stdout.write("\033[J")
-            else:
-                first_frame = False
-
-            total_lines = sum(max(1, -(-visual_len(line) // cols)) for line in out)
-            prev_lines = total_lines
-
-            sys.stdout.write("\n".join(out))
-            sys.stdout.flush()
-
-            key = get_key()
-            # None means stdin gave EOF (terminal went away); treat it as cancel
-            # rather than looping on a dead descriptor.
-            if key is None or key in ("ctrl+c", "esc", "q", "Q"):
-                raise KeyboardInterrupt
-            elif key == "up":
-                cursor_idx = (cursor_idx - 1) % n
-            elif key == "down":
-                cursor_idx = (cursor_idx + 1) % n
-            elif key == "space":
-                selected[cursor_idx] = not selected[cursor_idx]
-            elif key in ("a", "A"):
-                selected = [False] * n if any(selected) else [True] * n
-            elif key == "enter":
-                break
-
-        sys.stdout.write("\n\033[?25h")
-        sys.stdout.flush()
-
-        return [ext_list[i][0] for i in range(n) if selected[i]]
-
+        action, selected, _cursor = run_list_picker(
+            n,
+            layout,
+            header,
+            row,
+            [
+                ("Space", "Toggle", Colors.CYAN),
+                ("a", "Toggle All", Colors.CYAN),
+                ("\u2191/\u2193", "Move", Colors.CYAN),
+                ("Enter", "Uninstall", Colors.RED),
+                ("q/Esc", "Exit", Colors.YELLOW),
+            ],
+            "extension",
+        )
     except KeyboardInterrupt:
-        sys.stdout.write("\n\033[?25h")
-        sys.stdout.flush()
+        action = "quit"
+
+    if action == "quit":
         print("Removal selection cancelled.")
         sys.exit(0)
+
+    return [ext_list[i][0] for i in range(n) if selected[i]]
 
 
 def handle_remove(args, config):
@@ -3075,139 +3059,77 @@ def interactive_search_flow(search_results, config, args, installed_exts=None):
         )
         installed_exts = get_installed_extensions(code_binary, ignore_errors=True)
 
-    selected = [False] * n
-    cursor_idx = 0
-    top = 0
-
     W_VER = 12
     W_NAME = 25
     OVERHEAD = 6 + 1 + (W_NAME + 1) + (W_VER + 1) + 1
+    max_id_len = max((display_width(res["id"]) for res in search_results), default=35)
 
-    def visual_len(s):
-        return display_width(s)
+    def layout(cols):
+        avail = max(20, cols - OVERHEAD)
+        id_w = max(12, min(max_id_len, max(35, avail // 3)))
+        desc_w = max(10, cols - OVERHEAD - id_w)
+        return {"id": id_w, "desc": desc_w}, OVERHEAD + id_w + desc_w
 
-    sys.stdout.write("\033[?25l")
-    sys.stdout.flush()
-
-    try:
-        first_frame = True
-        prev_lines = 0
-
-        max_id_len = max(
-            (display_width(res["id"]) for res in search_results), default=35
+    def header(widths):
+        return (
+            f"{Colors.BOLD}{'':6}{fit_column('Extension ID', widths['id'])} {fit_column('Display Name', W_NAME)} "
+            f"{fit_column('Eligible', W_VER)} {fit_column('Description', widths['desc'])}{Colors.ENDC}"
         )
 
+    def row(i, widths, is_cursor, is_selected):
+        res = search_results[i]
+        prefix = ">" if is_cursor else " "
+        mark = f"{Colors.GREEN}x{Colors.ENDC}" if is_selected else " "
+        ver_color = Colors.YELLOW if res["is_held_back"] else Colors.GREEN
+        is_installed = res["id"].lower() in installed_exts
+        id_color = Colors.GREEN if is_installed else Colors.CYAN
+        return (
+            f"{prefix} [{mark}] {id_color}{fit_column(res['id'], widths['id'])}{Colors.ENDC} "
+            f"{Colors.BOLD}{fit_column(res['displayName'], W_NAME)}{Colors.ENDC} "
+            f"{ver_color}{fit_column(res['eligible'], W_VER)}{Colors.ENDC} "
+            f"{fit_column(res['description'], widths['desc'])}"
+        )
+
+    actions = [
+        ("Space", "Toggle", Colors.CYAN),
+        ("a", "Toggle All", Colors.CYAN),
+        ("\u2191/\u2193", "Move", Colors.CYAN),
+        ("Enter", "View Info", Colors.GREEN),
+        ("i", "Install", Colors.GREEN),
+        ("q/Esc", "Exit", Colors.RED),
+    ]
+
+    selected = [False] * n
+    cursor_idx = 0
+    try:
         while True:
-            cols, rows = shutil.get_terminal_size((80, 24))
-            avail = max(20, cols - OVERHEAD)
-            id_w = max(12, min(max_id_len, max(35, avail // 3)))
-            desc_w = max(10, cols - OVERHEAD - id_w)
-            row_width = OVERHEAD + id_w + desc_w
-            lines_per_row = max(1, -(-row_width // cols))
-            win = max(1, min(n, (rows - 5) // lines_per_row))
-
-            if cursor_idx < top:
-                top = cursor_idx
-            elif cursor_idx >= top + win:
-                top = cursor_idx - win + 1
-            top = max(0, min(top, max(0, n - win)))
-
-            out = []
-            out.append(
-                format_action_bar(
-                    [
-                        ("Space", "Toggle", Colors.CYAN),
-                        ("a", "Toggle All", Colors.CYAN),
-                        ("↑/↓", "Move", Colors.CYAN),
-                        ("Enter", "View Info", Colors.GREEN),
-                        ("i", "Install", Colors.GREEN),
-                        ("q/Esc", "Exit", Colors.RED),
-                    ]
-                )
+            action, selected, cursor_idx = run_list_picker(
+                n,
+                layout,
+                header,
+                row,
+                actions,
+                "result",
+                selected=selected,
+                cursor_idx=cursor_idx,
+                extra_keys=("enter", "i", "I"),
             )
-            out.append(
-                f"{Colors.BOLD}{'':6}{fit_column('Extension ID', id_w)} {fit_column('Display Name', W_NAME)} "
-                f"{fit_column('Eligible', W_VER)} {fit_column('Description', desc_w)}{Colors.ENDC}"
-            )
-            out.append("-" * min(cols, row_width))
-
-            for i in range(top, top + win):
-                res = search_results[i]
-                prefix = ">" if i == cursor_idx else " "
-                mark = f"{Colors.GREEN}x{Colors.ENDC}" if selected[i] else " "
-                ver_color = Colors.YELLOW if res["is_held_back"] else Colors.GREEN
-                is_installed = res["id"].lower() in installed_exts
-                id_color = Colors.GREEN if is_installed else Colors.CYAN
-                out.append(
-                    f"{prefix} [{mark}] {id_color}{fit_column(res['id'], id_w)}{Colors.ENDC} "
-                    f"{Colors.BOLD}{fit_column(res['displayName'], W_NAME)}{Colors.ENDC} "
-                    f"{ver_color}{fit_column(res['eligible'], W_VER)}{Colors.ENDC} "
-                    f"{fit_column(res['description'], desc_w)}"
-                )
-
-            status = (
-                f"[{top + 1}-{top + win}/{n}]  (scroll with ↑/↓)"
-                if win < n
-                else f"[{n} result{'s' if n != 1 else ''}]"
-            )
-            out.append(f"{Colors.BOLD}{status}{Colors.ENDC}")
-
-            if not first_frame:
-                if prev_lines > 1:
-                    sys.stdout.write(f"\r\033[{prev_lines - 1}A")
-                else:
-                    sys.stdout.write("\r")
-                sys.stdout.write("\033[J")
-            else:
-                first_frame = False
-
-            total_lines = sum(max(1, -(-visual_len(line) // cols)) for line in out)
-            prev_lines = total_lines
-
-            sys.stdout.write("\n".join(out))
-            sys.stdout.flush()
-
-            key = get_key()
-            # None means stdin gave EOF (terminal went away); treat it as cancel
-            # rather than looping on a dead descriptor.
-            if key is None or key in ("ctrl+c", "esc", "q", "Q"):
-                sys.stdout.write("\n\033[?25h")
-                sys.stdout.flush()
+            if action == "quit":
                 return
-            elif key == "up":
-                cursor_idx = (cursor_idx - 1) % n
-            elif key == "down":
-                cursor_idx = (cursor_idx + 1) % n
-            elif key == "space":
-                selected[cursor_idx] = not selected[cursor_idx]
-            elif key in ("a", "A"):
-                selected = [False] * n if any(selected) else [True] * n
-            elif key in ("enter", "info"):
-                sys.stdout.write("\n\033[?25h")
-                sys.stdout.flush()
-                action = show_search_item_info(search_results[cursor_idx], config, args)
-                if action == "exit":
-                    return
-                elif action == "install":
-                    to_install = [search_results[cursor_idx]["id"]]
-                    install_search_items(to_install, config, args)
-                    return
-                first_frame = True
-                prev_lines = 0
-                sys.stdout.write("\033[?25l")
-                sys.stdout.flush()
-            elif key in ("i", "I"):
-                sys.stdout.write("\n\033[?25h")
-                sys.stdout.flush()
-                to_install = [search_results[i]["id"] for i in range(n) if selected[i]]
-                if not to_install:
-                    to_install = [search_results[cursor_idx]["id"]]
+            if action in ("i", "I"):
+                to_install = [
+                    search_results[i]["id"] for i in range(n) if selected[i]
+                ] or [search_results[cursor_idx]["id"]]
                 install_search_items(to_install, config, args)
                 return
-
+            # Enter opens the detail view, which can hand back to the list.
+            outcome = show_search_item_info(search_results[cursor_idx], config, args)
+            if outcome == "exit":
+                return
+            if outcome == "install":
+                install_search_items([search_results[cursor_idx]["id"]], config, args)
+                return
     except KeyboardInterrupt:
-        sys.stdout.write("\n\033[?25h")
-        sys.stdout.flush()
         return
 
 
