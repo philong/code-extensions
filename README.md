@@ -92,6 +92,9 @@ code-extensions list [query] [options]
 **Options**:
 * `-q`, `--quiet`: Output raw extension IDs only (one per line, ideal for scripting).
 * `-u`, `--outdated`: List only extensions that have updates available.
+* `-p`, `--include-prerelease`: Count pre-release versions as updates (with `--outdated`).
+* `-V`, `--no-code-version-check`: Disable the VS Code version compatibility check (with `--outdated`).
+* `-a`, `--min-release-age <age>`: Minimum release age threshold (with `--outdated`).
 
 ### 4. `search` Command
 

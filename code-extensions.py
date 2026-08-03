@@ -2811,18 +2811,37 @@ def handle_list(args, config):
     if args.outdated:
         service_url = resolve_service_url(args, config)
         token = resolve_token_for_service(service_url, args, config)
-        vscode_version = get_vscode_version(code_binary)
+        # Same settings as `update`, so the two agree on what counts as outdated.
+        include_prerelease = resolve_option(
+            getattr(args, "include_prerelease", None),
+            config,
+            "include_prerelease",
+            False,
+        )
+        no_code_version_check = resolve_option(
+            getattr(args, "no_code_version_check", None),
+            config,
+            "no_code_version_check",
+            False,
+        )
+        vscode_version = (
+            None if no_code_version_check else get_vscode_version(code_binary)
+        )
         target_platform = get_local_target_platform()
-        min_release_age, _min_release_age_str = resolve_min_release_age(None, config)
+        min_release_age, _min_release_age_str = resolve_min_release_age(
+            getattr(args, "min_release_age", None), config
+        )
 
         filtered_dict = dict(ext_items)
         updates = check_updates(
             filtered_dict,
             target_platform,
             vscode_version=vscode_version,
-            exclude_prerelease=True,
+            exclude_prerelease=not include_prerelease,
             min_release_age=min_release_age,
             extensions_config=config.get("extensions", {}),
+            cli_min_release_age_override=getattr(args, "min_release_age", None)
+            is not None,
             service_url=service_url,
             token=token,
         )
@@ -3430,12 +3449,12 @@ complete -c code-extensions -n "__fish_seen_subcommand_from config" -a "list get
 complete -c code-extensions -n "__fish_seen_subcommand_from completion" -a "bash zsh fish powershell"
 
 complete -c code-extensions -n "__fish_seen_subcommand_from install" -s f -l file -d "File containing extension IDs" -r -F
-complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade search" -s p -l include-prerelease -d "Allow pre-release versions"
-complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade search" -s V -l no-code-version-check -d "Disable VS Code version check"
+complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade search list ls" -s p -l include-prerelease -d "Allow pre-release versions"
+complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade search list ls" -s V -l no-code-version-check -d "Disable VS Code version check"
 complete -c code-extensions -n "__fish_seen_subcommand_from update upgrade" -s n -l dry-run -d "Perform dry run without downloading or installing"
 complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade" -s d -l download-dir -d "Download directory for VSIX files" -r -F
 complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade" -s y -l yes -d "Non-interactive mode"
-complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade search" -s a -l min-release-age -d "Minimum release age threshold" -r
+complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade search list ls" -s a -l min-release-age -d "Minimum release age threshold" -r
 complete -c code-extensions -n "__fish_seen_subcommand_from install" -l force -d "Force re-installation"
 complete -c code-extensions -n "__fish_seen_subcommand_from search" -s n -l max-results -d "Maximum search results" -r
 complete -c code-extensions -n "__fish_seen_subcommand_from list ls search" -s q -l quiet -d "Output raw extension IDs only"
@@ -3497,7 +3516,7 @@ _code_extensions_completion() {
             fi
             ;;
         list|ls)
-            COMPREPLY=( $(compgen -W "-q --quiet -u --outdated -h --help" -- "$cur") )
+            COMPREPLY=( $(compgen -W "-q --quiet -u --outdated -p --include-prerelease -V --no-code-version-check -a --min-release-age -h --help" -- "$cur") )
             ;;
         search)
             COMPREPLY=( $(compgen -W "-n --max-results -q --quiet -p --include-prerelease -V --no-code-version-check -a --min-release-age -h --help" -- "$cur") )
@@ -3588,7 +3607,10 @@ _code_extensions() {
                 list|ls)
                     _arguments \\
                         '(-q --quiet)'{-q,--quiet}'[Output raw extension IDs only]' \\
-                        '(-u --outdated)'{-u,--outdated}'[List extensions with updates available]'
+                        '(-u --outdated)'{-u,--outdated}'[List extensions with updates available]' \\
+                        '(-p --include-prerelease)'{-p,--include-prerelease}'[Count pre-release versions as updates]' \\
+                        '(-V --no-code-version-check)'{-V,--no-code-version-check}'[Disable VS Code version check]' \\
+                        '(-a --min-release-age)'{-a,--min-release-age}'[Minimum release age threshold]:age:'
                     ;;
                 search)
                     _arguments \\
@@ -3863,6 +3885,27 @@ def main():
         action="store_true",
         default=False,
         help="List only extensions that have updates available",
+    )
+    parser_list.add_argument(
+        "-p",
+        "--include-prerelease",
+        action="store_true",
+        default=None,
+        help="Count pre-release versions as updates (with --outdated)",
+    )
+    parser_list.add_argument(
+        "-V",
+        "--no-code-version-check",
+        dest="no_code_version_check",
+        action="store_true",
+        default=None,
+        help="Disable VS Code version compatibility check (with --outdated)",
+    )
+    parser_list.add_argument(
+        "-a",
+        "--min-release-age",
+        default=None,
+        help="Minimum release age threshold (e.g. 24h, 3d, 0), with --outdated",
     )
 
     # Search sub-parser
