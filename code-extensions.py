@@ -381,6 +381,67 @@ def is_engine_compatible(vscode_version_str, engine_constraint):
     return True
 
 
+def filter_versions(
+    versions,
+    target_platform,
+    vscode_version=None,
+    include_prerelease=False,
+    skip_versions=(),
+    required_version=None,
+    newer_than=None,
+):
+    """Select the gallery versions installable on this host, newest first.
+
+    Shared by install, update, search and info so they cannot drift apart on
+    which versions they consider. `required_version` pins an exact version,
+    `newer_than` drops every version at or below an installed one.
+
+    Candidates are ordered before being filtered, which is what makes stopping at
+    the first version below `newer_than` correct: it holds whatever order the
+    gallery used, and --service-url accepts any gallery. Both public galleries do
+    order by version descending rather than by publication date -- a maintenance
+    release for an older line sits at its numeric position, not first -- but
+    nothing here depends on that. Sorting up front is not a cost either: it runs
+    the version parser in one pass instead of an interpreted loop, and the early
+    stop then skips the rest entirely.
+
+    The sort is stable, so several builds of one version (the per-platform
+    variants) keep the order the gallery listed them in.
+    """
+    ordered = sorted(
+        (v for v in versions if v.get("version")),
+        key=lambda v: parse_version(v["version"]),
+        reverse=True,
+    )
+    parsed_floor = parse_version(newer_than) if newer_than else None
+
+    selected = []
+    for ver_obj in ordered:
+        version_str = ver_obj["version"]
+        if parsed_floor is not None and parse_version(version_str) <= parsed_floor:
+            break
+        if required_version is not None and version_str != required_version:
+            continue
+        if version_str in skip_versions:
+            continue
+        if not include_prerelease and is_prerelease(ver_obj):
+            continue
+        if vscode_version:
+            engine_constraint = get_engine_constraint(ver_obj)
+            if engine_constraint and not is_engine_compatible(
+                vscode_version, engine_constraint
+            ):
+                continue
+        ver_platform = ver_obj.get("targetPlatform")
+        if ver_platform is None or ver_platform.lower() in (
+            "universal",
+            target_platform.lower(),
+        ):
+            selected.append(ver_obj)
+
+    return selected
+
+
 def get_engine_constraint(version_obj):
     properties = version_obj.get("properties", [])
     for p in properties:
@@ -436,6 +497,14 @@ def released_long_enough(ver_obj, min_age):
 
 
 CACHE_FILE_PREFIX = "vscode_ext_cache_"
+
+
+def first_eligible_version(versions, min_age):
+    """Newest version that satisfies the minimum-release-age gate, if any."""
+    for ver_obj in versions:
+        if released_long_enough(ver_obj, min_age):
+            return ver_obj
+    return None
 
 
 def get_cache_dir():
@@ -1547,45 +1616,23 @@ def query_marketplace_search(
             except ValueError:
                 pass
 
-        compatible_versions = []
-        for ver_obj in full_ext.get("versions", []):
-            version_str = ver_obj.get("version")
-            if not version_str:
-                continue
-            if skipped_versions and version_str in skipped_versions:
-                continue
-            if not eff_include_prerelease and is_prerelease(ver_obj):
-                continue
-            if vscode_version:
-                engine_constraint = get_engine_constraint(ver_obj)
-                if engine_constraint and not is_engine_compatible(
-                    vscode_version, engine_constraint
-                ):
-                    continue
-            ver_platform = ver_obj.get("targetPlatform")
-            if ver_platform is None or ver_platform.lower() in (
-                "universal",
-                target_platform.lower(),
-            ):
-                compatible_versions.append(ver_obj)
+        compatible_versions = filter_versions(
+            full_ext.get("versions", []),
+            target_platform,
+            vscode_version=vscode_version,
+            include_prerelease=eff_include_prerelease,
+            skip_versions=skipped_versions,
+        )
 
         latest_version = "unknown"
         eligible_version = "unknown"
         is_held_back = False
 
         if compatible_versions:
-            compatible_versions.sort(
-                key=lambda x: parse_version(x["version"]), reverse=True
-            )
             latest_ver_obj = compatible_versions[0]
             latest_version = latest_ver_obj["version"]
 
-            eligible_ver_obj = None
-            for ver_obj in compatible_versions:
-                if not released_long_enough(ver_obj, eff_min_age):
-                    continue
-                eligible_ver_obj = ver_obj
-                break
+            eligible_ver_obj = first_eligible_version(compatible_versions, eff_min_age)
 
             if eligible_ver_obj:
                 eligible_version = eligible_ver_obj["version"]
@@ -1987,30 +2034,14 @@ def handle_install(args, config):
         # min-release-age gate below.
         skipped_versions = [] if req_ver else ext_cfg.get("skip_versions", [])
 
-        versions = ext_obj.get("versions", [])
-        compatible_versions = []
-        for ver_obj in versions:
-            v_str = ver_obj.get("version")
-            if not v_str:
-                continue
-            if req_ver and v_str != req_ver:
-                continue
-            if v_str in skipped_versions:
-                continue
-            if not req_ver and not eff_include_prerelease and is_prerelease(ver_obj):
-                continue
-            if vscode_version:
-                engine_constraint = get_engine_constraint(ver_obj)
-                if engine_constraint and not is_engine_compatible(
-                    vscode_version, engine_constraint
-                ):
-                    continue
-            ver_platform = ver_obj.get("targetPlatform")
-            if ver_platform is None or ver_platform.lower() in (
-                "universal",
-                target_platform.lower(),
-            ):
-                compatible_versions.append(ver_obj)
+        compatible_versions = filter_versions(
+            ext_obj.get("versions", []),
+            target_platform,
+            vscode_version=vscode_version,
+            include_prerelease=eff_include_prerelease or bool(req_ver),
+            skip_versions=skipped_versions,
+            required_version=req_ver,
+        )
 
         if not compatible_versions:
             if req_ver:
@@ -2023,17 +2054,8 @@ def handle_install(args, config):
                 )
             continue
 
-        compatible_versions.sort(
-            key=lambda x: parse_version(x["version"]), reverse=True
-        )
         latest_ver_obj = compatible_versions[0]
-
-        eligible_ver_obj = None
-        for ver_obj in compatible_versions:
-            if not released_long_enough(ver_obj, eff_min_age):
-                continue
-            eligible_ver_obj = ver_obj
-            break
+        eligible_ver_obj = first_eligible_version(compatible_versions, eff_min_age)
 
         selected_ver_obj = None
 
@@ -2184,45 +2206,24 @@ def check_updates(
         if not installed_ver:
             continue
 
-        parsed_installed = parse_version(installed_ver)
         ext_cfg = extensions_config.get(full_id, {}) if extensions_config else {}
         skipped_versions = ext_cfg.get("skip_versions", [])
         eff_exclude_prerelease = exclude_prerelease
         if "include_prerelease" in ext_cfg:
             eff_exclude_prerelease = not ext_cfg["include_prerelease"]
 
-        compatible_versions = []
-        # The gallery returns versions newest-first, so the first version at or
-        # below the installed one marks the end of newer releases to consider.
-        for ver_obj in ext.get("versions", []):
-            version_str = ver_obj.get("version")
-            if not version_str:
-                continue
-            if parse_version(version_str) <= parsed_installed:
-                break
-            if skipped_versions and version_str in skipped_versions:
-                continue
-            if eff_exclude_prerelease and is_prerelease(ver_obj):
-                continue
-            if vscode_version:
-                engine_constraint = get_engine_constraint(ver_obj)
-                if engine_constraint and not is_engine_compatible(
-                    vscode_version, engine_constraint
-                ):
-                    continue
-            ver_platform = ver_obj.get("targetPlatform")
-            if ver_platform is None or ver_platform.lower() in (
-                "universal",
-                target_platform.lower(),
-            ):
-                compatible_versions.append(ver_obj)
+        compatible_versions = filter_versions(
+            ext.get("versions", []),
+            target_platform,
+            vscode_version=vscode_version,
+            include_prerelease=not eff_exclude_prerelease,
+            skip_versions=skipped_versions,
+            newer_than=installed_ver,
+        )
 
         if not compatible_versions:
             continue
 
-        compatible_versions.sort(
-            key=lambda x: parse_version(x["version"]), reverse=True
-        )
         latest_ver_obj = compatible_versions[0]
         latest_version = latest_ver_obj["version"]
 
@@ -2234,12 +2235,7 @@ def check_updates(
                 pass
 
         if parse_version(latest_version) > parse_version(installed_ver):
-            eligible_ver_obj = None
-            for ver_obj in compatible_versions:
-                if not released_long_enough(ver_obj, eff_min_age):
-                    continue
-                eligible_ver_obj = ver_obj
-                break
+            eligible_ver_obj = first_eligible_version(compatible_versions, eff_min_age)
 
             last_updated = latest_ver_obj.get("lastUpdated", "")
             latest_release_date = (
@@ -3293,32 +3289,15 @@ def handle_info(args, config):
         except ValueError:
             pass
 
-    # Mirror the install/search eligibility filter: only versions compatible
-    # with the host VS Code engine and platform/architecture (and not skipped
-    # or pre-release) are candidates, then the min-release-age gate applies.
-    compatible_versions = []
-    for ver_obj in versions:
-        v_str = ver_obj.get("version")
-        if not v_str:
-            continue
-        if skipped_versions and v_str in skipped_versions:
-            continue
-        if not eff_include_prerelease and is_prerelease(ver_obj):
-            continue
-        if vscode_version:
-            engine_constraint = get_engine_constraint(ver_obj)
-            if engine_constraint and not is_engine_compatible(
-                vscode_version, engine_constraint
-            ):
-                continue
-        ver_platform = ver_obj.get("targetPlatform")
-        if ver_platform is None or ver_platform.lower() in (
-            "universal",
-            target_platform.lower(),
-        ):
-            compatible_versions.append(ver_obj)
-
-    compatible_versions.sort(key=lambda x: parse_version(x["version"]), reverse=True)
+    # Same eligibility filter as install/search/update, so what `info` reports as
+    # eligible is what those commands would actually pick.
+    compatible_versions = filter_versions(
+        versions,
+        target_platform,
+        vscode_version=vscode_version,
+        include_prerelease=eff_include_prerelease,
+        skip_versions=skipped_versions,
+    )
 
     latest_ver = "unknown"
     eligible_ver = "unknown"
@@ -3328,13 +3307,10 @@ def handle_info(args, config):
     if compatible_versions:
         latest_ver_obj = compatible_versions[0]
         latest_ver = latest_ver_obj["version"]
-        for ver_obj in compatible_versions:
-            if not released_long_enough(ver_obj, eff_min_age):
-                continue
-            eligible_ver = ver_obj["version"]
-            if eligible_ver != latest_ver:
-                is_held_back = True
-            break
+        eligible_ver_obj = first_eligible_version(compatible_versions, eff_min_age)
+        if eligible_ver_obj:
+            eligible_ver = eligible_ver_obj["version"]
+            is_held_back = eligible_ver != latest_ver
         else:
             eligible_ver = "held back"
             is_held_back = True
