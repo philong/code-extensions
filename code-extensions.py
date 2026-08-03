@@ -323,6 +323,37 @@ def semver_parts(v_str):
         return 0, 0, 0
 
 
+def expand_x_range(version_str):
+    """Expand a wildcard range into [lower, upper) bounds.
+
+    '1.80.x' -> ('1.80.0', '1.81.0'), '1.x' -> ('1.0.0', '2.0.0'),
+    'x' -> ('0.0.0', None) meaning unbounded. Returns None when the version
+    carries no wildcard, or when it is too odd to interpret.
+    """
+    core = version_str.split("-", 1)[0].split("+", 1)[0].strip()
+    if not core:
+        return None
+    components = [c.strip() for c in core.split(".")]
+    fixed = []
+    for component in components:
+        if component in ("x", "X", "*"):
+            break
+        fixed.append(component)
+    if len(fixed) == len(components):
+        return None
+    try:
+        numbers = [int(c) for c in fixed]
+    except ValueError:
+        return None
+    if not numbers:
+        return ("0.0.0", None)
+    if len(numbers) == 1:
+        return (f"{numbers[0]}.0.0", f"{numbers[0] + 1}.0.0")
+    if len(numbers) == 2:
+        return (f"{numbers[0]}.{numbers[1]}.0", f"{numbers[0]}.{numbers[1] + 1}.0")
+    return None
+
+
 @lru_cache(maxsize=4096)
 def is_engine_compatible(vscode_version_str, engine_constraint):
     if not vscode_version_str or not engine_constraint:
@@ -341,6 +372,12 @@ def is_engine_compatible(vscode_version_str, engine_constraint):
             for g in constraint_str.split("||")
         )
     parts = [p.strip() for p in re.split(r"\s+", constraint_str) if p.strip()]
+    # Hyphen range: 'A - B' means >=A <=B. Only the spaced spelling is treated as
+    # a range, since 'A-B' unspaced is a pre-release version.
+    if len(parts) == 3 and parts[1] == "-":
+        return is_engine_compatible(
+            vscode_version_str, f">={parts[0]}"
+        ) and is_engine_compatible(vscode_version_str, f"<={parts[2]}")
     if len(parts) > 1:
         return all(is_engine_compatible(vscode_version_str, p) for p in parts)
     single_constraint = parts[0]
@@ -348,6 +385,25 @@ def is_engine_compatible(vscode_version_str, engine_constraint):
     if not match:
         return True
     op, version_str = match.groups()
+
+    # Wildcard ranges ('1.80.x', '1.*'). Without this the wildcard component
+    # parses as a string that sorts above every integer, which inverts the
+    # comparison: '1.80.x' rejected 1.80.0 and accepted 1.81.0.
+    x_range = expand_x_range(version_str)
+    if x_range is not None:
+        lower, upper = x_range
+        if op in (None, "", "=", "==", "^", "~"):
+            if upper is None:
+                return True
+            return is_engine_compatible(
+                vscode_version_str, f">={lower}"
+            ) and is_engine_compatible(vscode_version_str, f"<{upper}")
+        # With an explicit comparator, the wildcard just drops out: '>=1.80.x'
+        # is '>=1.80.0', '<=1.x' is '<2.0.0'.
+        if op == "<=" and upper is not None:
+            return is_engine_compatible(vscode_version_str, f"<{upper}")
+        version_str = lower
+
     if not op:
         op = ">="
     parsed_vscode = parse_version(vscode_version_str)
