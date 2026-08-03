@@ -30,6 +30,7 @@ import tempfile
 import time
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from functools import lru_cache
 
@@ -44,6 +45,35 @@ except ImportError:
 
 DEFAULT_SERVICE_URL = "https://marketplace.visualstudio.com/_apis/public/gallery"
 OPEN_VSX_SERVICE_URL = "https://open-vsx.org/vscode/gallery"
+
+
+def url_host(url):
+    try:
+        return (urllib.parse.urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Drop the Authorization header when a redirect crosses hosts.
+
+    urllib copies every header except Content-* onto the redirected request, so
+    without this the access token would be handed to whatever CDN host the
+    gallery redirects downloads to (*.vsassets.io, blob storage, GitHub, ...).
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is None:
+            return None
+        if url_host(req.full_url) != url_host(new_req.full_url):
+            # Request.add_header() capitalizes header names.
+            new_req.headers.pop("Authorization", None)
+            new_req.unredirected_hdrs.pop("Authorization", None)
+        return new_req
+
+
+_url_opener = urllib.request.build_opener(_AuthStrippingRedirectHandler)
 
 
 class Colors:
@@ -1138,7 +1168,7 @@ def _post_extension_query(payload, service_url, token=None):
         retry_reason = None
         retry_after = None
         try:
-            with urllib.request.urlopen(req, timeout=30) as response:
+            with _url_opener.open(req, timeout=30) as response:
                 resp_data = json.loads(response.read().decode("utf-8"))
             try:
                 with open(cache_file, "w", encoding="utf-8") as f:
@@ -1398,7 +1428,7 @@ def download_vsix(url, filepath, token=None, service_url=None):
         headers=headers,
     )
 
-    with urllib.request.urlopen(req, timeout=30) as response:
+    with _url_opener.open(req, timeout=30) as response:
         content_encoding = response.headers.get("Content-Encoding", "").lower()
         total_size = response.headers.get("Content-Length")
         if total_size:
