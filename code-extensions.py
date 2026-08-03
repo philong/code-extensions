@@ -1412,8 +1412,39 @@ def query_marketplace_search(
     return search_results
 
 
+def resolve_download_target(args, config):
+    """Return (directory, is_private_temp) for .vsix downloads.
+
+    Without an explicit --download-dir the files go into a fresh 0700 directory
+    rather than straight into the shared temp directory: the filenames are
+    predictable, so a local attacker could otherwise pre-plant a symlink or swap
+    the package between download and install.
+    """
+    download_dir = resolve_option(
+        getattr(args, "download_dir", None), config, "download_dir", None
+    )
+    if download_dir is not None:
+        return os.path.expanduser(download_dir), False
+    return tempfile.mkdtemp(prefix="code-extensions-"), True
+
+
+def discard_download_dir(directory, is_private_temp):
+    if is_private_temp:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def open_for_download(filepath):
+    """Open a download target for writing, refusing to follow a symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    return os.open(filepath, flags, 0o600)
+
+
 def download_vsix(url, filepath, token=None, service_url=None):
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    parent = os.path.dirname(filepath)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     show_progress = sys.stdout.isatty()
 
     if not token:
@@ -1486,7 +1517,7 @@ def download_vsix(url, filepath, token=None, service_url=None):
 
             body = zlib.decompress(body)
 
-        with open(filepath, "wb") as f:
+        with os.fdopen(open_for_download(filepath), "wb") as f:
             f.write(body)
 
 
@@ -1687,13 +1718,7 @@ def handle_install(args, config):
     )
     installed_exts = get_installed_extensions(code_binary)
 
-    download_dir = resolve_option(args.download_dir, config, "download_dir", None)
-    if download_dir is not None:
-        download_dir = os.path.expanduser(download_dir)
-    download_dir_resolved = (
-        download_dir if download_dir is not None else tempfile.gettempdir()
-    )
-    download_dir_is_temp = download_dir is None
+    download_dir_resolved, download_dir_is_temp = resolve_download_target(args, config)
 
     for ext_id, req_ver in parsed_targets:
         ext_obj = marketplace_data.get(ext_id)
@@ -1881,6 +1906,8 @@ def handle_install(args, config):
                 os.remove(filepath)
             except Exception:
                 pass
+
+    discard_download_dir(download_dir_resolved, download_dir_is_temp)
 
 
 def check_updates(
@@ -2303,14 +2330,6 @@ def handle_update(args, config):
         print(f"{Colors.GREEN}All extensions are up to date!{Colors.ENDC}")
         return
 
-    download_dir = resolve_option(args.download_dir, config, "download_dir", None)
-    if download_dir is not None:
-        download_dir = os.path.expanduser(download_dir)
-    download_dir_resolved = (
-        download_dir if download_dir is not None else tempfile.gettempdir()
-    )
-    download_dir_is_temp = download_dir is None
-
     if yes:
         print(f"{Colors.GREEN}{Colors.BOLD}Updates available:{Colors.ENDC}")
         print_updates_table(updates)
@@ -2355,6 +2374,8 @@ def handle_update(args, config):
         )
         return
 
+    download_dir_resolved, download_dir_is_temp = resolve_download_target(args, config)
+
     for update in selected_updates:
         pub_name = update["publisher"]
         ext_name = update["name"]
@@ -2396,6 +2417,8 @@ def handle_update(args, config):
                 os.remove(filepath)
             except Exception:
                 pass
+
+    discard_download_dir(download_dir_resolved, download_dir_is_temp)
 
 
 def select_removals(installed_exts):
