@@ -448,6 +448,70 @@ def cleanup_stale_cache():
         pass
 
 
+_TOML_ESCAPES = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
+
+
+def unescape_toml_basic(text):
+    out = []
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char != "\\" or i + 1 >= len(text):
+            out.append(char)
+            i += 1
+            continue
+        following = text[i + 1]
+        if following in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[following])
+            i += 2
+        elif following in ("u", "U"):
+            width = 4 if following == "u" else 8
+            digits = text[i + 2 : i + 2 + width]
+            # A short slice means the escape was truncated by the end of the
+            # string; without the length check '\u12' would decode as '\x12'
+            # instead of being kept as written. Lone surrogates are not
+            # characters either, and would fail later on encode.
+            code_point = None
+            if len(digits) == width:
+                try:
+                    code_point = int(digits, 16)
+                except ValueError:
+                    code_point = None
+            if code_point is None or 0xD800 <= code_point <= 0xDFFF:
+                out.append(char)
+                i += 1
+            else:
+                out.append(chr(code_point))
+                i += 2 + width
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
+def unquote_toml_value(text):
+    """Strip one layer of TOML quoting, honouring escapes in basic strings.
+
+    Basic ("...") strings process escapes; literal ('...') strings do not.
+    """
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1]:
+        if text[0] == '"':
+            return unescape_toml_basic(text[1:-1])
+        if text[0] == "'":
+            return text[1:-1]
+    return text
+
+
 def strip_comment(line):
     in_quote = None
     for i, char in enumerate(line):
@@ -527,7 +591,7 @@ def parse_toml_fallback(content):
         if line.startswith("[") and line.endswith("]"):
             sec = line[1:-1].strip()
             if "." in sec:
-                parts = [p.strip().strip('"').strip("'") for p in sec.split(".", 1)]
+                parts = [unquote_toml_value(p) for p in sec.split(".", 1)]
                 top_sec, sub_sec = parts[0], parts[1]
                 if top_sec not in data or not isinstance(data[top_sec], dict):
                     data[top_sec] = {}
@@ -537,7 +601,7 @@ def parse_toml_fallback(content):
                     data[top_sec][sub_sec] = {}
                 current_section = (top_sec, sub_sec)
             else:
-                sec_name = sec.strip('"').strip("'")
+                sec_name = unquote_toml_value(sec)
                 if sec_name not in data or not isinstance(data[sec_name], dict):
                     data[sec_name] = {}
                 current_section = sec_name
@@ -545,7 +609,7 @@ def parse_toml_fallback(content):
 
         if "=" in line:
             key, val = line.split("=", 1)
-            key = key.strip().strip('"').strip("'")
+            key = unquote_toml_value(key)
             val = val.strip()
 
             if val.startswith("[") and val.endswith("]"):
@@ -559,21 +623,19 @@ def parse_toml_fallback(content):
                         elif in_quote is None:
                             in_quote = char
                     elif char == "," and in_quote is None:
-                        items.append(
-                            "".join(current_item).strip().strip('"').strip("'")
-                        )
+                        items.append(unquote_toml_value("".join(current_item)))
                         current_item = []
                     else:
                         current_item.append(char)
                 if current_item:
-                    items.append("".join(current_item).strip().strip('"').strip("'"))
+                    items.append(unquote_toml_value("".join(current_item)))
                 parsed_val = [x for x in items if x]
             elif val.lower() == "true":
                 parsed_val = True
             elif val.lower() == "false":
                 parsed_val = False
             else:
-                parsed_val = val.strip('"').strip("'")
+                parsed_val = unquote_toml_value(val)
 
             if isinstance(current_section, tuple):
                 data[current_section[0]][current_section[1]][key] = parsed_val
@@ -802,56 +864,61 @@ def get_default_config_path():
     return os.path.join(user_config_dir, "config.toml")
 
 
+def toml_string(value):
+    escaped = (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
+
+
+def toml_key(key):
+    key = str(key)
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else toml_string(key)
+
+
+def toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    return toml_string(value)
+
+
 def dump_toml(data):
     lines = []
-    top_keys = [k for k in data if not isinstance(data[k], dict)]
-    for k in sorted(top_keys):
-        v = data[k]
-        if isinstance(v, bool):
-            lines.append(f"{k} = {'true' if v else 'false'}")
-        elif isinstance(v, (int, float)):
-            lines.append(f"{k} = {v}")
-        elif isinstance(v, list):
-            items_str = ", ".join(f'"{x}"' for x in v)
-            lines.append(f"{k} = [{items_str}]")
-        else:
-            lines.append(f'{k} = "{v}"')
+    for k in sorted(k for k in data if not isinstance(data[k], dict)):
+        lines.append(f"{toml_key(k)} = {toml_value(data[k])}")
 
-    if top_keys and any(isinstance(data[k], dict) for k in data):
-        lines.append("")
-
-    dict_keys = [k for k in data if isinstance(data[k], dict)]
-    for k in sorted(dict_keys):
+    for k in sorted(k for k in data if isinstance(data[k], dict) and data[k]):
         subdict = data[k]
-        if not subdict:
-            continue
-        lines.append(f"[{k}]")
-        for sk in sorted(subdict.keys()):
-            val = subdict[sk]
-            if isinstance(val, dict):
-                lines.append(f'\n[extensions."{sk}"]')
-                for ik in sorted(val.keys()):
-                    iv = val[ik]
-                    if isinstance(iv, bool):
-                        lines.append(f"  {ik} = {'true' if iv else 'false'}")
-                    elif isinstance(iv, (int, float)):
-                        lines.append(f"  {ik} = {iv}")
-                    elif isinstance(iv, list):
-                        items_str = ", ".join(f'"{x}"' for x in iv)
-                        lines.append(f"  {ik} = [{items_str}]")
-                    else:
-                        lines.append(f'  {ik} = "{iv}"')
-            else:
-                if isinstance(val, bool):
-                    lines.append(f"  {sk} = {'true' if val else 'false'}")
-                elif isinstance(val, (int, float)):
-                    lines.append(f"  {sk} = {val}")
-                elif isinstance(val, list):
-                    items_str = ", ".join(f'"{x}"' for x in val)
-                    lines.append(f"  {sk} = [{items_str}]")
-                else:
-                    lines.append(f'  {sk} = "{val}"')
-        lines.append("")
+        scalar_keys = sorted(sk for sk in subdict if not isinstance(subdict[sk], dict))
+        sub_tables = sorted(sk for sk in subdict if isinstance(subdict[sk], dict))
+
+        # Emit the parent header only when it carries keys of its own, so a
+        # config holding nothing but per-extension rules has no empty
+        # '[extensions]' table hanging above them.
+        if scalar_keys or not sub_tables:
+            if lines:
+                lines.append("")
+            lines.append(f"[{toml_key(k)}]")
+            for sk in scalar_keys:
+                lines.append(f"  {toml_key(sk)} = {toml_value(subdict[sk])}")
+
+        for sk in sub_tables:
+            if not subdict[sk]:
+                continue
+            if lines:
+                lines.append("")
+            lines.append(f"[{toml_key(k)}.{toml_key(sk)}]")
+            for ik in sorted(subdict[sk]):
+                lines.append(f"  {toml_key(ik)} = {toml_value(subdict[sk][ik])}")
 
     return "\n".join(lines).strip() + "\n"
 
