@@ -296,6 +296,11 @@ def semver_parts(v_str):
 def is_engine_compatible(vscode_version_str, engine_constraint):
     if not vscode_version_str or not engine_constraint:
         return True
+    # VS Code reports Insiders and other pre-release builds as e.g.
+    # '1.86.0-insider'. Semver ranks that below the 1.86.0 release, so every
+    # extension requiring ^1.86.0 would look incompatible. VS Code itself treats
+    # such a build as satisfying the corresponding release constraint.
+    vscode_version_str = vscode_version_str.split("-", 1)[0]
     constraint_str = engine_constraint.strip()
     if constraint_str == "*" or constraint_str == "":
         return True
