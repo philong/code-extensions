@@ -1796,6 +1796,11 @@ def handle_install(args, config):
             except ValueError:
                 pass
 
+        # An explicitly requested version overrides the config's opinion about
+        # pre-releases and skipped versions, the same way it overrides the
+        # min-release-age gate below.
+        skipped_versions = [] if req_ver else ext_cfg.get("skip_versions", [])
+
         versions = ext_obj.get("versions", [])
         compatible_versions = []
         for ver_obj in versions:
@@ -1803,6 +1808,8 @@ def handle_install(args, config):
             if not v_str:
                 continue
             if req_ver and v_str != req_ver:
+                continue
+            if v_str in skipped_versions:
                 continue
             if not req_ver and not eff_include_prerelease and is_prerelease(ver_obj):
                 continue
