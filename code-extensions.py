@@ -697,8 +697,18 @@ def unquote_toml_value(text):
 
 
 def strip_comment(line):
+    """Drop a trailing '#' comment, ignoring '#' inside a quoted value."""
     in_quote = None
+    escaped = False
     for i, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        # Only basic ("...") strings process escapes; inside a literal string a
+        # backslash is just a backslash.
+        if char == "\\" and in_quote != "'":
+            escaped = True
+            continue
         if char in ('"', "'"):
             if in_quote == char:
                 in_quote = None
