@@ -45,6 +45,7 @@ except ImportError:
 
 DEFAULT_SERVICE_URL = "https://marketplace.visualstudio.com/_apis/public/gallery"
 OPEN_VSX_SERVICE_URL = "https://open-vsx.org/vscode/gallery"
+OPEN_VSX_HOST = "open-vsx.org"
 
 
 def url_host(url):
@@ -1080,13 +1081,15 @@ def vsix_filename(pub_name, ext_name, version, platform):
 
 
 def is_open_vsx_url(url):
+    """Whether a URL points at Open VSX, matched on host rather than substring.
+
+    A substring test would accept hosts such as 'open-vsx.org.example.com' and
+    hand them the access token.
+    """
     if not url:
         return False
-    url_lower = url.lower()
-    return (
-        "open-vsx.org" in url_lower
-        or url.rstrip("/").lower() == OPEN_VSX_SERVICE_URL.rstrip("/").lower()
-    )
+    host = url_host(url)
+    return host == OPEN_VSX_HOST or host.endswith("." + OPEN_VSX_HOST)
 
 
 def resolve_open_vsx_token(args, config):
