@@ -1073,10 +1073,28 @@ def resolve_update_url(update, service_url):
     )
 
 
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def safe_filename_part(value, fallback="unknown"):
+    """Reduce a gallery-supplied string to something safe inside a filename.
+
+    Publisher, extension name, version and platform all come from the gallery
+    response, so a hostile --service-url could otherwise smuggle path separators
+    or '..' into the download path.
+    """
+    cleaned = _UNSAFE_FILENAME_CHARS.sub("_", str(value or "")).strip("._-")
+    return cleaned or fallback
+
+
 def vsix_filename(pub_name, ext_name, version, platform):
-    filename = f"{pub_name}.{ext_name}-{version}"
+    filename = (
+        f"{safe_filename_part(pub_name, 'publisher')}."
+        f"{safe_filename_part(ext_name, 'extension')}-"
+        f"{safe_filename_part(version, 'version')}"
+    )
     if platform and platform != "universal":
-        filename += f"-{platform}"
+        filename += f"-{safe_filename_part(platform, 'platform')}"
     return filename + ".vsix"
 
 
