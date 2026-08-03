@@ -527,7 +527,35 @@ def get_cache_dir():
 
 
 def is_cache_file(filename):
-    return filename.startswith(CACHE_FILE_PREFIX) and filename.endswith(".json")
+    # .tmp covers a partial write left behind by a killed process; the reader
+    # only ever opens the final name, so collecting them is safe.
+    return filename.startswith(CACHE_FILE_PREFIX) and filename.endswith(
+        (".json", ".tmp")
+    )
+
+
+def write_cache_atomically(cache_file, payload):
+    """Write a cache entry via a temporary file and a rename.
+
+    Writing in place leaves a half-written entry behind if the process is
+    interrupted, or if two runs cache the same query at once. A reader recovers
+    from that by refetching, but it also wastes the entry for a full hour.
+    """
+    tmp_path = f"{cache_file}.{os.getpid()}.tmp"
+    replaced = False
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, cache_file)
+        replaced = True
+    except OSError:
+        pass
+    finally:
+        if not replaced:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def cleanup_stale_cache():
@@ -1443,11 +1471,7 @@ def _post_extension_query(payload, service_url, token=None):
             with _url_opener.open(req, timeout=30) as response:
                 resp_data = json.loads(response.read().decode("utf-8"))
             if cache_file:
-                try:
-                    with open(cache_file, "w", encoding="utf-8") as f:
-                        json.dump(resp_data, f)
-                except OSError:
-                    pass
+                write_cache_atomically(cache_file, resp_data)
             return resp_data
         except urllib.error.HTTPError as e:
             err = e
