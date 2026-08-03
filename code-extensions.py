@@ -600,9 +600,14 @@ CONFIG_OPTION_TYPES = {
     "open_vsx_token": str,
 }
 
-EXT_OPTION_KEYS = frozenset(
-    {"ignore", "min_release_age", "skip_versions", "include_prerelease"}
-)
+EXT_OPTION_TYPES = {
+    "ignore": bool,
+    "min_release_age": str,
+    "skip_versions": list,
+    "include_prerelease": bool,
+}
+
+EXT_OPTION_KEYS = frozenset(EXT_OPTION_TYPES)
 
 
 def coerce_config_value(val, expected_type):
@@ -612,11 +617,52 @@ def coerce_config_value(val, expected_type):
         if isinstance(val, str) and val.strip().lower() in ("true", "false"):
             return val.strip().lower() == "true"
         raise ValueError(f"expected true or false, got {val!r}")
+    if expected_type is list:
+        if isinstance(val, bool):
+            raise ValueError(f"expected a list of values, got {val!r}")
+        if isinstance(val, list):
+            return [str(v) for v in val]
+        if isinstance(val, str):
+            items = [p for p in re.split(r"[,\s]+", val.strip()) if p]
+            if not items:
+                raise ValueError("expected a list of values, got an empty value")
+            return items
+        return [str(val)]
     if isinstance(val, str):
         return val
     if isinstance(val, (int, float)) and not isinstance(val, bool):
         return str(val)
     raise ValueError(f"expected a string, got {val!r}")
+
+
+def validate_config_value(display_key, norm_key, val, expected_type):
+    """Coerce a value being written to the config, refusing to store junk.
+
+    An unusable value used to be accepted here and only rejected on load, which
+    left every later command either warning or exiting until the file was fixed
+    by hand.
+    """
+    try:
+        coerced = coerce_config_value(val, expected_type)
+        if norm_key == "min_release_age":
+            parse_age_threshold(coerced)
+        return coerced
+    except ValueError as e:
+        print(
+            f"{Colors.RED}Error: Invalid value for '{display_key}': {str(e).rstrip('.')}.{Colors.ENDC}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def resolve_min_release_age(args_val, config):
+    """Return (timedelta, source string) for the min-release-age setting."""
+    age_str = resolve_option(args_val, config, "min_release_age", "24h")
+    try:
+        return parse_age_threshold(age_str), age_str
+    except ValueError as e:
+        print(f"{Colors.RED}Error: {e}{Colors.ENDC}", file=sys.stderr)
+        sys.exit(1)
 
 
 def load_config():
@@ -998,7 +1044,9 @@ def handle_config(args, config):
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            config[norm_key] = coerced_val
+            config[norm_key] = validate_config_value(
+                args.key, norm_key, coerced_val, CONFIG_OPTION_TYPES[norm_key]
+            )
         else:
             norm_prop = prop.replace("-", "_")
             if norm_prop not in EXT_OPTION_KEYS:
@@ -1012,7 +1060,9 @@ def handle_config(args, config):
             norm_ext_id = ext_id.lower()
             if norm_ext_id not in config["extensions"]:
                 config["extensions"][norm_ext_id] = {}
-            config["extensions"][norm_ext_id][norm_prop] = coerced_val
+            config["extensions"][norm_ext_id][norm_prop] = validate_config_value(
+                args.key, norm_prop, coerced_val, EXT_OPTION_TYPES[norm_prop]
+            )
 
         save_config(config, config_path)
         print(
@@ -1188,9 +1238,7 @@ def _post_extension_query(payload, service_url, token=None):
         payload_hash = hashlib.sha256(
             json.dumps(cache_key_data, sort_keys=True).encode("utf-8")
         ).hexdigest()
-        cache_file = os.path.join(
-            cache_dir, f"{CACHE_FILE_PREFIX}{payload_hash}.json"
-        )
+        cache_file = os.path.join(cache_dir, f"{CACHE_FILE_PREFIX}{payload_hash}.json")
 
         if os.path.exists(cache_file):
             try:
@@ -1708,15 +1756,9 @@ def handle_install(args, config):
         args.no_code_version_check, config, "no_code_version_check", False
     )
     yes = resolve_option(args.yes, config, "yes", False)
-    min_release_age_str = resolve_option(
-        args.min_release_age, config, "min_release_age", "24h"
+    min_release_age, min_release_age_str = resolve_min_release_age(
+        args.min_release_age, config
     )
-
-    try:
-        min_release_age = parse_age_threshold(min_release_age_str)
-    except ValueError as e:
-        print(f"{Colors.RED}Error: {e}{Colors.ENDC}", file=sys.stderr)
-        sys.exit(1)
 
     vscode_version = None if no_code_version_check else get_vscode_version(code_binary)
     target_platform = get_local_target_platform()
@@ -2347,15 +2389,9 @@ def handle_update(args, config):
     )
     yes = resolve_option(args.yes, config, "yes", False)
     dry_run = bool(getattr(args, "dry_run", None))
-    min_release_age_str = resolve_option(
-        args.min_release_age, config, "min_release_age", "24h"
+    min_release_age, _min_release_age_str = resolve_min_release_age(
+        args.min_release_age, config
     )
-
-    try:
-        min_release_age = parse_age_threshold(min_release_age_str)
-    except ValueError as e:
-        print(f"{Colors.RED}Error: {e}{Colors.ENDC}", file=sys.stderr)
-        sys.exit(1)
 
     vscode_version = None if no_code_version_check else get_vscode_version(code_binary)
     target_platform = get_local_target_platform()
@@ -2687,8 +2723,7 @@ def handle_list(args, config):
         token = resolve_token_for_service(service_url, args, config)
         vscode_version = get_vscode_version(code_binary)
         target_platform = get_local_target_platform()
-        min_release_age_str = resolve_option(None, config, "min_release_age", "24h")
-        min_release_age = parse_age_threshold(min_release_age_str)
+        min_release_age, _min_release_age_str = resolve_min_release_age(None, config)
 
         filtered_dict = dict(ext_items)
         updates = check_updates(
@@ -2954,14 +2989,9 @@ def handle_search(args, config):
     no_code_version_check = resolve_option(
         args.no_code_version_check, config, "no_code_version_check", False
     )
-    min_release_age_str = resolve_option(
-        args.min_release_age, config, "min_release_age", "24h"
+    min_release_age, _min_release_age_str = resolve_min_release_age(
+        args.min_release_age, config
     )
-    try:
-        min_release_age = parse_age_threshold(min_release_age_str)
-    except ValueError as e:
-        print(f"{Colors.RED}Error: {e}{Colors.ENDC}", file=sys.stderr)
-        sys.exit(1)
 
     vscode_version = None if no_code_version_check else get_vscode_version(code_binary)
     target_platform = get_local_target_platform()
