@@ -690,8 +690,13 @@ def resolve_service_url(args, config):
 
 
 def get_default_config_path():
-    if os.path.exists("./config.toml"):
-        return os.path.abspath("./config.toml")
+    # Deliberately NOT ./config.toml: the config can set `code_binary` (which is
+    # executed) and `service_url` (where VSIX files are fetched from), so picking
+    # one up from the working directory would let any checked-out repository run
+    # arbitrary commands. Use CODE_EXTENSIONS_CONFIG for an explicit override.
+    override = os.environ.get("CODE_EXTENSIONS_CONFIG")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     user_config_dir = os.path.join(base, "code-extensions")
     return os.path.join(user_config_dir, "config.toml")

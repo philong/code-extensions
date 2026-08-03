@@ -183,7 +183,7 @@ code-extensions remove [extension-id...] [options]
 
 ## Configuration File
 
-Set defaults and per-extension rules in `~/.config/code-extensions/config.toml` (or `$XDG_CONFIG_HOME/code-extensions/config.toml` when that variable is set). A `config.toml` in the current working directory takes precedence over both. Because the file can hold an access token, it is written owner-only (`0600`, in a `0700` directory) on Unix-like systems; on Windows it inherits the ACLs of its parent directory instead:
+Set defaults and per-extension rules in `~/.config/code-extensions/config.toml` (or `$XDG_CONFIG_HOME/code-extensions/config.toml` when that variable is set). Set `CODE_EXTENSIONS_CONFIG=/path/to/config.toml` to load a different file; a `config.toml` in the current working directory is *not* picked up automatically, because the file can name the executable to run and the gallery to download from. Because the file can hold an access token, it is written owner-only (`0600`, in a `0700` directory) on Unix-like systems; on Windows it inherits the ACLs of its parent directory instead:
 
 ```toml
 min-release-age = "12h"        # Default release age buffer (e.g., 24h, 3d, 0)
