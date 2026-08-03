@@ -1273,6 +1273,12 @@ def _post_extension_query(payload, service_url, token=None):
     return None
 
 
+# Gallery query flags: IncludeVersions (0x1) | IncludeCategoryAndTags (0x4) |
+# IncludeVersionProperties (0x10). Without the category flag the response simply
+# omits `categories`, which is what `info` reports.
+GALLERY_QUERY_FLAGS = 0x1 | 0x4 | 0x10
+
+
 def query_marketplace_extensions(ext_ids, service_url=DEFAULT_SERVICE_URL, token=None):
     cleanup_stale_cache()
     if not ext_ids:
@@ -1298,7 +1304,7 @@ def query_marketplace_extensions(ext_ids, service_url=DEFAULT_SERVICE_URL, token
                 }
             ],
             "assetTypes": [],
-            "flags": 17,
+            "flags": GALLERY_QUERY_FLAGS,
         }
 
         resp_data = _post_extension_query(payload, service_url, token=token)
