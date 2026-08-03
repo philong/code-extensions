@@ -2499,7 +2499,9 @@ def select_updates(updates, action_label="Install"):
             sys.stdout.flush()
 
             key = get_key()
-            if key in ("ctrl+c", "esc", "q", "Q"):
+            # None means stdin gave EOF (terminal went away); treat it as cancel
+            # rather than looping on a dead descriptor.
+            if key is None or key in ("ctrl+c", "esc", "q", "Q"):
                 raise KeyboardInterrupt
             elif key == "up":
                 cursor_idx = (cursor_idx - 1) % n
@@ -2823,7 +2825,9 @@ def select_removals(installed_exts):
             sys.stdout.flush()
 
             key = get_key()
-            if key in ("ctrl+c", "esc", "q", "Q"):
+            # None means stdin gave EOF (terminal went away); treat it as cancel
+            # rather than looping on a dead descriptor.
+            if key is None or key in ("ctrl+c", "esc", "q", "Q"):
                 raise KeyboardInterrupt
             elif key == "up":
                 cursor_idx = (cursor_idx - 1) % n
@@ -3034,14 +3038,14 @@ def show_search_item_info(item, config, args):
 
     while True:
         key = get_key()
+        if key is None or key in ("q", "Q", "ctrl+c"):
+            return "exit"
         if key in ("i", "I", "enter"):
             return "install"
         elif key in ("b", "B", "esc", "backspace"):
             sys.stdout.write("\033[2J\033[H")
             sys.stdout.flush()
             return "back"
-        elif key in ("q", "Q", "ctrl+c"):
-            return "exit"
 
 
 def install_search_items(ext_ids, config, args):
@@ -3164,7 +3168,9 @@ def interactive_search_flow(search_results, config, args, installed_exts=None):
             sys.stdout.flush()
 
             key = get_key()
-            if key in ("ctrl+c", "esc", "q", "Q"):
+            # None means stdin gave EOF (terminal went away); treat it as cancel
+            # rather than looping on a dead descriptor.
+            if key is None or key in ("ctrl+c", "esc", "q", "Q"):
                 sys.stdout.write("\n\033[?25h")
                 sys.stdout.flush()
                 return
@@ -4149,3 +4155,10 @@ if __name__ == "__main__":
     except BrokenPipeError:
         # e.g. `code-extensions list -q | head`
         os._exit(0)
+    except Exception as e:
+        # A terminal that disappears mid-TUI surfaces as termios.error (not an
+        # OSError subclass) from the raw-mode restore. There is nowhere left to
+        # print a traceback to, so exit like an interrupted run.
+        if HAS_TTY and isinstance(e, termios.error):
+            sys.exit(130)
+        raise
