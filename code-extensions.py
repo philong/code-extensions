@@ -48,6 +48,8 @@ except ImportError:
 # fill the disk (the largest extensions on the Marketplace are ~200MB).
 MAX_VSIX_BYTES = 1024 * 1024 * 1024
 
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
 DEFAULT_SERVICE_URL = "https://marketplace.visualstudio.com/_apis/public/gallery"
 OPEN_VSX_SERVICE_URL = "https://open-vsx.org/vscode/gallery"
 OPEN_VSX_HOST = "open-vsx.org"
@@ -122,6 +124,25 @@ def _enable_windows_vt():
         return False
 
 
+class _AnsiStrippingStream:
+    """Write-through wrapper that removes escape sequences."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        return self._stream.write(ANSI_ESCAPE.sub("", text))
+
+    def writelines(self, lines):
+        # Must not fall through to __getattr__, which would reach the wrapped
+        # stream directly and let escape sequences past the filter.
+        for line in lines:
+            self.write(line)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def enable_colors():
     if not sys.stdout.isatty():
         _disable_colors()
@@ -129,6 +150,11 @@ def enable_colors():
     if os.name == "nt" and not _enable_windows_vt():
         # Legacy console without VT support would print raw escape codes.
         _disable_colors()
+        return
+    # Colors are decided by stdout, but warnings and errors go to stderr, which
+    # may be redirected on its own (`cmd 2>log`). Strip the codes there.
+    if not sys.stderr.isatty():
+        sys.stderr = _AnsiStrippingStream(sys.stderr)
 
 
 def get_local_target_platform():
@@ -1733,6 +1759,26 @@ def get_key():
         b = os.read(fd, 1)
         if not b:
             return None
+        # A non-ASCII keystroke arrives as several bytes; decoding only the first
+        # one yields "" and silently swallows the key.
+        lead = b[0]
+        if lead >= 0x80:
+            if lead >= 0xF0:
+                extra = 3
+            elif lead >= 0xE0:
+                extra = 2
+            elif lead >= 0xC0:
+                extra = 1
+            else:
+                extra = 0
+            for _ in range(extra):
+                rlist, _, _ = select.select([fd], [], [], 0.05)
+                if not rlist:
+                    break
+                more = os.read(fd, 1)
+                if not more:
+                    break
+                b += more
         ch = b.decode("utf-8", errors="ignore")
         if ch == "\x1b":
             rlist, _, _ = select.select([fd], [], [], 0.05)
@@ -1765,11 +1811,8 @@ def get_key():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-ansi_escape = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
-
-
 def display_width(text):
-    clean_text = ansi_escape.sub("", str(text))
+    clean_text = ANSI_ESCAPE.sub("", str(text))
     w = 0
     for ch in clean_text:
         if unicodedata.east_asian_width(ch) in ("F", "W"):
@@ -2263,10 +2306,11 @@ def check_updates(
 
 
 def print_updates_table(updates):
+    widths = (45, 12, 12, 12, 15, 12)
     print(
         f"{Colors.BOLD}{fit_column('Extension ID', 45)} {fit_column('Installed', 12)} {fit_column('Eligible', 12)} {fit_column('Latest', 12)} {fit_column('Release Date', 15)} {fit_column('Platform', 12)}{Colors.ENDC}"
     )
-    print("-" * 115)
+    print("-" * (sum(widths) + len(widths) - 1))
     for update in updates:
         eligible_str = (
             f"{Colors.GREEN}{fit_column(update['eligible'], 12)}{Colors.ENDC}"
@@ -2877,7 +2921,7 @@ def handle_list(args, config):
     print(
         f"{Colors.BOLD}{fit_column('Extension ID', 45)} {fit_column('Version', 15)}{Colors.ENDC}"
     )
-    print("-" * 62)
+    print("-" * (45 + 1 + 15))
     for ext_id, ver in ext_items:
         print(
             f"{Colors.CYAN}{fit_column(ext_id, 45)}{Colors.ENDC} {Colors.YELLOW}{fit_column(ver, 15)}{Colors.ENDC}"
@@ -4017,25 +4061,35 @@ def main():
         parser.print_help()
         sys.exit(0)
 
-    if args.command == "install":
-        handle_install(args, config)
-    elif args.command in ("update", "upgrade"):
-        handle_update(args, config)
-    elif args.command in ("remove", "uninstall", "rm"):
-        handle_remove(args, config)
-    elif args.command in ("list", "ls"):
-        handle_list(args, config)
-    elif args.command == "search":
-        handle_search(args, config)
-    elif args.command in ("info", "show"):
-        handle_info(args, config)
-    elif args.command == "clean":
-        handle_clean(args, config)
-    elif args.command == "config":
-        handle_config(args, config)
-    elif args.command == "completion":
-        handle_completion(args, config)
+    handlers = {
+        "install": handle_install,
+        "update": handle_update,
+        "upgrade": handle_update,
+        "remove": handle_remove,
+        "uninstall": handle_remove,
+        "rm": handle_remove,
+        "list": handle_list,
+        "ls": handle_list,
+        "search": handle_search,
+        "info": handle_info,
+        "show": handle_info,
+        "clean": handle_clean,
+        "config": handle_config,
+        "completion": handle_completion,
+    }
+    handlers[args.command](args, config)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Restore the cursor in case we were interrupted inside a TUI.
+        if sys.stdout.isatty():
+            sys.stdout.write("\033[?25h\n")
+            sys.stdout.flush()
+        print("Aborted.", file=sys.stderr)
+        sys.exit(130)
+    except BrokenPipeError:
+        # e.g. `code-extensions list -q | head`
+        os._exit(0)
