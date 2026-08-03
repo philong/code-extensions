@@ -32,6 +32,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from functools import lru_cache
 
 try:
@@ -42,6 +43,10 @@ try:
     HAS_TTY = True
 except ImportError:
     HAS_TTY = False
+
+# Upper bound on an expanded .vsix, so a hostile or misconfigured gallery cannot
+# fill the disk (the largest extensions on the Marketplace are ~200MB).
+MAX_VSIX_BYTES = 1024 * 1024 * 1024
 
 DEFAULT_SERVICE_URL = "https://marketplace.visualstudio.com/_apis/public/gallery"
 OPEN_VSX_SERVICE_URL = "https://open-vsx.org/vscode/gallery"
@@ -1647,54 +1652,72 @@ def download_vsix(url, filepath, token=None, service_url=None):
             except ValueError:
                 total_size = None
 
-        chunks = []
+        # Marketplace serves /vspackage gzip-encoded; decompress as we go rather
+        # than holding both the compressed and expanded package in memory.
+        decompressor = None
+        if content_encoding == "gzip":
+            decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        elif content_encoding == "deflate":
+            decompressor = zlib.decompressobj()
+
         bytes_read = 0
+        bytes_written = 0
         chunk_size = 32768
+        ok = False
 
-        while True:
-            chunk = response.read(chunk_size)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            bytes_read += len(chunk)
+        fd = open_for_download(filepath)
+        try:
+            with os.fdopen(fd, "wb") as f:
 
-            if not show_progress:
-                continue
-            if total_size and total_size > 0:
-                percent = (bytes_read * 100) // total_size
-                bar_len = 30
-                filled_len = int(round(bar_len * bytes_read / float(total_size)))
-                bar = "=" * filled_len + " " * (bar_len - filled_len)
+                def emit(data):
+                    nonlocal bytes_written
+                    if not data:
+                        return
+                    bytes_written += len(data)
+                    if bytes_written > MAX_VSIX_BYTES:
+                        raise ValueError(
+                            f"package exceeds the {MAX_VSIX_BYTES // (1024 * 1024)}MB limit"
+                        )
+                    f.write(data)
 
-                read_mb = bytes_read / (1024 * 1024)
-                total_mb = total_size / (1024 * 1024)
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    bytes_read += len(chunk)
+                    emit(decompressor.decompress(chunk) if decompressor else chunk)
+                    report_download_progress(show_progress, bytes_read, total_size)
 
-                sys.stdout.write(
-                    f"\r  [{bar}] {percent}% ({read_mb:.2f}MB / {total_mb:.2f}MB)"
-                )
-                sys.stdout.flush()
-            else:
-                read_mb = bytes_read / (1024 * 1024)
-                sys.stdout.write(f"\r  Downloaded: {read_mb:.2f}MB")
-                sys.stdout.flush()
+                if decompressor:
+                    emit(decompressor.flush())
+            ok = True
+        finally:
+            if not ok:
+                # Never leave a truncated package behind for `--install-extension`.
+                try:
+                    os.remove(filepath)
+                except OSError:
+                    pass
 
         if show_progress and (total_size or bytes_read > 0):
             sys.stdout.write("\n")
             sys.stdout.flush()
 
-        body = b"".join(chunks)
 
-        if content_encoding == "gzip":
-            import gzip
-
-            body = gzip.decompress(body)
-        elif content_encoding == "deflate":
-            import zlib
-
-            body = zlib.decompress(body)
-
-        with os.fdopen(open_for_download(filepath), "wb") as f:
-            f.write(body)
+def report_download_progress(show_progress, bytes_read, total_size):
+    if not show_progress:
+        return
+    read_mb = bytes_read / (1024 * 1024)
+    if total_size and total_size > 0:
+        percent = (bytes_read * 100) // total_size
+        bar_len = 30
+        filled_len = int(round(bar_len * bytes_read / float(total_size)))
+        bar = "=" * filled_len + " " * (bar_len - filled_len)
+        total_mb = total_size / (1024 * 1024)
+        sys.stdout.write(f"\r  [{bar}] {percent}% ({read_mb:.2f}MB / {total_mb:.2f}MB)")
+    else:
+        sys.stdout.write(f"\r  Downloaded: {read_mb:.2f}MB")
+    sys.stdout.flush()
 
 
 def get_key():
