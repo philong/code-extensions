@@ -399,29 +399,47 @@ def released_long_enough(ver_obj, min_age):
         return True
 
 
+CACHE_FILE_PREFIX = "vscode_ext_cache_"
+
+
 def get_cache_dir():
+    """Return the private cache directory, or None if it cannot be secured.
+
+    Falling back to the shared temp directory would put cache files under
+    world-writable, fully predictable paths, letting a local attacker pre-create
+    one and dictate which download URL the tool trusts. Losing the cache is the
+    lesser evil.
+    """
     base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
     cache_dir = os.path.join(base, "code-extensions")
     try:
         os.makedirs(cache_dir, mode=0o700, exist_ok=True)
-    except Exception:
-        return tempfile.gettempdir()
+    except OSError:
+        return None
+    # makedirs ignores mode for an existing directory.
+    restrict_to_owner(cache_dir, 0o700)
     return cache_dir
 
 
+def is_cache_file(filename):
+    return filename.startswith(CACHE_FILE_PREFIX) and filename.endswith(".json")
+
+
 def cleanup_stale_cache():
+    cache_dir = get_cache_dir()
+    if not cache_dir:
+        return
     try:
-        cache_dir = get_cache_dir()
         now = time.time()
         for filename in os.listdir(cache_dir):
-            if filename.startswith("vscode_ext_cache_") and filename.endswith(".json"):
+            if is_cache_file(filename):
                 filepath = os.path.join(cache_dir, filename)
                 try:
                     if now - os.path.getmtime(filepath) > 3600:
                         os.remove(filepath)
-                except Exception:
+                except OSError:
                     pass
-    except Exception:
+    except OSError:
         pass
 
 
@@ -1150,19 +1168,32 @@ def _post_extension_query(payload, service_url, token=None):
         token = os.environ.get("OVSX_PAT")
 
     req_data = json.dumps(payload).encode("utf-8")
-    cache_key_data = {"service_url": service_url, "payload": payload}
-    payload_hash = hashlib.sha256(
-        json.dumps(cache_key_data, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    cache_file = os.path.join(get_cache_dir(), f"vscode_ext_cache_{payload_hash}.json")
+    cache_dir = get_cache_dir()
+    cache_file = None
+    if cache_dir:
+        cache_key_data = {
+            "service_url": service_url,
+            "payload": payload,
+            # An authenticated response can differ from an anonymous one, so keep
+            # their cache entries apart without storing the token itself.
+            "token": hashlib.sha256(token.encode("utf-8")).hexdigest()
+            if token
+            else None,
+        }
+        payload_hash = hashlib.sha256(
+            json.dumps(cache_key_data, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cache_file = os.path.join(
+            cache_dir, f"{CACHE_FILE_PREFIX}{payload_hash}.json"
+        )
 
-    if os.path.exists(cache_file):
-        try:
-            if time.time() - os.path.getmtime(cache_file) < 3600:
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception:
-            pass
+        if os.path.exists(cache_file):
+            try:
+                if time.time() - os.path.getmtime(cache_file) < 3600:
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        return json.load(f)
+            except (OSError, ValueError):
+                pass
 
     query_endpoint = f"{service_url.rstrip('/')}/extensionquery"
     if "api-version=" not in query_endpoint:
@@ -1191,11 +1222,12 @@ def _post_extension_query(payload, service_url, token=None):
         try:
             with _url_opener.open(req, timeout=30) as response:
                 resp_data = json.loads(response.read().decode("utf-8"))
-            try:
-                with open(cache_file, "w", encoding="utf-8") as f:
-                    json.dump(resp_data, f)
-            except Exception:
-                pass
+            if cache_file:
+                try:
+                    with open(cache_file, "w", encoding="utf-8") as f:
+                        json.dump(resp_data, f)
+                except OSError:
+                    pass
             return resp_data
         except urllib.error.HTTPError as e:
             err = e
@@ -3174,6 +3206,17 @@ def handle_info(args, config):
     print(f"    {description}\n")
 
 
+def dir_size(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
 def handle_clean(args, config):
     cache_dir = get_cache_dir()
     temp_dir = tempfile.gettempdir()
@@ -3183,29 +3226,37 @@ def handle_clean(args, config):
 
     print(f"{Colors.BLUE}Cleaning cached data and temporary files...{Colors.ENDC}")
 
-    if os.path.exists(cache_dir):
+    if cache_dir and os.path.exists(cache_dir):
         for f in os.listdir(cache_dir):
-            if f.endswith(".json"):
+            if is_cache_file(f):
                 fp = os.path.join(cache_dir, f)
                 try:
                     size = os.path.getsize(fp)
                     os.remove(fp)
                     cleaned_files += 1
                     freed_bytes += size
-                except Exception:
+                except OSError:
                     pass
 
+    # Download directories left behind by an interrupted run. Anything younger
+    # than an hour may belong to a concurrent invocation, so leave it alone.
     if os.path.exists(temp_dir):
+        now = time.time()
         for f in os.listdir(temp_dir):
-            if f.endswith(".vsix") and ("vscode_ext" in f or f.startswith("ext_")):
-                fp = os.path.join(temp_dir, f)
-                try:
-                    size = os.path.getsize(fp)
-                    os.remove(fp)
-                    cleaned_files += 1
-                    freed_bytes += size
-                except Exception:
-                    pass
+            if not f.startswith("code-extensions-"):
+                continue
+            fp = os.path.join(temp_dir, f)
+            if not os.path.isdir(fp) or os.path.islink(fp):
+                continue
+            try:
+                if now - os.path.getmtime(fp) <= 3600:
+                    continue
+                size = dir_size(fp)
+                shutil.rmtree(fp)
+                cleaned_files += 1
+                freed_bytes += size
+            except OSError:
+                pass
 
     freed_kb = freed_bytes / 1024.0
     if freed_kb > 1024:
