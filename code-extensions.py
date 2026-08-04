@@ -2085,6 +2085,10 @@ def handle_install(args, config):
         spec = spec.strip()
         if "@" in spec:
             ext_id, req_ver = spec.rsplit("@", 1)
+            # A trailing '@' pins nothing. filter_versions tests the pin with
+            # 'is not None', so leaving it as '' would match no version and turn
+            # 'publisher.name@' into 'no compatible version found'.
+            req_ver = req_ver.strip() or None
         else:
             ext_id, req_ver = spec, None
         ext_id_lower = ext_id.lower()
