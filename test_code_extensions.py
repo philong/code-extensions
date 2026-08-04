@@ -51,6 +51,17 @@ class TestSemverAndEngineCompatibility(unittest.TestCase):
             ("0.81.0", "^0.80.x", False),  # Caret below 1.0.0 pins the minor
             ("0.80.5", "^0.80.x", True),
             ("1.81.0", "~1.80.x", False),  # Tilde keeps the wildcard's ceiling
+            # A comparator applies to the wildcard range as a whole.
+            ("1.80.5", ">1.80.x", False),
+            ("1.81.0", ">1.80.x", True),
+            ("1.80.0", ">=1.80.x", True),
+            ("1.80.0", "<1.80.x", False),
+            ("1.80.5", "<=1.80.x", True),
+            ("1.81.0", "<=1.80.x", False),
+            # An unbounded wildcard constrains nothing, comparator or not.
+            ("1.85.0", "x", True),
+            ("1.85.0", "<=x", True),
+            ("1.85.0", ">x", True),
             ("1.85.0", ">=1.80.0 <1.90.0", True),
             ("1.91.0", ">=1.80.0 <1.90.0", False),
             ("1.50.0", "1.0.0 - 2.0.0", True),

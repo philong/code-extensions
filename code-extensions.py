@@ -392,7 +392,13 @@ def is_engine_compatible(vscode_version_str, engine_constraint):
     x_range = expand_x_range(version_str)
     if x_range is not None:
         lower, upper = x_range
-        if op == "^" and upper is not None:
+        if upper is None:
+            # A wildcard with nothing fixed in front of it ('x', '*') bounds
+            # nothing, whichever comparator precedes it. Semver reads '>x' and
+            # '<x' as matching no version at all, but an engine spelled that way
+            # is a typo, and discarding every version is the worse guess.
+            return True
+        if op == "^":
             # A caret widens the wildcard's ceiling to the next major, so
             # '^1.80.x' means '>=1.80.0 <2.0.0' rather than the '<1.81.0' the
             # wildcard alone would give. Below 1.0.0 the caret pins the leading
@@ -402,15 +408,16 @@ def is_engine_compatible(vscode_version_str, engine_constraint):
             if major > 0:
                 upper = f"{major + 1}.0.0"
         if op in (None, "", "=", "==", "^", "~"):
-            if upper is None:
-                return True
             return is_engine_compatible(
                 vscode_version_str, f">={lower}"
             ) and is_engine_compatible(vscode_version_str, f"<{upper}")
-        # With an explicit comparator, the wildcard just drops out: '>=1.80.x'
-        # is '>=1.80.0', '<=1.x' is '<2.0.0'.
-        if op == "<=" and upper is not None:
+        # An explicit comparator applies to the range as a whole, so it collapses
+        # onto whichever bound it faces: '>=1.80.x' and '<1.80.x' clamp at
+        # 1.80.0, while '<=1.80.x' and '>1.80.x' take in the entire 1.80 line.
+        if op == "<=":
             return is_engine_compatible(vscode_version_str, f"<{upper}")
+        if op == ">":
+            return is_engine_compatible(vscode_version_str, f">={upper}")
         version_str = lower
 
     if not op:
