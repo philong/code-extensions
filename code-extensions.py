@@ -606,6 +606,15 @@ def is_cache_file(filename):
     )
 
 
+def is_cache_temp_file(filename):
+    """Whether the name is a cache entry mid-write rather than a finished one.
+
+    A .tmp still belonging to a live process must not be removed: its os.replace
+    would then fail and that run would lose the entry it just fetched.
+    """
+    return is_cache_file(filename) and filename.endswith(".tmp")
+
+
 def write_cache_atomically(cache_file, payload):
     """Write a cache entry via a temporary file and a rename.
 
@@ -3441,11 +3450,17 @@ def handle_clean(args, config):
 
     print(f"{Colors.BLUE}Cleaning cached data and temporary files...{Colors.ENDC}")
 
+    now = time.time()
+
     if cache_dir and os.path.exists(cache_dir):
         for f in os.listdir(cache_dir):
             if is_cache_file(f):
                 fp = os.path.join(cache_dir, f)
                 try:
+                    # Same one-hour grace period as the temp directory below: a
+                    # young .tmp is probably a concurrent run still writing it.
+                    if is_cache_temp_file(f) and now - os.path.getmtime(fp) <= 3600:
+                        continue
                     size = os.path.getsize(fp)
                     os.remove(fp)
                     cleaned_files += 1
@@ -3456,7 +3471,6 @@ def handle_clean(args, config):
     # Download directories left behind by an interrupted run. Anything younger
     # than an hour may belong to a concurrent invocation, so leave it alone.
     if os.path.exists(temp_dir):
-        now = time.time()
         for f in os.listdir(temp_dir):
             if not f.startswith("code-extensions-"):
                 continue

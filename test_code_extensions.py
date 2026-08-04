@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import contextlib
 import datetime
 import email
 import importlib.util
@@ -8,6 +9,7 @@ import json
 import os
 import random
 import tempfile
+import time
 import unittest
 import urllib.request
 from unittest.mock import MagicMock, patch
@@ -463,6 +465,33 @@ class TestAtomicCacheAndFileSecurity(unittest.TestCase):
         self.assertTrue(ce.is_cache_file("vscode_ext_cache_12345.json"))
         self.assertTrue(ce.is_cache_file("vscode_ext_cache_12345.tmp"))
         self.assertFalse(ce.is_cache_file("other_file.json"))
+
+    def test_clean_spares_a_temp_file_a_concurrent_run_may_own(self):
+        with (
+            tempfile.TemporaryDirectory() as cache_dir,
+            tempfile.TemporaryDirectory() as temp_dir,
+        ):
+            fresh = os.path.join(cache_dir, "vscode_ext_cache_a.json.999.tmp")
+            stale = os.path.join(cache_dir, "vscode_ext_cache_b.json.998.tmp")
+            entry = os.path.join(cache_dir, "vscode_ext_cache_c.json")
+            for path in (fresh, stale, entry):
+                with open(path, "w") as f:
+                    f.write("{}")
+            old = time.time() - 7200
+            os.utime(stale, (old, old))
+
+            with (
+                patch.object(ce, "get_cache_dir", return_value=cache_dir),
+                patch.object(ce.tempfile, "gettempdir", return_value=temp_dir),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                ce.handle_clean(MagicMock(), {})
+
+            # A .tmp younger than an hour belongs to a run still writing it;
+            # removing it would make its os.replace fail.
+            self.assertEqual(
+                sorted(os.listdir(cache_dir)), ["vscode_ext_cache_a.json.999.tmp"]
+            )
 
 
 # =====================================================================
