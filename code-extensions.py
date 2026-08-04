@@ -2451,6 +2451,7 @@ def run_list_picker(
     unit_label,
     selected=None,
     cursor_idx=0,
+    top=0,
     toggle_all=None,
     extra_keys=(),
 ):
@@ -2459,19 +2460,19 @@ def run_list_picker(
     Shared by the update, removal and search screens, which differ only in their
     columns, action bar and what a commit means. layout(cols) returns the column
     widths for the current terminal plus the total row width; header and row
-    render with those widths. Returns (action, selected, cursor_idx) where action
-    is "confirm", "quit", or whichever of extra_keys was pressed, so the caller
-    can act and, if it wants, resume with the same selection.
+    render with those widths. Returns (action, selected, cursor_idx, top) where
+    action is "confirm", "quit", or whichever of extra_keys was pressed, so the
+    caller can act and, if it wants, resume with the same selection and the same
+    stretch of the list on screen.
     """
     if count <= 0:
         # Nothing to show. The window height is clamped to at least one row, so
         # rendering would index an empty list and the cursor arithmetic would
         # divide by zero.
-        return "quit", [], 0
+        return "quit", [], 0, 0
 
     if selected is None:
         selected = [False] * count
-    top = 0
     first_frame = True
     prev_lines = 0
 
@@ -2521,11 +2522,11 @@ def run_list_picker(
 
             key = get_key()
             if key in extra_keys:
-                return key, selected, cursor_idx
+                return key, selected, cursor_idx, top
             # None means stdin gave EOF (terminal went away); treat it as cancel
             # rather than looping on a dead descriptor.
             if key is None or key in ("ctrl+c", "esc", "q", "Q"):
-                return "quit", selected, cursor_idx
+                return "quit", selected, cursor_idx, top
             elif key == "up":
                 cursor_idx = (cursor_idx - 1) % count
             elif key == "down":
@@ -2538,7 +2539,7 @@ def run_list_picker(
                 else:
                     selected = toggle_all() if toggle_all else [True] * count
             elif key == "enter":
-                return "confirm", selected, cursor_idx
+                return "confirm", selected, cursor_idx, top
     finally:
         sys.stdout.write("\n\033[?25h")
         sys.stdout.flush()
@@ -2586,7 +2587,7 @@ def select_updates(updates, action_label="Install"):
 
     eligible_mask = [bool(u["eligible"]) for u in updates]
     try:
-        action, selected, _cursor = run_list_picker(
+        action, selected, _cursor, _top = run_list_picker(
             n,
             layout,
             header,
@@ -2851,7 +2852,7 @@ def select_removals(installed_exts):
         )
 
     try:
-        action, selected, _cursor = run_list_picker(
+        action, selected, _cursor, _top = run_list_picker(
             n,
             layout,
             header,
@@ -3140,9 +3141,12 @@ def interactive_search_flow(search_results, config, args, installed_exts=None):
 
     selected = [False] * n
     cursor_idx = 0
+    # Carried across the detail view so returning to the list shows the same
+    # window rather than scrolling the cursor's row to the bottom.
+    top = 0
     try:
         while True:
-            action, selected, cursor_idx = run_list_picker(
+            action, selected, cursor_idx, top = run_list_picker(
                 n,
                 layout,
                 header,
@@ -3151,6 +3155,7 @@ def interactive_search_flow(search_results, config, args, installed_exts=None):
                 "result",
                 selected=selected,
                 cursor_idx=cursor_idx,
+                top=top,
                 extra_keys=("enter", "i", "I"),
             )
             if action == "quit":

@@ -514,7 +514,7 @@ class TestCLIAndBinaryParsing(unittest.TestCase):
         def boom(*args, **kwargs):  # pragma: no cover - must not be reached
             raise AssertionError("nothing should be rendered for an empty list")
 
-        action, selected, cursor = ce.run_list_picker(
+        action, selected, cursor, top = ce.run_list_picker(
             0,
             layout=boom,
             header=boom,
@@ -522,7 +522,29 @@ class TestCLIAndBinaryParsing(unittest.TestCase):
             actions=[],
             unit_label="thing",
         )
-        self.assertEqual((action, selected, cursor), ("quit", [], 0))
+        self.assertEqual((action, selected, cursor, top), ("quit", [], 0, 0))
+
+    def test_run_list_picker_hands_back_the_scroll_offset(self):
+        """The caller resumes with it, so leaving the list must not reset the
+        window to wherever the cursor happens to sit."""
+        with (
+            patch.object(ce, "get_key", return_value="q"),
+            patch.object(
+                ce.shutil, "get_terminal_size", return_value=os.terminal_size((80, 9))
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            action, _selected, cursor, top = ce.run_list_picker(
+                100,
+                layout=lambda cols: ({}, 40),
+                header=lambda widths: "header",
+                row=lambda i, widths, is_cursor, is_selected: f"row {i}",
+                actions=[],
+                unit_label="thing",
+                cursor_idx=50,
+                top=48,
+            )
+        self.assertEqual((action, cursor, top), ("quit", 50, 48))
 
     @patch("subprocess.run")
     def test_get_installed_extensions(self, mock_run):
