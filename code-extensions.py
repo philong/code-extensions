@@ -4129,7 +4129,14 @@ if __name__ == "__main__":
     except Exception as e:
         # A terminal that disappears mid-TUI surfaces as termios.error (not an
         # OSError subclass) from the raw-mode restore. There is nowhere left to
-        # print a traceback to, so exit like an interrupted run.
+        # print a traceback to, so exit like an interrupted run -- but say so on
+        # stderr, because the same error also comes from a tcgetattr that fails
+        # on a descriptor isatty() nonetheless called a terminal, and vanishing
+        # with no output at all leaves nothing to debug.
         if HAS_TTY and isinstance(e, termios.error):
+            try:
+                print(f"Terminal error: {e}", file=sys.stderr)
+            except OSError:
+                pass
             sys.exit(130)
         raise
