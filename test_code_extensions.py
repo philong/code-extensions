@@ -43,6 +43,14 @@ class TestSemverAndEngineCompatibility(unittest.TestCase):
             ("1.86.0-insider", "^1.86.0", True),  # Insider build handling
             ("1.80.5", "1.80.x", True),  # Wildcard range expansion
             ("1.81.0", "1.80.x", False),
+            # A caret over a wildcard reaches to the next major.
+            ("1.85.0", "^1.80.x", True),
+            ("1.79.0", "^1.80.x", False),
+            ("2.0.0", "^1.80.x", False),
+            ("1.85.0", "^1.x", True),
+            ("0.81.0", "^0.80.x", False),  # Caret below 1.0.0 pins the minor
+            ("0.80.5", "^0.80.x", True),
+            ("1.81.0", "~1.80.x", False),  # Tilde keeps the wildcard's ceiling
             ("1.85.0", ">=1.80.0 <1.90.0", True),
             ("1.91.0", ">=1.80.0 <1.90.0", False),
             ("1.50.0", "1.0.0 - 2.0.0", True),

@@ -392,6 +392,15 @@ def is_engine_compatible(vscode_version_str, engine_constraint):
     x_range = expand_x_range(version_str)
     if x_range is not None:
         lower, upper = x_range
+        if op == "^" and upper is not None:
+            # A caret widens the wildcard's ceiling to the next major, so
+            # '^1.80.x' means '>=1.80.0 <2.0.0' rather than the '<1.81.0' the
+            # wildcard alone would give. Below 1.0.0 the caret pins the leading
+            # non-zero component, which is the bound the wildcard already
+            # carries ('^0.80.x' stays '<0.81.0').
+            major = semver_parts(lower)[0]
+            if major > 0:
+                upper = f"{major + 1}.0.0"
         if op in (None, "", "=", "==", "^", "~"):
             if upper is None:
                 return True
