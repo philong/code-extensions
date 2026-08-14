@@ -2352,6 +2352,29 @@ class TestHandleConfigIntegration(unittest.TestCase):
                 after_unset = ce.load_config()
                 self.assertNotIn("min_release_age", after_unset)
 
+    def test_handle_config_list_hides_the_token(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, "config.toml")
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write('open-vsx-token = "super-secret"\n')
+
+            with patch.object(ce, "get_default_config_path", return_value=config_path):
+                config = ce.load_config()
+                list_args = argparse.Namespace(action="list", key=None, value=None)
+                with contextlib.redirect_stdout(io.StringIO()) as list_out:
+                    ce.handle_config(list_args, config)
+
+                get_args = argparse.Namespace(
+                    action="get", key="open_vsx_token", value=None
+                )
+                with contextlib.redirect_stdout(io.StringIO()) as get_out:
+                    ce.handle_config(get_args, config)
+
+        self.assertNotIn("super-secret", list_out.getvalue())
+        self.assertIn("open_vsx_token", list_out.getvalue())
+        # Asking for it by name still prints it.
+        self.assertEqual(get_out.getvalue().strip(), "super-secret")
+
     def test_handle_config_still_reaches_a_legacy_malformed_extension_entry(self):
         # Releases before id validation accepted 'foo.ignore' and wrote an
         # [extensions.foo] section. 'set' now refuses to create one, but 'get'

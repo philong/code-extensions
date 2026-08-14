@@ -1244,6 +1244,21 @@ def save_config(config, config_path):
     write_config_text(dump_toml(config), config_path)
 
 
+SECRET_CONFIG_KEYS = frozenset({"open_vsx_token"})
+
+
+def redact_config_value(key, value):
+    """Render a config value for display, masking anything secret.
+
+    'config list' is the one command whose output tends to end up in a bug
+    report or a screen share, so the token is shown only when asked for by name
+    with 'config get'.
+    """
+    if key in SECRET_CONFIG_KEYS and value:
+        return f"{Colors.YELLOW}<set, hidden>{Colors.ENDC}"
+    return repr(value)
+
+
 def config_table_path(target_type, ext_id):
     """The TOML table an edited key lives in: None for a global setting."""
     return None if target_type == "global" else ("extensions", ext_id.lower())
@@ -1572,7 +1587,9 @@ def handle_config(args, config):
         globals_found = False
         for k in sorted(config.keys()):
             if k != "extensions":
-                print(f"  {Colors.CYAN}{k:<22}{Colors.ENDC} = {config[k]!r}")
+                print(
+                    f"  {Colors.CYAN}{k:<22}{Colors.ENDC} = {redact_config_value(k, config[k])}"
+                )
                 globals_found = True
         if not globals_found:
             print("  (no global settings overridden)")
