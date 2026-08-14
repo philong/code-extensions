@@ -18,6 +18,7 @@
 import argparse
 import datetime
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -1575,13 +1576,32 @@ def _post_extension_query(payload, service_url, token=None):
                     retry_after = float(ra.strip())
         except (urllib.error.URLError, TimeoutError) as e:
             err = e
-            reason = str(getattr(e, "reason", e)).lower()
+            # urllib wraps any OSError raised while connecting or sending into
+            # URLError, so a refused or reset connection arrives here rather
+            # than in the ConnectionError clause below, which only ever sees
+            # failures raised while reading the response body.
+            cause = getattr(e, "reason", None)
+            reason = str(cause if cause is not None else e).lower()
             if (
                 isinstance(e, TimeoutError)
+                or isinstance(cause, TimeoutError)
                 or "timed out" in reason
                 or "timeout" in reason
             ):
                 retry_reason = "request timed out"
+            elif isinstance(cause, ConnectionError):
+                retry_reason = "connection failed"
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            http.client.HTTPException,
+            ConnectionError,
+        ) as e:
+            err = e
+            if isinstance(e, (json.JSONDecodeError, UnicodeDecodeError)):
+                retry_reason = "returned invalid or truncated JSON response"
+            else:
+                retry_reason = "connection interrupted or incomplete read"
         except Exception as e:
             err = e
 

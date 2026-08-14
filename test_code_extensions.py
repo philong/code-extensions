@@ -3,6 +3,7 @@
 import contextlib
 import datetime
 import email
+import http.client
 import importlib.util
 import io
 import json
@@ -560,6 +561,80 @@ class TestCLIAndBinaryParsing(unittest.TestCase):
                 "charliermarsh.ruff": "0.0.1",
             },
         )
+
+
+# =====================================================================
+# Network Retry Tests
+# =====================================================================
+class TestNetworkRetry(unittest.TestCase):
+    @patch.object(ce, "get_cache_dir", return_value=None)
+    @patch.object(ce.time, "sleep")
+    def test_post_extension_query_retries_on_json_decode_error(
+        self, mock_sleep, mock_cache
+    ):
+        resp_bad = MagicMock()
+        resp_bad.read.return_value = b"<!DOCTYPE html><html>Gateway Error</html>"
+        resp_bad.__enter__.return_value = resp_bad
+        resp_bad.__exit__.return_value = None
+
+        resp_good = MagicMock()
+        resp_good.read.return_value = b'{"results": [{"extensions": []}]}'
+        resp_good.__enter__.return_value = resp_good
+        resp_good.__exit__.return_value = None
+
+        with (
+            patch.object(ce._url_opener, "open", side_effect=[resp_bad, resp_good]),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            result = ce._post_extension_query(
+                {"dummy": True}, "https://example.com/gallery"
+            )
+        self.assertEqual(result, {"results": [{"extensions": []}]})
+        mock_sleep.assert_called_once()
+
+    @patch.object(ce, "get_cache_dir", return_value=None)
+    @patch.object(ce.time, "sleep")
+    def test_post_extension_query_retries_on_incomplete_read(
+        self, mock_sleep, mock_cache
+    ):
+        resp_good = MagicMock()
+        resp_good.read.return_value = b'{"results": []}'
+        resp_good.__enter__.return_value = resp_good
+        resp_good.__exit__.return_value = None
+
+        with (
+            patch.object(
+                ce._url_opener,
+                "open",
+                side_effect=[http.client.IncompleteRead(b"partial"), resp_good],
+            ),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            result = ce._post_extension_query(
+                {"dummy": True}, "https://example.com/gallery"
+            )
+        self.assertEqual(result, {"results": []})
+        mock_sleep.assert_called_once()
+
+    @patch.object(ce, "get_cache_dir", return_value=None)
+    @patch.object(ce.time, "sleep")
+    def test_post_extension_query_exhausts_retries_on_persistent_bad_json(
+        self, mock_sleep, mock_cache
+    ):
+        resp_bad = MagicMock()
+        resp_bad.read.return_value = b"garbage"
+        resp_bad.__enter__.return_value = resp_bad
+        resp_bad.__exit__.return_value = None
+
+        with (
+            patch.object(ce._url_opener, "open", return_value=resp_bad),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            result = ce._post_extension_query(
+                {"dummy": True}, "https://example.com/gallery"
+            )
+        self.assertIsNone(result)
+        self.assertEqual(mock_sleep.call_count, 3)
 
 
 if __name__ == "__main__":
