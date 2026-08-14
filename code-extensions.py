@@ -4311,7 +4311,7 @@ def main():
         "--yes",
         action="store_true",
         default=None,
-        help="Non-interactive mode (automatically accept held-back or eligible versions)",
+        help="Non-interactive mode (install a pinned version even when held back; otherwise skip held-back extensions instead of prompting)",
     )
     parser_install.add_argument(
         "-a",

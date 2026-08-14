@@ -17,14 +17,14 @@ A Python script to install, update, list, search, and remove VS Code extensions 
 
 ## Installation
 
-Ensure you have Python 3 installed. Make the script executable and run:
+Ensure you have Python 3.9 or newer installed. Make the script executable and run:
 
 ```bash
 chmod +x code-extensions.py
 ./code-extensions --help
 ```
 
-No external Python dependencies are required (uses standard library modules like `urllib`, `subprocess`, and `argparse`).
+No external Python dependencies are required (uses standard library modules like `urllib`, `subprocess`, and `argparse`). The config file is read with the standard library's `tomllib` on Python 3.11+, falling back to `tomli` or `toml` when either is installed, and to a built-in parser otherwise.
 
 ---
 
@@ -60,7 +60,7 @@ code-extensions install [extension-id...] [options]
 * `-p`, `--include-prerelease`: Allow pre-release versions.
 * `-V`, `--no-code-version-check`: Disable VS Code host compatibility check.
 * `-d`, `--download-dir <path>`: Directory for downloading `.vsix` files.
-* `-y`, `--yes`: Non-interactive mode.
+* `-y`, `--yes`: Non-interactive mode. A version pinned with `@` is installed even when it is held back by the release-age policy; an unpinned extension whose only release is held back is skipped rather than prompted for.
 * `-a`, `--min-release-age <age>`: Minimum release age threshold (e.g. `24h`, `3d`, `0`).
 * `--force`: Force re-installation even if the target version is already installed.
 
