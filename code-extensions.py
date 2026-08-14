@@ -50,6 +50,12 @@ except ImportError:
 # fill the disk (the largest extensions on the Marketplace are ~200MB).
 MAX_VSIX_BYTES = 1024 * 1024 * 1024
 
+# Every way a package download can fail: urllib's URLError/HTTPError and any
+# failure writing the .vsix to disk (OSError), a truncated or otherwise
+# malformed HTTP response (HTTPException), a corrupt compressed body
+# (zlib.error), and the size cap above (ValueError).
+DOWNLOAD_ERRORS = (OSError, http.client.HTTPException, zlib.error, ValueError)
+
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 DEFAULT_SERVICE_URL = "https://marketplace.visualstudio.com/_apis/public/gallery"
@@ -2339,9 +2345,7 @@ def handle_install(args, config):
         )
         try:
             download_vsix(url, filepath, token=token, service_url=service_url)
-        # urllib's URLError/HTTPError are OSError subclasses, as is any failure
-        # writing the .vsix to disk.
-        except OSError as e:
+        except DOWNLOAD_ERRORS as e:
             print(f"{Colors.RED}✗ Download failed: {e}{Colors.ENDC}", file=sys.stderr)
             continue
 
@@ -2870,9 +2874,7 @@ def handle_update(args, config):
         )
         try:
             download_vsix(url, filepath, token=token, service_url=service_url)
-        # urllib's URLError/HTTPError are OSError subclasses, as is any failure
-        # writing the .vsix to disk.
-        except OSError as e:
+        except DOWNLOAD_ERRORS as e:
             print(f"{Colors.RED}✗ Download failed: {e}{Colors.ENDC}", file=sys.stderr)
             continue
 

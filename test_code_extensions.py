@@ -854,7 +854,12 @@ class TestDownloadVsix(unittest.TestCase):
             captured["req"] = req
             return response
 
-        with patch.object(ce._url_opener, "open", side_effect=fake_open):
+        # download_vsix draws a progress line when stdout is a terminal, which it
+        # is when this file is run directly rather than through a pipe.
+        with (
+            patch.object(ce._url_opener, "open", side_effect=fake_open),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
             ce.download_vsix(url, self.filepath, **kwargs)
         return captured["req"]
 
@@ -909,6 +914,26 @@ class TestDownloadVsix(unittest.TestCase):
                     service_url=service_url,
                 )
                 self.assertNotIn("Authorization", req.headers)
+
+    def test_download_refuses_an_oversized_package(self):
+        with (
+            patch.object(ce, "MAX_VSIX_BYTES", 8),
+            self.assertRaises(ce.DOWNLOAD_ERRORS),
+        ):
+            self.download(
+                FakeDownloadResponse(b"x" * 64),
+                "https://open-vsx.org/api/pub/ext/file.vsix",
+            )
+        # A truncated package must never be left behind for --install-extension.
+        self.assertFalse(os.path.exists(self.filepath))
+
+    def test_download_refuses_a_corrupt_compressed_package(self):
+        with self.assertRaises(ce.DOWNLOAD_ERRORS):
+            self.download(
+                FakeDownloadResponse(b"not actually gzip", {"Content-Encoding": "gzip"}),
+                "https://open-vsx.org/api/pub/ext/file.vsix",
+            )
+        self.assertFalse(os.path.exists(self.filepath))
 
     def test_download_decompresses_a_gzip_encoded_package(self):
         compressor = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
@@ -1219,6 +1244,47 @@ class TestHandleInstallIntegration(unittest.TestCase):
 
         call_url = mock_download.call_args[0][0]
         self.assertIn("2024.1.0", call_url)
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(
+        ce,
+        "download_vsix",
+        side_effect=ValueError("package exceeds the 1024MB limit"),
+    )
+    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_install_reports_an_oversized_package(
+        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
+    ):
+        mock_query.return_value = {
+            "ms-python.python": make_mock_gallery_extension(
+                "ms-python", "python", "2024.2.0"
+            )
+        }
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=["ms-python.python"],
+            file=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            yes=True,
+            min_release_age="0",
+            download_dir=None,
+            force=False,
+        )
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            ce.handle_install(args, self.config)
+
+        # A rejected package is a reported failure, not a traceback.
+        self.assertIn("Download failed", err.getvalue())
+        mock_run.assert_not_called()
 
     @patch.object(ce, "download_vsix")
     @patch.object(ce, "get_installed_extensions", return_value={})
