@@ -434,7 +434,7 @@ class TestAtomicCacheAndFileSecurity(unittest.TestCase):
             ce.write_cache_atomically(cache_file, payload)
 
             self.assertTrue(os.path.exists(cache_file))
-            with open(cache_file, "r") as f:
+            with open(cache_file) as f:
                 self.assertEqual(json.load(f), payload)
             # No half-written temporary file may survive a successful write.
             self.assertEqual(os.listdir(tmp_dir), ["test_cache.json"])
@@ -449,7 +449,7 @@ class TestAtomicCacheAndFileSecurity(unittest.TestCase):
 
             # The previous entry survives and no .tmp is left over.
             self.assertEqual(os.listdir(tmp_dir), ["test_cache.json"])
-            with open(cache_file, "r") as f:
+            with open(cache_file) as f:
                 self.assertEqual(json.load(f), {"good": 1})
 
     def test_write_cache_atomically_ignores_unwritable_directory(self):

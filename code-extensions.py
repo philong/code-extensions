@@ -16,6 +16,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import http.client
@@ -37,9 +38,9 @@ import zlib
 from functools import lru_cache
 
 try:
-    import tty
-    import termios
     import select
+    import termios
+    import tty
 
     HAS_TTY = True
 except ImportError:
@@ -121,7 +122,9 @@ def _enable_windows_vt():
                 handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
             )
         )
-    except Exception:
+    # No windll off Windows (AttributeError), and the console calls raise
+    # OSError when stdout is not attached to a real console.
+    except (ImportError, AttributeError, OSError):
         return False
 
 
@@ -223,7 +226,8 @@ def parse_code_binary(code_binary):
     elif isinstance(code_binary, str):
         try:
             tokens = shlex.split(code_binary)
-        except Exception:
+        except ValueError:
+            # Unbalanced quote: fall back to the raw string as a single token.
             tokens = [code_binary]
     elif code_binary:
         tokens = [str(code_binary)]
@@ -235,7 +239,7 @@ def parse_code_binary(code_binary):
 
     executable = os.path.expanduser(tokens[0])
     resolved_exec = shutil.which(executable) or executable
-    return [resolved_exec] + tokens[1:]
+    return [resolved_exec, *tokens[1:]]
 
 
 def run_code_cmd(args, retries=3, delay=1.0):
@@ -257,16 +261,18 @@ def run_code_cmd(args, retries=3, delay=1.0):
                 )
                 time.sleep(delay)
                 continue
-            raise e
+            raise
 
 
 def get_installed_extensions(code_binary="code", ignore_errors=False):
     binary_cmd = parse_code_binary(code_binary)
-    full_cmd = binary_cmd + ["--list-extensions", "--show-versions"]
+    full_cmd = [*binary_cmd, "--list-extensions", "--show-versions"]
     try:
         result = run_code_cmd(full_cmd)
         output = result.stdout
-    except Exception as e:
+    # A missing or unexecutable binary raises OSError; a non-zero exit raises
+    # CalledProcessError, which SubprocessError covers.
+    except (OSError, subprocess.SubprocessError) as e:
         if ignore_errors:
             return {}
         cmd_str = " ".join(full_cmd)
@@ -300,15 +306,14 @@ def is_prerelease(version_obj):
 
 def get_vscode_version(code_binary="code"):
     binary_cmd = parse_code_binary(code_binary)
-    full_cmd = binary_cmd + ["--version"]
+    full_cmd = [*binary_cmd, "--version"]
     try:
         result = run_code_cmd(full_cmd)
-        lines = result.stdout.strip().splitlines()
-        if lines:
-            return lines[0].strip()
-    except Exception:
-        pass
-    return None
+    except (OSError, subprocess.SubprocessError):
+        # The caller treats an unknown version as 'skip the engine check'.
+        return None
+    lines = result.stdout.strip().splitlines()
+    return lines[0].strip() if lines else None
 
 
 def semver_parts(v_str):
@@ -565,7 +570,10 @@ def released_long_enough(ver_obj, min_age):
         release_dt = datetime.datetime.fromisoformat(cleaned_ts)
         now = datetime.datetime.now(datetime.timezone.utc)
         return now - release_dt >= min_age
-    except Exception:
+    # An unparsable timestamp (ValueError), a non-string one (AttributeError,
+    # TypeError), or a naive one compared against an aware now (TypeError) all
+    # mean the age is unknown, which the gate treats as old enough.
+    except (AttributeError, TypeError, ValueError):
         return True
 
 
@@ -634,10 +642,8 @@ def write_cache_atomically(cache_file, payload):
         pass
     finally:
         if not replaced:
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(tmp_path)
-            except OSError:
-                pass
 
 
 def cleanup_stale_cache():
@@ -969,12 +975,14 @@ def load_config():
                 try:
                     import toml
 
-                    with open(config_path, "r", encoding="utf-8") as f:
+                    with open(config_path, encoding="utf-8") as f:
                         parsed = toml.load(f)
                 except ImportError:
-                    with open(config_path, "r", encoding="utf-8") as f:
+                    with open(config_path, encoding="utf-8") as f:
                         parsed = parse_toml_fallback(f.read())
-    except Exception as e:
+    # ValueError covers every parser's decode error: tomllib.TOMLDecodeError,
+    # toml.TomlDecodeError, and UnicodeDecodeError all derive from it.
+    except (OSError, ValueError) as e:
         print(
             f"{Colors.YELLOW}Warning: Failed to parse config file '{config_path}': {e}{Colors.ENDC}",
             file=sys.stderr,
@@ -1148,10 +1156,8 @@ def restrict_to_owner(path, mode):
     # read-only attribute; skip it there instead of risking a read-only config.
     if os.name == "nt":
         return
-    try:
+    with contextlib.suppress(OSError):
         os.chmod(path, mode)
-    except OSError:
-        pass
 
 
 def save_config(config, config_path):
@@ -1190,8 +1196,7 @@ def parse_config_key(key, validate=True):
     # `validate` is off for get/unset so that entries an older release wrote with
     # a malformed id stay reachable; only `set` refuses to create new ones.
     key = str(key).strip()
-    if key.startswith("extensions."):
-        key = key[len("extensions.") :]
+    key = key.removeprefix("extensions.")
 
     if "." in key:
         parts = key.rsplit(".", 1)
@@ -1556,7 +1561,7 @@ def _post_extension_query(payload, service_url, token=None):
         if os.path.exists(cache_file):
             try:
                 if time.time() - os.path.getmtime(cache_file) < 3600:
-                    with open(cache_file, "r", encoding="utf-8") as f:
+                    with open(cache_file, encoding="utf-8") as f:
                         return json.load(f)
             except (OSError, ValueError):
                 pass
@@ -1628,7 +1633,10 @@ def _post_extension_query(payload, service_url, token=None):
                 retry_reason = "returned invalid or truncated JSON response"
             else:
                 retry_reason = "connection interrupted or incomplete read"
-        except Exception as e:
+        # Deliberate last resort: every transient failure is classified above,
+        # so anything left is unforeseen and must not abort a bulk update
+        # midway. It is reported, without a retry_reason, as a plain failure.
+        except Exception as e:  # noqa: BLE001
             err = e
 
         if retry_reason and attempt < max_retries:
@@ -1772,10 +1780,8 @@ def query_marketplace_search(
         eff_include_prerelease = ext_cfg.get("include_prerelease", include_prerelease)
         eff_min_age = min_release_age
         if "min_release_age" in ext_cfg:
-            try:
+            with contextlib.suppress(ValueError):
                 eff_min_age = parse_age_threshold(ext_cfg["min_release_age"])
-            except ValueError:
-                pass
 
         compatible_versions = filter_versions(
             full_ext.get("versions", []),
@@ -1862,9 +1868,10 @@ def download_vsix(url, filepath, token=None, service_url=None):
         os.makedirs(parent, exist_ok=True)
     show_progress = sys.stdout.isatty()
 
-    if not token:
-        if is_open_vsx_url(url) or (service_url and is_open_vsx_url(service_url)):
-            token = os.environ.get("OVSX_PAT")
+    if not token and (
+        is_open_vsx_url(url) or (service_url and is_open_vsx_url(service_url))
+    ):
+        token = os.environ.get("OVSX_PAT")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -1928,10 +1935,8 @@ def download_vsix(url, filepath, token=None, service_url=None):
         finally:
             if not ok:
                 # Never leave a truncated package behind for `--install-extension`.
-                try:
+                with contextlib.suppress(OSError):
                     os.remove(filepath)
-                except OSError:
-                    pass
 
         if show_progress and (total_size or bytes_read > 0):
             sys.stdout.write("\n")
@@ -1945,13 +1950,17 @@ def report_download_progress(show_progress, bytes_read, total_size):
     if total_size and total_size > 0:
         percent = (bytes_read * 100) // total_size
         bar_len = 30
-        filled_len = int(round(bar_len * bytes_read / float(total_size)))
+        filled_len = round(bar_len * bytes_read / float(total_size))
         bar = "=" * filled_len + " " * (bar_len - filled_len)
         total_mb = total_size / (1024 * 1024)
         sys.stdout.write(f"\r  [{bar}] {percent}% ({read_mb:.2f}MB / {total_mb:.2f}MB)")
     else:
         sys.stdout.write(f"\r  Downloaded: {read_mb:.2f}MB")
     sys.stdout.flush()
+
+
+# Final byte of a CSI escape sequence (ESC '[' <byte>) for the arrow keys.
+CSI_ARROW_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left"}
 
 
 def get_key():
@@ -1998,14 +2007,8 @@ def get_key():
                     if rlist:
                         b3 = os.read(fd, 1)
                         ch3 = b3.decode("utf-8", errors="ignore") if b3 else ""
-                        if ch3 == "A":
-                            return "up"
-                        elif ch3 == "B":
-                            return "down"
-                        elif ch3 == "C":
-                            return "right"
-                        elif ch3 == "D":
-                            return "left"
+                        if ch3 in CSI_ARROW_KEYS:
+                            return CSI_ARROW_KEYS[ch3]
             return "esc"
         elif ch in ("\r", "\n"):
             return "enter"
@@ -2116,12 +2119,12 @@ def handle_install(args, config):
             )
             sys.exit(1)
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
+            with open(file_path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith("#"):
                         target_specs.append(line)
-        except Exception as e:
+        except (OSError, UnicodeDecodeError) as e:
             print(
                 f"{Colors.RED}Error reading file '{file_option}': {e}{Colors.ENDC}",
                 file=sys.stderr,
@@ -2306,7 +2309,9 @@ def handle_install(args, config):
         )
         try:
             download_vsix(url, filepath, token=token, service_url=service_url)
-        except Exception as e:
+        # urllib's URLError/HTTPError are OSError subclasses, as is any failure
+        # writing the .vsix to disk.
+        except OSError as e:
             print(f"{Colors.RED}✗ Download failed: {e}{Colors.ENDC}", file=sys.stderr)
             continue
 
@@ -2314,7 +2319,7 @@ def handle_install(args, config):
             f"Installing {Colors.CYAN}{full_id}{Colors.ENDC} v{Colors.GREEN}{target_version}{Colors.ENDC}..."
         )
         try:
-            cmd = code_binary + ["--install-extension", filepath]
+            cmd = [*code_binary, "--install-extension", filepath]
             if force or (
                 installed_ver
                 and parse_version(installed_ver) > parse_version(target_version)
@@ -2327,17 +2332,16 @@ def handle_install(args, config):
                 f"  {Colors.RED}✗ Installation failed: {e.stderr.strip() or e}{Colors.ENDC}",
                 file=sys.stderr,
             )
-        except Exception as e:
+        # run_code_cmd raises OSError when the binary is missing or unexecutable.
+        except OSError as e:
             print(
                 f"  {Colors.RED}✗ Installation failed: {e}{Colors.ENDC}",
                 file=sys.stderr,
             )
 
         if download_dir_is_temp and os.path.exists(filepath):
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(filepath)
-            except Exception:
-                pass
 
     discard_download_dir(download_dir_resolved, download_dir_is_temp)
 
@@ -2396,10 +2400,8 @@ def check_updates(
 
         eff_min_age = min_release_age
         if not cli_min_release_age_override and "min_release_age" in ext_cfg:
-            try:
+            with contextlib.suppress(ValueError):
                 eff_min_age = parse_age_threshold(ext_cfg["min_release_age"])
-            except ValueError:
-                pass
 
         if parse_version(latest_version) > parse_version(installed_ver):
             eligible_ver_obj = first_eligible_version(compatible_versions, eff_min_age)
@@ -2838,7 +2840,9 @@ def handle_update(args, config):
         )
         try:
             download_vsix(url, filepath, token=token, service_url=service_url)
-        except Exception as e:
+        # urllib's URLError/HTTPError are OSError subclasses, as is any failure
+        # writing the .vsix to disk.
+        except OSError as e:
             print(f"{Colors.RED}✗ Download failed: {e}{Colors.ENDC}", file=sys.stderr)
             continue
 
@@ -2846,24 +2850,23 @@ def handle_update(args, config):
             f"Installing {Colors.CYAN}{update['id']}{Colors.ENDC} v{Colors.GREEN}{version}{Colors.ENDC}..."
         )
         try:
-            run_code_cmd(code_binary + ["--install-extension", filepath], retries=0)
+            run_code_cmd([*code_binary, "--install-extension", filepath], retries=0)
             print(f"  {Colors.GREEN}✓{Colors.ENDC} Installed successfully.")
         except subprocess.CalledProcessError as e:
             print(
                 f"  {Colors.RED}✗ Installation failed: {e.stderr.strip() or e}{Colors.ENDC}",
                 file=sys.stderr,
             )
-        except Exception as e:
+        # run_code_cmd raises OSError when the binary is missing or unexecutable.
+        except OSError as e:
             print(
                 f"  {Colors.RED}✗ Installation failed: {e}{Colors.ENDC}",
                 file=sys.stderr,
             )
 
         if download_dir_is_temp and os.path.exists(filepath):
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(filepath)
-            except Exception:
-                pass
 
     discard_download_dir(download_dir_resolved, download_dir_is_temp)
 
@@ -2966,25 +2969,25 @@ def handle_remove(args, config):
     for t in targets:
         print(f"  - {t} (v{installed_exts.get(t, 'unknown')})")
 
-    if not yes:
-        if not prompt_yes_no(
-            f"Are you sure you want to remove {len(targets)} extension(s)?",
-            default=False,
-        ):
-            print("Removal cancelled.")
-            return
+    if not yes and not prompt_yes_no(
+        f"Are you sure you want to remove {len(targets)} extension(s)?",
+        default=False,
+    ):
+        print("Removal cancelled.")
+        return
 
     for ext_id in targets:
         print(f"Removing {Colors.CYAN}{ext_id}{Colors.ENDC}...")
         try:
-            run_code_cmd(code_binary + ["--uninstall-extension", ext_id], retries=0)
+            run_code_cmd([*code_binary, "--uninstall-extension", ext_id], retries=0)
             print(f"  {Colors.GREEN}✓{Colors.ENDC} Removed successfully.")
         except subprocess.CalledProcessError as e:
             print(
                 f"  {Colors.RED}✗ Removal failed: {e.stderr.strip() or e}{Colors.ENDC}",
                 file=sys.stderr,
             )
-        except Exception as e:
+        # run_code_cmd raises OSError when the binary is missing or unexecutable.
+        except OSError as e:
             print(f"  {Colors.RED}✗ Removal failed: {e}{Colors.ENDC}", file=sys.stderr)
 
 
@@ -3387,10 +3390,8 @@ def handle_info(args, config):
 
     eff_min_age = min_release_age
     if getattr(args, "min_release_age", None) is None and "min_release_age" in ext_cfg:
-        try:
+        with contextlib.suppress(ValueError):
             eff_min_age = parse_age_threshold(ext_cfg["min_release_age"])
-        except ValueError:
-            pass
 
     # Same eligibility filter as install/search/update, so what `info` reports as
     # eligible is what those commands would actually pick.
@@ -3490,10 +3491,8 @@ def dir_size(path):
     total = 0
     for root, _dirs, files in os.walk(path):
         for name in files:
-            try:
+            with contextlib.suppress(OSError):
                 total += os.path.getsize(os.path.join(root, name))
-            except OSError:
-                pass
     return total
 
 
@@ -4185,9 +4184,7 @@ if __name__ == "__main__":
         # on a descriptor isatty() nonetheless called a terminal, and vanishing
         # with no output at all leaves nothing to debug.
         if HAS_TTY and isinstance(e, termios.error):
-            try:
+            with contextlib.suppress(OSError):
                 print(f"Terminal error: {e}", file=sys.stderr)
-            except OSError:
-                pass
             sys.exit(130)
         raise
