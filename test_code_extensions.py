@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import contextlib
 import datetime
 import email
@@ -563,10 +564,100 @@ class TestCLIAndBinaryParsing(unittest.TestCase):
         )
 
 
+# Helper to construct mock gallery extension data
+def make_mock_gallery_extension(
+    pub_name="ms-python",
+    ext_name="python",
+    version="2024.2.0",
+    last_updated=None,
+    properties=None,
+    categories=None,
+    target_platform="universal",
+    versions_list=None,
+):
+    if last_updated is None:
+        last_updated = (
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+        ).isoformat()
+    if versions_list is None:
+        versions_list = [
+            {
+                "version": version,
+                "lastUpdated": last_updated,
+                "targetPlatform": target_platform,
+                "properties": properties
+                or [
+                    {"key": "Microsoft.VisualStudio.Code.Engine", "value": "^1.80.0"},
+                    {
+                        "key": "Microsoft.VisualStudio.Services.Links.Source",
+                        "value": "https://github.com/example/repo",
+                    },
+                    {
+                        "key": "Microsoft.VisualStudio.Services.Links.Getstarted",
+                        "value": "https://example.com/docs",
+                    },
+                    {
+                        "key": "Microsoft.VisualStudio.Services.Content.Pricing",
+                        "value": "Free",
+                    },
+                ],
+                "files": [
+                    {
+                        "assetType": "Microsoft.VisualStudio.Services.VSIXPackage",
+                        "source": f"https://marketplace.visualstudio.com/download/{pub_name}.{ext_name}/{version}",
+                    }
+                ],
+            }
+        ]
+    return {
+        "publisher": {"publisherName": pub_name, "displayName": pub_name.capitalize()},
+        "extensionName": ext_name,
+        "displayName": f"{pub_name}.{ext_name}",
+        "shortDescription": f"Test description for {pub_name}.{ext_name}",
+        "categories": categories or ["Programming Languages"],
+        "versions": versions_list,
+    }
+
+
 # =====================================================================
-# Network Retry Tests
+# Network Retry & Extension ID Validation Tests
 # =====================================================================
-class TestNetworkRetry(unittest.TestCase):
+class TestNetworkRetryAndIDValidation(unittest.TestCase):
+    def test_is_valid_extension_id(self):
+        valid_ids = [
+            "ms-python.python",
+            "charliermarsh.ruff",
+            "golang.go",
+            "pub.name-with-hyphens",
+            "pub_name.ext_name",
+            "pub.ext.sub",
+            "A.B",
+            "a1.b2",
+        ]
+        for vid in valid_ids:
+            with self.subTest(vid=vid):
+                self.assertTrue(ce.is_valid_extension_id(vid))
+
+        invalid_ids = [
+            "python",  # no dot
+            "ms-python.python&calc",
+            "ms-python.python|dir",
+            "ms-python.python;ls",
+            "../../etc/passwd",
+            "foo..bar",
+            "",
+            None,
+            123,
+            " . ",
+            # Padding is rejected rather than stripped, so what is validated is
+            # exactly what the caller goes on to use as a lookup key.
+            "ms-python.python ",
+            " ms-python.python",
+        ]
+        for iid in invalid_ids:
+            with self.subTest(iid=iid):
+                self.assertFalse(ce.is_valid_extension_id(iid))
+
     @patch.object(ce, "get_cache_dir", return_value=None)
     @patch.object(ce.time, "sleep")
     def test_post_extension_query_retries_on_json_decode_error(
@@ -618,6 +709,34 @@ class TestNetworkRetry(unittest.TestCase):
 
     @patch.object(ce, "get_cache_dir", return_value=None)
     @patch.object(ce.time, "sleep")
+    def test_post_extension_query_retries_a_refused_connection(
+        self, mock_sleep, mock_cache
+    ):
+        # urllib wraps a connect-phase OSError into URLError, so this never
+        # reaches the ConnectionError clause; the URLError arm has to recognize
+        # the wrapped cause or a refused connection fails on the first attempt.
+        refused = urllib.error.URLError(
+            ConnectionRefusedError(111, "Connection refused")
+        )
+
+        resp_good = MagicMock()
+        resp_good.read.return_value = b'{"results": []}'
+        resp_good.__enter__.return_value = resp_good
+        resp_good.__exit__.return_value = None
+
+        with (
+            patch.object(ce._url_opener, "open", side_effect=[refused, resp_good]),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            result = ce._post_extension_query(
+                {"dummy": True}, "https://example.com/gallery"
+            )
+        self.assertEqual(result, {"results": []})
+        mock_sleep.assert_called_once()
+        self.assertIn("connection failed", err.getvalue())
+
+    @patch.object(ce, "get_cache_dir", return_value=None)
+    @patch.object(ce.time, "sleep")
     def test_post_extension_query_exhausts_retries_on_persistent_bad_json(
         self, mock_sleep, mock_cache
     ):
@@ -638,39 +757,1040 @@ class TestNetworkRetry(unittest.TestCase):
 
 
 # =====================================================================
-# Extension ID Validation Tests
+# CLI Integration Tests: handle_install
 # =====================================================================
-class TestExtensionIDValidation(unittest.TestCase):
-    def test_is_valid_extension_id(self):
-        valid_ids = [
-            "ms-python.python",
-            "charliermarsh.ruff",
-            "golang.go",
-            "pub.name-with-hyphens",
-            "pub_name.ext_name",
-            "pub.ext.sub",
-            "A.B",
-            "a1.b2",
-        ]
-        for vid in valid_ids:
-            with self.subTest(vid=vid):
-                self.assertTrue(ce.is_valid_extension_id(vid))
+class TestHandleInstallIntegration(unittest.TestCase):
+    def setUp(self):
+        self.config = {"extensions": {}}
 
-        invalid_ids = [
-            "python",  # no dot
-            "ms-python.python&calc",
-            "ms-python.python|dir",
-            "ms-python.python;ls",
-            "../../etc/passwd",
-            "foo..bar",
-            "",
-            None,
-            123,
-            " . ",
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_install_success(
+        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
+    ):
+        mock_query.return_value = {
+            "ms-python.python": make_mock_gallery_extension(
+                "ms-python", "python", "2024.2.0"
+            )
+        }
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=["ms-python.python"],
+            file=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            yes=True,
+            min_release_age="0",
+            download_dir=None,
+            force=False,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            ce.handle_install(args, self.config)
+
+        mock_download.assert_called_once()
+        mock_run.assert_called_once()
+        self.assertIn("--install-extension", mock_run.call_args[0][0])
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_install_pinned_version(
+        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
+    ):
+        ext_data = make_mock_gallery_extension(
+            "ms-python",
+            "python",
+            versions_list=[
+                {
+                    "version": "2024.2.0",
+                    "targetPlatform": "universal",
+                    "properties": [
+                        {
+                            "key": "Microsoft.VisualStudio.Code.Engine",
+                            "value": "^1.80.0",
+                        }
+                    ],
+                    "files": [
+                        {
+                            "assetType": "Microsoft.VisualStudio.Services.VSIXPackage",
+                            "source": "https://marketplace.visualstudio.com/download/2024.2.0",
+                        }
+                    ],
+                },
+                {
+                    "version": "2024.1.0",
+                    "targetPlatform": "universal",
+                    "properties": [
+                        {
+                            "key": "Microsoft.VisualStudio.Code.Engine",
+                            "value": "^1.80.0",
+                        }
+                    ],
+                    "files": [
+                        {
+                            "assetType": "Microsoft.VisualStudio.Services.VSIXPackage",
+                            "source": "https://marketplace.visualstudio.com/download/2024.1.0",
+                        }
+                    ],
+                },
+            ],
+        )
+        mock_query.return_value = {"ms-python.python": ext_data}
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=["ms-python.python@2024.1.0"],
+            file=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            yes=True,
+            min_release_age="0",
+            download_dir=None,
+            force=False,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            ce.handle_install(args, self.config)
+
+        call_url = mock_download.call_args[0][0]
+        self.assertIn("2024.1.0", call_url)
+        self.assertIn("2024.1.0", mock_download.call_args[0][1])
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_install_from_file(
+        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
+    ):
+        mock_query.return_value = {
+            "ms-python.python": make_mock_gallery_extension(
+                "ms-python", "python", "2024.2.0"
+            ),
+            "charliermarsh.ruff": make_mock_gallery_extension(
+                "charliermarsh", "ruff", "0.1.0"
+            ),
+        }
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write("# Extension list\nms-python.python\n\ncharliermarsh.ruff\n")
+            temp_path = tf.name
+
+        try:
+            args = argparse.Namespace(
+                code_binary="code",
+                service_url=None,
+                open_vsx=False,
+                open_vsx_token=None,
+                extensions=[],
+                file=temp_path,
+                include_prerelease=False,
+                no_code_version_check=False,
+                yes=True,
+                min_release_age="0",
+                download_dir=None,
+                force=False,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                ce.handle_install(args, self.config)
+
+            self.assertEqual(mock_download.call_count, 2)
+            self.assertEqual(mock_run.call_count, 2)
+        finally:
+            os.remove(temp_path)
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.2.0"},
+    )
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_install_already_installed_skips(
+        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
+    ):
+        mock_query.return_value = {
+            "ms-python.python": make_mock_gallery_extension(
+                "ms-python", "python", "2024.2.0"
+            )
+        }
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=["ms-python.python"],
+            file=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            yes=True,
+            min_release_age="0",
+            download_dir=None,
+            force=False,
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_install(args, self.config)
+
+        mock_download.assert_not_called()
+        mock_run.assert_not_called()
+        self.assertIn("already installed", out.getvalue())
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.2.0"},
+    )
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_install_force_reinstalls(
+        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
+    ):
+        mock_query.return_value = {
+            "ms-python.python": make_mock_gallery_extension(
+                "ms-python", "python", "2024.2.0"
+            )
+        }
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=["ms-python.python"],
+            file=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            yes=True,
+            min_release_age="0",
+            download_dir=None,
+            force=True,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            ce.handle_install(args, self.config)
+
+        mock_download.assert_called_once()
+        mock_run.assert_called_once()
+        self.assertIn("--force", mock_run.call_args[0][0])
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_install_held_back_by_release_age_installs_older(
+        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
+    ):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        ext_data = make_mock_gallery_extension(
+            "ms-python",
+            "python",
+            versions_list=[
+                {
+                    "version": "2024.2.0",
+                    "lastUpdated": (now - datetime.timedelta(hours=2)).isoformat(),
+                    "targetPlatform": "universal",
+                    "properties": [
+                        {
+                            "key": "Microsoft.VisualStudio.Code.Engine",
+                            "value": "^1.80.0",
+                        }
+                    ],
+                    "files": [
+                        {
+                            "assetType": "Microsoft.VisualStudio.Services.VSIXPackage",
+                            "source": "https://marketplace.visualstudio.com/download/2024.2.0",
+                        }
+                    ],
+                },
+                {
+                    "version": "2024.1.0",
+                    "lastUpdated": (now - datetime.timedelta(hours=48)).isoformat(),
+                    "targetPlatform": "universal",
+                    "properties": [
+                        {
+                            "key": "Microsoft.VisualStudio.Code.Engine",
+                            "value": "^1.80.0",
+                        }
+                    ],
+                    "files": [
+                        {
+                            "assetType": "Microsoft.VisualStudio.Services.VSIXPackage",
+                            "source": "https://marketplace.visualstudio.com/download/2024.1.0",
+                        }
+                    ],
+                },
+            ],
+        )
+        mock_query.return_value = {"ms-python.python": ext_data}
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=["ms-python.python"],
+            file=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            yes=True,
+            min_release_age="24h",
+            download_dir=None,
+            force=False,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            ce.handle_install(args, self.config)
+
+        call_url = mock_download.call_args[0][0]
+        self.assertIn("2024.1.0", call_url)
+
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    def test_handle_install_invalid_id_rejected(
+        self, mock_vsver, mock_installed, mock_download
+    ):
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=["invalid_id_no_dot", "ms-python.python&calc"],
+            file=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            yes=True,
+            min_release_age="0",
+            download_dir=None,
+            force=False,
+        )
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+            self.assertRaises(SystemExit) as exit_ctx,
+        ):
+            ce.handle_install(args, self.config)
+
+        # Rejecting every spec has to be distinguishable from installing them.
+        self.assertEqual(exit_ctx.exception.code, 1)
+        mock_download.assert_not_called()
+        self.assertIn("Invalid extension ID", err.getvalue())
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_install_tolerates_a_space_before_the_version_pin(
+        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
+    ):
+        # 'pub.name @1.2.3' leaves a trailing space on the id after the rsplit.
+        # The gallery response is keyed by the canonical id, so the padded form
+        # has to be normalized before the query or the lookup misses and a real
+        # extension is reported as not found.
+        mock_query.return_value = {
+            "ms-python.python": make_mock_gallery_extension(
+                "ms-python", "python", "2024.2.0"
+            )
+        }
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=["ms-python.python @2024.2.0"],
+            file=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            yes=True,
+            min_release_age="0",
+            download_dir=None,
+            force=False,
+        )
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            ce.handle_install(args, self.config)
+
+        self.assertEqual(mock_query.call_args[0][0], ["ms-python.python"])
+        self.assertNotIn("not found", err.getvalue())
+        mock_download.assert_called_once()
+        mock_run.assert_called_once()
+
+
+# =====================================================================
+# CLI Integration Tests: handle_update
+# =====================================================================
+class TestHandleUpdateIntegration(unittest.TestCase):
+    def setUp(self):
+        self.config = {"extensions": {}}
+
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "check_updates", return_value=[])
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.2.0"},
+    )
+    def test_handle_update_all_up_to_date(
+        self, mock_installed, mock_updates, mock_vsver
+    ):
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=[],
+            include_prerelease=False,
+            no_code_version_check=False,
+            dry_run=False,
+            download_dir=None,
+            yes=True,
+            min_release_age="24h",
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_update(args, self.config)
+
+        self.assertIn("All extensions are up to date", out.getvalue())
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.1.0"},
+    )
+    @patch.object(ce, "check_updates")
+    def test_handle_update_yes_installs_eligible(
+        self, mock_check, mock_installed, mock_vsver, mock_download, mock_run
+    ):
+        mock_check.return_value = [
+            {
+                "id": "ms-python.python",
+                "publisher": "ms-python",
+                "name": "python",
+                "installed": "2024.1.0",
+                "latest": "2024.2.0",
+                "eligible": "2024.2.0",
+                "eligible_platform": "universal",
+                "latest_platform": "universal",
+                "latest_release_date": "2024-01-01",
+                "eligible_release_date": "2024-01-01",
+                "latest_download_url": "https://example.com/python.vsix",
+                "eligible_download_url": "https://example.com/python.vsix",
+            }
         ]
-        for iid in invalid_ids:
-            with self.subTest(iid=iid):
-                self.assertFalse(ce.is_valid_extension_id(iid))
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=[],
+            include_prerelease=False,
+            no_code_version_check=False,
+            dry_run=False,
+            download_dir=None,
+            yes=True,
+            min_release_age="24h",
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            ce.handle_update(args, self.config)
+
+        mock_download.assert_called_once()
+        mock_run.assert_called_once()
+        self.assertIn("--install-extension", mock_run.call_args[0][0])
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.1.0"},
+    )
+    @patch.object(ce, "check_updates")
+    def test_handle_update_dry_run(
+        self, mock_check, mock_installed, mock_vsver, mock_download, mock_run
+    ):
+        mock_check.return_value = [
+            {
+                "id": "ms-python.python",
+                "publisher": "ms-python",
+                "name": "python",
+                "installed": "2024.1.0",
+                "latest": "2024.2.0",
+                "eligible": "2024.2.0",
+                "eligible_platform": "universal",
+                "latest_platform": "universal",
+                "latest_release_date": "2024-01-01",
+                "eligible_release_date": "2024-01-01",
+                "latest_download_url": "https://example.com/python.vsix",
+                "eligible_download_url": "https://example.com/python.vsix",
+            }
+        ]
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=[],
+            include_prerelease=False,
+            no_code_version_check=False,
+            dry_run=True,
+            download_dir=None,
+            yes=True,
+            min_release_age="24h",
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_update(args, self.config)
+
+        mock_download.assert_not_called()
+        mock_run.assert_not_called()
+        self.assertIn("[Dry-run]", out.getvalue())
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={
+            "ms-python.python": "2024.1.0",
+            "charliermarsh.ruff": "0.1.0",
+        },
+    )
+    @patch.object(ce, "check_updates")
+    def test_handle_update_targeted_extension(
+        self, mock_check, mock_installed, mock_vsver, mock_download, mock_run
+    ):
+        mock_check.return_value = []
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=["python"],
+            include_prerelease=False,
+            no_code_version_check=False,
+            dry_run=False,
+            download_dir=None,
+            yes=True,
+            min_release_age="24h",
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            ce.handle_update(args, self.config)
+
+        passed_exts = mock_check.call_args[0][0]
+        self.assertEqual(list(passed_exts.keys()), ["ms-python.python"])
+
+
+# =====================================================================
+# CLI Integration Tests: handle_remove
+# =====================================================================
+class TestHandleRemoveIntegration(unittest.TestCase):
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.2.0"},
+    )
+    def test_handle_remove_explicit_with_yes(self, mock_installed, mock_run):
+        args = argparse.Namespace(
+            code_binary="code",
+            yes=True,
+            extensions=["ms-python.python"],
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            ce.handle_remove(args, {})
+
+        mock_run.assert_called_once()
+        self.assertEqual(
+            mock_run.call_args[0][0][1:],
+            ["--uninstall-extension", "ms-python.python"],
+        )
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.2.0"},
+    )
+    def test_handle_remove_nonexistent(self, mock_installed, mock_run):
+        args = argparse.Namespace(
+            code_binary="code",
+            yes=True,
+            extensions=["other.nonexistent"],
+        )
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as out,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            ce.handle_remove(args, {})
+
+        mock_run.assert_not_called()
+        self.assertIn("No matching installed extensions to remove", out.getvalue())
+
+
+# =====================================================================
+# CLI Integration Tests: handle_list
+# =====================================================================
+class TestHandleListIntegration(unittest.TestCase):
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={
+            "ms-python.python": "2024.2.0",
+            "charliermarsh.ruff": "0.1.0",
+        },
+    )
+    def test_handle_list_standard(self, mock_installed):
+        args = argparse.Namespace(
+            code_binary="code",
+            query=None,
+            quiet=False,
+            outdated=False,
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_list(args, {})
+
+        output = out.getvalue()
+        self.assertIn("ms-python.python", output)
+        self.assertIn("charliermarsh.ruff", output)
+        self.assertIn("Total: 2 extension(s)", output)
+
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={
+            "ms-python.python": "2024.2.0",
+            "charliermarsh.ruff": "0.1.0",
+        },
+    )
+    def test_handle_list_quiet(self, mock_installed):
+        args = argparse.Namespace(
+            code_binary="code",
+            query=None,
+            quiet=True,
+            outdated=False,
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_list(args, {})
+
+        output = out.getvalue().strip().splitlines()
+        self.assertEqual(output, ["charliermarsh.ruff", "ms-python.python"])
+
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={
+            "ms-python.python": "2024.2.0",
+            "charliermarsh.ruff": "0.1.0",
+        },
+    )
+    def test_handle_list_query_filter(self, mock_installed):
+        args = argparse.Namespace(
+            code_binary="code",
+            query="ruff",
+            quiet=True,
+            outdated=False,
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_list(args, {})
+
+        self.assertEqual(out.getvalue().strip(), "charliermarsh.ruff")
+
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "check_updates")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={
+            "ms-python.python": "2024.1.0",
+            "charliermarsh.ruff": "0.1.0",
+        },
+    )
+    def test_handle_list_outdated(self, mock_installed, mock_updates, mock_vsver):
+        mock_updates.return_value = [
+            {
+                "id": "ms-python.python",
+                "installed": "2024.1.0",
+                "latest": "2024.2.0",
+            }
+        ]
+        args = argparse.Namespace(
+            code_binary="code",
+            query=None,
+            quiet=False,
+            outdated=True,
+            include_prerelease=False,
+            no_code_version_check=False,
+            min_release_age="24h",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_list(args, {})
+
+        output = out.getvalue()
+        self.assertIn("ms-python.python", output)
+        self.assertNotIn("charliermarsh.ruff", output)
+
+
+# =====================================================================
+# CLI Integration Tests: handle_search
+# =====================================================================
+class TestHandleSearchIntegration(unittest.TestCase):
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_search")
+    def test_handle_search_quiet(self, mock_search, mock_vsver):
+        mock_search.return_value = [
+            {
+                "id": "ms-python.python",
+                "displayName": "Python",
+                "eligible": "2024.2.0",
+                "description": "Python language support",
+                "is_held_back": False,
+            }
+        ]
+        args = argparse.Namespace(
+            code_binary="code",
+            query="python",
+            max_results=10,
+            quiet=True,
+            include_prerelease=False,
+            no_code_version_check=False,
+            min_release_age="24h",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_search(args, {})
+
+        self.assertEqual(out.getvalue().strip(), "ms-python.python")
+
+    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_search")
+    def test_handle_search_table_output_non_tty(
+        self, mock_search, mock_vsver, mock_installed
+    ):
+        mock_search.return_value = [
+            {
+                "id": "ms-python.python",
+                "displayName": "Python",
+                "eligible": "2024.2.0",
+                "description": "Python language support",
+                "is_held_back": False,
+            }
+        ]
+        args = argparse.Namespace(
+            code_binary="code",
+            query="python",
+            max_results=10,
+            quiet=False,
+            include_prerelease=False,
+            no_code_version_check=False,
+            min_release_age="24h",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+        )
+        with (
+            patch("sys.stdin.isatty", return_value=False),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            ce.handle_search(args, {})
+
+        output = out.getvalue()
+        self.assertIn("ms-python.python", output)
+        self.assertIn("Python", output)
+        self.assertIn("Found 1 matching extension(s)", output)
+
+
+# =====================================================================
+# CLI Integration Tests: handle_info
+# =====================================================================
+class TestHandleInfoIntegration(unittest.TestCase):
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.1.0"},
+    )
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_info_found(self, mock_query, mock_installed, mock_vsver):
+        mock_query.return_value = {
+            "ms-python.python": make_mock_gallery_extension(
+                "ms-python", "python", "2024.2.0"
+            )
+        }
+        args = argparse.Namespace(
+            extension="ms-python.python",
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            min_release_age="24h",
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_info(args, {})
+
+        output = out.getvalue()
+        self.assertIn("ms-python.python", output)
+        self.assertIn("Publisher:", output)
+        self.assertIn("Latest Ver:", output)
+        self.assertIn("Installed (v2024.1.0)", output)
+        self.assertIn("Repository:", output)
+
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "query_marketplace_search")
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_info_partial_name_fallback(
+        self, mock_exts, mock_search, mock_installed, mock_vsver
+    ):
+        mock_search.return_value = [{"id": "ms-python.python"}]
+        mock_exts.return_value = {
+            "ms-python.python": make_mock_gallery_extension(
+                "ms-python", "python", "2024.2.0"
+            )
+        }
+        args = argparse.Namespace(
+            extension="python",
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            min_release_age="24h",
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_info(args, {})
+
+        output = out.getvalue()
+        self.assertIn("Showing info for top match 'ms-python.python'", output)
+        self.assertIn("ms-python.python", output)
+
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "query_marketplace_search")
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_info_searches_rather_than_querying_a_malformed_id(
+        self, mock_exts, mock_search, mock_installed, mock_vsver
+    ):
+        # A dot alone used to route straight to a by-id query, which can only
+        # answer 'not found' for something that is not a well-formed id.
+        mock_search.return_value = [{"id": "ms-python.python"}]
+        mock_exts.return_value = {
+            "ms-python.python": make_mock_gallery_extension(
+                "ms-python", "python", "2024.2.0"
+            )
+        }
+        args = argparse.Namespace(
+            extension="ms-python.python&calc",
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            min_release_age="24h",
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_info(args, {})
+
+        mock_search.assert_called_once()
+        self.assertEqual(mock_search.call_args[0][0], "ms-python.python&calc")
+        self.assertIn("Showing info for top match 'ms-python.python'", out.getvalue())
+
+
+# =====================================================================
+# CLI Integration Tests: handle_clean
+# =====================================================================
+class TestHandleCleanIntegration(unittest.TestCase):
+    def test_handle_clean_purges_cache_and_old_temp_dirs(self):
+        with (
+            tempfile.TemporaryDirectory() as cache_dir,
+            tempfile.TemporaryDirectory() as temp_dir,
+        ):
+            # Create a stale cache file
+            cache_file = os.path.join(cache_dir, "vscode_ext_cache_test.json")
+            with open(cache_file, "w") as f:
+                f.write('{"data": 123}')
+
+            # Create an old code-extensions temp dir
+            ext_temp_dir = os.path.join(temp_dir, "code-extensions-old")
+            os.makedirs(ext_temp_dir, exist_ok=True)
+            dummy_vsix = os.path.join(ext_temp_dir, "test.vsix")
+            with open(dummy_vsix, "w") as f:
+                f.write("mock vsix payload")
+            old_time = time.time() - 7200
+            os.utime(ext_temp_dir, (old_time, old_time))
+
+            args = argparse.Namespace()
+            with (
+                patch.object(ce, "get_cache_dir", return_value=cache_dir),
+                patch.object(ce.tempfile, "gettempdir", return_value=temp_dir),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
+                ce.handle_clean(args, {})
+
+            self.assertFalse(os.path.exists(cache_file))
+            self.assertFalse(os.path.exists(ext_temp_dir))
+            self.assertIn("Cleaned", out.getvalue())
+
+
+# =====================================================================
+# CLI Integration Tests: handle_config
+# =====================================================================
+class TestHandleConfigIntegration(unittest.TestCase):
+    def test_handle_config_lifecycle(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, "config.toml")
+            with (
+                patch.object(ce, "get_default_config_path", return_value=config_path),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                config = ce.load_config()
+
+                # 1. Config set global
+                set_args = argparse.Namespace(
+                    action="set", key="min_release_age", value="3d"
+                )
+                ce.handle_config(set_args, config)
+
+                # 2. Config set per-extension
+                set_ext_args = argparse.Namespace(
+                    action="set",
+                    key="charliermarsh.ruff.min_release_age",
+                    value="12h",
+                )
+                ce.handle_config(set_ext_args, config)
+
+                # Reload config from disk
+                reloaded = ce.load_config()
+                self.assertEqual(reloaded.get("min_release_age"), "3d")
+                self.assertEqual(
+                    reloaded.get("extensions", {})
+                    .get("charliermarsh.ruff", {})
+                    .get("min_release_age"),
+                    "12h",
+                )
+
+                # 3. Config get
+                get_args = argparse.Namespace(
+                    action="get", key="min_release_age", value=None
+                )
+                with contextlib.redirect_stdout(io.StringIO()) as get_out:
+                    ce.handle_config(get_args, reloaded)
+                self.assertEqual(get_out.getvalue().strip(), "3d")
+
+                # 4. Config unset
+                unset_args = argparse.Namespace(
+                    action="unset", key="min_release_age", value=None
+                )
+                ce.handle_config(unset_args, reloaded)
+                after_unset = ce.load_config()
+                self.assertNotIn("min_release_age", after_unset)
+
+    def test_handle_config_still_reaches_a_legacy_malformed_extension_entry(self):
+        # Releases before id validation accepted 'foo.ignore' and wrote an
+        # [extensions.foo] section. 'set' now refuses to create one, but 'get'
+        # and 'unset' must keep reaching the existing section, or it could only
+        # be removed by hand-editing the TOML.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, "config.toml")
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write("[extensions.foo]\nignore = true\n")
+
+            with (
+                patch.object(ce, "get_default_config_path", return_value=config_path),
+                contextlib.redirect_stderr(io.StringIO()) as err,
+            ):
+                get_args = argparse.Namespace(
+                    action="get", key="foo.ignore", value=None
+                )
+                with contextlib.redirect_stdout(io.StringIO()) as get_out:
+                    ce.handle_config(get_args, ce.load_config())
+                self.assertEqual(get_out.getvalue().strip(), "True")
+
+                set_args = argparse.Namespace(
+                    action="set", key="foo.ignore", value="false"
+                )
+                with (
+                    contextlib.redirect_stdout(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    ce.handle_config(set_args, ce.load_config())
+                # The refusal names the malformed id, not the global key list.
+                self.assertIn("Invalid extension ID", err.getvalue())
+                self.assertNotIn("Unknown global setting", err.getvalue())
+
+                unset_args = argparse.Namespace(
+                    action="unset", key="foo.ignore", value=None
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ce.handle_config(unset_args, ce.load_config())
+                self.assertNotIn("foo", ce.load_config().get("extensions", {}))
+
+    def test_parse_config_key_validates_only_when_asked(self):
+        # A dotted key is always an extension rule, so a malformed one comes
+        # back as 'invalid' rather than being retried as a global setting.
+        self.assertEqual(
+            ce.parse_config_key("foo.ignore"), ("invalid", "foo", "ignore")
+        )
+        self.assertEqual(
+            ce.parse_config_key("extensions.foo.ignore"), ("invalid", "foo", "ignore")
+        )
+        self.assertEqual(
+            ce.parse_config_key("foo.ignore", validate=False),
+            ("extension", "foo", "ignore"),
+        )
+        self.assertEqual(
+            ce.parse_config_key("charliermarsh.ruff.ignore"),
+            ("extension", "charliermarsh.ruff", "ignore"),
+        )
+        self.assertEqual(
+            ce.parse_config_key("extensions.charliermarsh.ruff.ignore"),
+            ("extension", "charliermarsh.ruff", "ignore"),
+        )
+        self.assertEqual(
+            ce.parse_config_key("min_release_age"), ("global", "min_release_age", None)
+        )
+
+
+# =====================================================================
+# CLI Integration Tests: handle_completion
+# =====================================================================
+class TestHandleCompletionIntegration(unittest.TestCase):
+    def test_handle_completion_all_shells(self):
+        shells = ["bash", "zsh", "fish", "powershell"]
+        for sh in shells:
+            with self.subTest(shell=sh):
+                args = argparse.Namespace(shell=sh)
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    ce.handle_completion(args, {})
+                output = out.getvalue()
+                self.assertIn("code-extensions", output)
+                self.assertIn("install", output)
+                self.assertIn("update", output)
 
 
 if __name__ == "__main__":
