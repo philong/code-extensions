@@ -939,6 +939,11 @@ def coerce_config_value(val, expected_type):
             return items
         return [str(val)]
     if isinstance(val, str):
+        # An empty string is never a usable setting: as a download-dir it means
+        # the working directory, as a code-binary or service-url it means
+        # nothing at all. Refuse it here rather than acting on it later.
+        if not val.strip():
+            raise ValueError("expected a value, got an empty string")
         return val
     if isinstance(val, (int, float)) and not isinstance(val, bool):
         return str(val)
@@ -2225,7 +2230,9 @@ def resolve_download_target(args, config):
     download_dir = resolve_option(
         getattr(args, "download_dir", None), config, "download_dir", None
     )
-    if download_dir is not None:
+    # A blank --download-dir would silently mean the working directory, which
+    # then keeps the .vsix files nobody asked it to keep.
+    if download_dir is not None and str(download_dir).strip():
         return os.path.expanduser(download_dir), False
     return tempfile.mkdtemp(prefix="code-extensions-"), True
 

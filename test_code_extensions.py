@@ -245,6 +245,21 @@ class TestTOMLParserAndConfig(unittest.TestCase):
         self.assertEqual(ce.coerce_config_value(42, str), "42")
         self.assertEqual(ce.coerce_config_value("hello", str), "hello")
 
+    def test_coerce_config_value_rejects_an_empty_string(self):
+        for val in ("", "   "):
+            with self.subTest(val=val), self.assertRaises(ValueError):
+                ce.coerce_config_value(val, str)
+
+    def test_resolve_download_target_ignores_a_blank_directory(self):
+        args = argparse.Namespace(download_dir="")
+        directory, is_temp = ce.resolve_download_target(args, {"download_dir": ""})
+        self.addCleanup(ce.discard_download_dir, directory, is_temp)
+
+        # A blank setting must not put .vsix files in the working directory,
+        # where nothing would ever clean them up.
+        self.assertTrue(is_temp)
+        self.assertNotEqual(os.path.realpath(directory), os.path.realpath(os.getcwd()))
+
     def test_load_and_save_config(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = os.path.join(tmp_dir, "config.toml")
