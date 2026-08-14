@@ -206,6 +206,8 @@ min-release-age = "3d"         # Require updates/installs for this extension to 
 skip-versions = ["0.39.0"]
 ```
 
+Settings are resolved in one order everywhere: a flag passed on the command line wins over a per-extension rule, which wins over the global setting, which falls back to the built-in default. So `-a 0` or `-p` always applies, whatever the config file says about that extension.
+
 ---
 
 ## Examples

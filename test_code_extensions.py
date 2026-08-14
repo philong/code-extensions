@@ -342,6 +342,137 @@ class TestReleaseAgeGating(unittest.TestCase):
 
 
 # =====================================================================
+# Per-Extension Option Precedence Tests
+# =====================================================================
+class TestEffectiveExtOptions(unittest.TestCase):
+    GLOBAL_AGE = datetime.timedelta(hours=24)
+
+    def test_a_per_extension_rule_beats_the_global_setting(self):
+        prerelease, age, age_str = ce.effective_ext_options(
+            {"include_prerelease": True, "min_release_age": "7d"},
+            False,
+            self.GLOBAL_AGE,
+            "24h",
+        )
+        self.assertTrue(prerelease)
+        self.assertEqual(age, datetime.timedelta(days=7))
+        self.assertEqual(age_str, "7d")
+
+    def test_an_explicit_cli_flag_beats_a_per_extension_rule(self):
+        ext_cfg = {"include_prerelease": False, "min_release_age": "7d"}
+
+        prerelease, age, age_str = ce.effective_ext_options(
+            ext_cfg,
+            True,
+            datetime.timedelta(0),
+            "0",
+            cli_include_prerelease_override=True,
+            cli_min_release_age_override=True,
+        )
+        self.assertTrue(prerelease)
+        self.assertEqual(age, datetime.timedelta(0))
+        self.assertEqual(age_str, "0")
+
+    def test_an_unparsable_per_extension_age_leaves_the_global_one(self):
+        _, age, age_str = ce.effective_ext_options(
+            {"min_release_age": "whenever"}, False, self.GLOBAL_AGE, "24h"
+        )
+        self.assertEqual(age, self.GLOBAL_AGE)
+        self.assertEqual(age_str, "24h")
+
+    def test_no_per_extension_rule_keeps_the_global_settings(self):
+        prerelease, age, _ = ce.effective_ext_options(None, True, self.GLOBAL_AGE)
+        self.assertTrue(prerelease)
+        self.assertEqual(age, self.GLOBAL_AGE)
+
+    @patch.object(ce, "cleanup_stale_cache")
+    @patch.object(ce, "query_marketplace_extensions")
+    @patch.object(ce, "_post_extension_query")
+    def test_search_honors_an_explicit_age_over_a_per_extension_rule(
+        self, mock_post, mock_details, mock_cleanup
+    ):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        ext_data = make_mock_gallery_extension(
+            "ms-python",
+            "python",
+            versions_list=[
+                {
+                    "version": "2024.2.0",
+                    "lastUpdated": (now - datetime.timedelta(hours=2)).isoformat(),
+                    "targetPlatform": "universal",
+                    "properties": [
+                        {
+                            "key": "Microsoft.VisualStudio.Code.Engine",
+                            "value": "^1.80.0",
+                        }
+                    ],
+                }
+            ],
+        )
+        mock_post.return_value = {"results": [{"extensions": [ext_data]}]}
+        mock_details.return_value = {"ms-python.python": ext_data}
+        extensions_config = {"ms-python.python": {"min_release_age": "30d"}}
+
+        def search(**kwargs):
+            return ce.query_marketplace_search(
+                "python",
+                target_platform="universal",
+                vscode_version="1.85.0",
+                min_release_age=datetime.timedelta(0),
+                extensions_config=extensions_config,
+                **kwargs,
+            )
+
+        # Without the override the 30d rule holds the fresh version back.
+        self.assertEqual(search()[0]["eligible"], "held back")
+        # 'search -a 0' has to be able to override it, like install and info.
+        self.assertEqual(
+            search(cli_min_release_age_override=True)[0]["eligible"], "2024.2.0"
+        )
+
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_check_updates_honors_an_explicit_prerelease_flag(self, mock_query):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        prerelease_props = [
+            {"key": "Microsoft.VisualStudio.Code.Engine", "value": "^1.80.0"},
+            {"key": "Microsoft.VisualStudio.Code.PreRelease", "value": "true"},
+        ]
+        ext_data = make_mock_gallery_extension(
+            "ms-python",
+            "python",
+            versions_list=[
+                {
+                    "version": "2024.3.0",
+                    "lastUpdated": (now - datetime.timedelta(days=10)).isoformat(),
+                    "targetPlatform": "universal",
+                    "properties": prerelease_props,
+                }
+            ],
+        )
+        mock_query.return_value = {"ms-python.python": ext_data}
+        installed = {"ms-python.python": "2024.1.0"}
+        extensions_config = {"ms-python.python": {"include_prerelease": False}}
+
+        def check(**kwargs):
+            return ce.check_updates(
+                installed,
+                "universal",
+                vscode_version="1.85.0",
+                exclude_prerelease=False,
+                min_release_age=datetime.timedelta(0),
+                extensions_config=extensions_config,
+                **kwargs,
+            )
+
+        # The per-extension rule still wins over the global config setting.
+        self.assertEqual(check(), [])
+        # 'update -p' has to be able to override it, like install and info.
+        self.assertEqual(
+            check(cli_include_prerelease_override=True)[0]["latest"], "2024.3.0"
+        )
+
+
+# =====================================================================
 # Security & Host Validation Tests
 # =====================================================================
 class TestSecurityAndHostValidation(unittest.TestCase):
@@ -955,7 +1086,9 @@ class TestDownloadVsix(unittest.TestCase):
     def test_download_refuses_a_corrupt_compressed_package(self):
         with self.assertRaises(ce.DOWNLOAD_ERRORS):
             self.download(
-                FakeDownloadResponse(b"not actually gzip", {"Content-Encoding": "gzip"}),
+                FakeDownloadResponse(
+                    b"not actually gzip", {"Content-Encoding": "gzip"}
+                ),
                 "https://open-vsx.org/api/pub/ext/file.vsix",
             )
         self.assertFalse(os.path.exists(self.filepath))
@@ -1394,19 +1527,19 @@ class TestHandleUpdateIntegration(unittest.TestCase):
         self.config = {"extensions": {}}
 
     def update_args(self, **overrides):
-        defaults = dict(
-            code_binary="code",
-            service_url=None,
-            open_vsx=False,
-            open_vsx_token=None,
-            extensions=[],
-            include_prerelease=False,
-            no_code_version_check=False,
-            dry_run=False,
-            download_dir=None,
-            yes=True,
-            min_release_age="24h",
-        )
+        defaults = {
+            "code_binary": "code",
+            "service_url": None,
+            "open_vsx": False,
+            "open_vsx_token": None,
+            "extensions": [],
+            "include_prerelease": False,
+            "no_code_version_check": False,
+            "dry_run": False,
+            "download_dir": None,
+            "yes": True,
+            "min_release_age": "24h",
+        }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
 

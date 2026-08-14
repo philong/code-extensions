@@ -958,6 +958,36 @@ def validate_config_value(display_key, norm_key, val, expected_type):
         sys.exit(1)
 
 
+def effective_ext_options(
+    ext_cfg,
+    include_prerelease,
+    min_release_age,
+    min_release_age_str=None,
+    cli_include_prerelease_override=False,
+    cli_min_release_age_override=False,
+):
+    """Merge a per-extension rule with the already-resolved global settings.
+
+    Precedence is the same for every command: an explicitly passed CLI flag wins
+    over a per-extension rule, which in turn wins over the global setting. An
+    unparsable per-extension age leaves the global one in place; load_config has
+    already warned about it.
+    """
+    ext_cfg = ext_cfg or {}
+    eff_include_prerelease = include_prerelease
+    if not cli_include_prerelease_override and "include_prerelease" in ext_cfg:
+        eff_include_prerelease = ext_cfg["include_prerelease"]
+
+    eff_min_age = min_release_age
+    eff_min_age_str = min_release_age_str
+    if not cli_min_release_age_override and "min_release_age" in ext_cfg:
+        with contextlib.suppress(ValueError):
+            eff_min_age = parse_age_threshold(ext_cfg["min_release_age"])
+            eff_min_age_str = str(ext_cfg["min_release_age"])
+
+    return eff_include_prerelease, eff_min_age, eff_min_age_str
+
+
 def resolve_min_release_age(args_val, config):
     """Return (timedelta, source string) for the min-release-age setting."""
     age_str = resolve_option(args_val, config, "min_release_age", "24h")
@@ -1747,6 +1777,8 @@ def query_marketplace_search(
     include_prerelease=False,
     min_release_age=None,
     extensions_config=None,
+    cli_include_prerelease_override=False,
+    cli_min_release_age_override=False,
     service_url=DEFAULT_SERVICE_URL,
     token=None,
 ):
@@ -1807,11 +1839,13 @@ def query_marketplace_search(
 
         ext_cfg = extensions_config.get(full_id, {}) if extensions_config else {}
         skipped_versions = ext_cfg.get("skip_versions", [])
-        eff_include_prerelease = ext_cfg.get("include_prerelease", include_prerelease)
-        eff_min_age = min_release_age
-        if "min_release_age" in ext_cfg:
-            with contextlib.suppress(ValueError):
-                eff_min_age = parse_age_threshold(ext_cfg["min_release_age"])
+        eff_include_prerelease, eff_min_age, _ = effective_ext_options(
+            ext_cfg,
+            include_prerelease,
+            min_release_age,
+            cli_include_prerelease_override=cli_include_prerelease_override,
+            cli_min_release_age_override=cli_min_release_age_override,
+        )
 
         compatible_versions = filter_versions(
             full_ext.get("versions", []),
@@ -2228,18 +2262,16 @@ def handle_install(args, config):
         full_id = f"{pub_name}.{ext_name}".lower()
 
         ext_cfg = extensions_config.get(full_id, {})
-        eff_include_prerelease = ext_cfg.get("include_prerelease", include_prerelease)
-        if getattr(args, "include_prerelease", False):
-            eff_include_prerelease = True
-
-        eff_min_age = min_release_age
-        eff_min_age_str = min_release_age_str
-        if args.min_release_age is None and "min_release_age" in ext_cfg:
-            try:
-                eff_min_age = parse_age_threshold(ext_cfg["min_release_age"])
-                eff_min_age_str = str(ext_cfg["min_release_age"])
-            except ValueError:
-                pass
+        eff_include_prerelease, eff_min_age, eff_min_age_str = effective_ext_options(
+            ext_cfg,
+            include_prerelease,
+            min_release_age,
+            min_release_age_str,
+            cli_include_prerelease_override=bool(
+                getattr(args, "include_prerelease", False)
+            ),
+            cli_min_release_age_override=args.min_release_age is not None,
+        )
 
         # An explicitly requested version overrides the config's opinion about
         # pre-releases and skipped versions, the same way it overrides the
@@ -2393,6 +2425,7 @@ def check_updates(
     exclude_prerelease=True,
     min_release_age=None,
     extensions_config=None,
+    cli_include_prerelease_override=False,
     cli_min_release_age_override=False,
     service_url=DEFAULT_SERVICE_URL,
     token=None,
@@ -2419,15 +2452,19 @@ def check_updates(
 
         ext_cfg = extensions_config.get(full_id, {}) if extensions_config else {}
         skipped_versions = ext_cfg.get("skip_versions", [])
-        eff_exclude_prerelease = exclude_prerelease
-        if "include_prerelease" in ext_cfg:
-            eff_exclude_prerelease = not ext_cfg["include_prerelease"]
+        eff_include_prerelease, eff_min_age, _ = effective_ext_options(
+            ext_cfg,
+            not exclude_prerelease,
+            min_release_age,
+            cli_include_prerelease_override=cli_include_prerelease_override,
+            cli_min_release_age_override=cli_min_release_age_override,
+        )
 
         compatible_versions = filter_versions(
             ext.get("versions", []),
             target_platform,
             vscode_version=vscode_version,
-            include_prerelease=not eff_exclude_prerelease,
+            include_prerelease=eff_include_prerelease,
             skip_versions=skipped_versions,
             newer_than=installed_ver,
         )
@@ -2437,11 +2474,6 @@ def check_updates(
 
         latest_ver_obj = compatible_versions[0]
         latest_version = latest_ver_obj["version"]
-
-        eff_min_age = min_release_age
-        if not cli_min_release_age_override and "min_release_age" in ext_cfg:
-            with contextlib.suppress(ValueError):
-                eff_min_age = parse_age_threshold(ext_cfg["min_release_age"])
 
         if parse_version(latest_version) > parse_version(installed_ver):
             eligible_ver_obj = first_eligible_version(compatible_versions, eff_min_age)
@@ -2809,6 +2841,9 @@ def handle_update(args, config):
         exclude_prerelease=not include_prerelease,
         min_release_age=min_release_age,
         extensions_config=extensions_config,
+        cli_include_prerelease_override=bool(
+            getattr(args, "include_prerelease", False)
+        ),
         cli_min_release_age_override=cli_min_release_age_override,
         service_url=service_url,
         token=token,
@@ -3086,6 +3121,9 @@ def handle_list(args, config):
             exclude_prerelease=not include_prerelease,
             min_release_age=min_release_age,
             extensions_config=config.get("extensions", {}),
+            cli_include_prerelease_override=bool(
+                getattr(args, "include_prerelease", False)
+            ),
             cli_min_release_age_override=getattr(args, "min_release_age", None)
             is not None,
             service_url=service_url,
@@ -3308,6 +3346,10 @@ def handle_search(args, config):
         include_prerelease=include_prerelease,
         min_release_age=min_release_age,
         extensions_config=extensions_config,
+        cli_include_prerelease_override=bool(
+            getattr(args, "include_prerelease", False)
+        ),
+        cli_min_release_age_override=getattr(args, "min_release_age", None) is not None,
         service_url=service_url,
         token=token,
     )
@@ -3431,14 +3473,13 @@ def handle_info(args, config):
 
     ext_cfg = config.get("extensions", {}).get(full_id, {})
     skipped_versions = ext_cfg.get("skip_versions", [])
-    eff_include_prerelease = ext_cfg.get("include_prerelease", include_prerelease)
-    if getattr(args, "include_prerelease", None):
-        eff_include_prerelease = True
-
-    eff_min_age = min_release_age
-    if getattr(args, "min_release_age", None) is None and "min_release_age" in ext_cfg:
-        with contextlib.suppress(ValueError):
-            eff_min_age = parse_age_threshold(ext_cfg["min_release_age"])
+    eff_include_prerelease, eff_min_age, _ = effective_ext_options(
+        ext_cfg,
+        include_prerelease,
+        min_release_age,
+        cli_include_prerelease_override=bool(getattr(args, "include_prerelease", None)),
+        cli_min_release_age_override=getattr(args, "min_release_age", None) is not None,
+    )
 
     # Same eligibility filter as install/search/update, so what `info` reports as
     # eligible is what those commands would actually pick.
