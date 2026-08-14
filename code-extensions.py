@@ -4556,8 +4556,10 @@ def main():
     args = parser.parse_args()
 
     if not args.command:
-        parser.print_help()
-        sys.exit(0)
+        parser.print_help(sys.stderr)
+        # Exit 2, argparse's usage-error code, so a script can tell a forgotten
+        # subcommand from a successful run of one.
+        sys.exit(2)
 
     handlers = {
         "install": handle_install,
