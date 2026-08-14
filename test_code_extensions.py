@@ -1850,8 +1850,8 @@ class TestHandleInfoIntegration(unittest.TestCase):
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(
         ce,
-        "get_installed_extensions",
-        return_value={"ms-python.python": "2024.1.0"},
+        "query_installed_extensions",
+        return_value=({"ms-python.python": "2024.1.0"}, None),
     )
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_info_found(self, mock_query, mock_installed, mock_vsver):
@@ -1881,7 +1881,42 @@ class TestHandleInfoIntegration(unittest.TestCase):
         self.assertIn("Repository:", output)
 
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
-    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(
+        ce,
+        "query_installed_extensions",
+        return_value=({}, "Error running 'code --list-extensions': not found"),
+    )
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_info_survives_a_missing_code_binary(
+        self, mock_query, mock_installed, mock_vsver
+    ):
+        mock_query.return_value = {
+            "ms-python.python": make_mock_gallery_extension(
+                "ms-python", "python", "2024.2.0"
+            )
+        }
+        args = argparse.Namespace(
+            extension="ms-python.python",
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            min_release_age="24h",
+        )
+        # The command is mostly gallery metadata; it must not exit just because
+        # the local install cannot be inspected.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_info(args, {})
+
+        output = out.getvalue()
+        self.assertIn("Latest Ver:", output)
+        self.assertIn("Unknown", output)
+        self.assertNotIn("Not installed", output)
+
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_installed_extensions", return_value=({}, None))
     @patch.object(ce, "query_marketplace_search")
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_info_partial_name_fallback(
@@ -1911,7 +1946,7 @@ class TestHandleInfoIntegration(unittest.TestCase):
         self.assertIn("ms-python.python", output)
 
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
-    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "query_installed_extensions", return_value=({}, None))
     @patch.object(ce, "query_marketplace_search")
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_info_searches_rather_than_querying_a_malformed_id(

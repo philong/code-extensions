@@ -273,7 +273,12 @@ def run_code_cmd(args, retries=3, delay=1.0):
             raise
 
 
-def get_installed_extensions(code_binary="code", ignore_errors=False):
+def query_installed_extensions(code_binary="code"):
+    """Return (mapping of extension id to version, error message or None).
+
+    An empty mapping is ambiguous - no extensions installed, or no usable 'code'
+    binary - so callers that need to tell those apart get the error text too.
+    """
     binary_cmd = parse_code_binary(code_binary)
     full_cmd = [*binary_cmd, "--list-extensions", "--show-versions"]
     try:
@@ -282,14 +287,7 @@ def get_installed_extensions(code_binary="code", ignore_errors=False):
     # A missing or unexecutable binary raises OSError; a non-zero exit raises
     # CalledProcessError, which SubprocessError covers.
     except (OSError, subprocess.SubprocessError) as e:
-        if ignore_errors:
-            return {}
-        cmd_str = " ".join(full_cmd)
-        print(
-            f"{Colors.RED}Error running '{cmd_str}': {e}{Colors.ENDC}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        return {}, f"Error running '{' '.join(full_cmd)}': {e}"
 
     extensions = {}
     for line in output.strip().splitlines():
@@ -299,6 +297,14 @@ def get_installed_extensions(code_binary="code", ignore_errors=False):
         ext_id, version = line.rsplit("@", 1)
         extensions[ext_id.lower()] = version
 
+    return extensions, None
+
+
+def get_installed_extensions(code_binary="code", ignore_errors=False):
+    extensions, error = query_installed_extensions(code_binary)
+    if error and not ignore_errors:
+        print(f"{Colors.RED}{error}{Colors.ENDC}", file=sys.stderr)
+        sys.exit(1)
     return extensions
 
 
@@ -3473,13 +3479,16 @@ def handle_info(args, config):
     categories = ext_obj.get("categories", [])
     cat_str = ", ".join(categories) if categories else "None"
 
-    installed_exts = get_installed_extensions(code_binary)
+    # Almost everything reported here is gallery metadata, so a missing or
+    # broken 'code' binary costs the installed-version line, not the command.
+    installed_exts, installed_error = query_installed_extensions(code_binary)
     installed_ver = installed_exts.get(full_id)
-    installed_status = (
-        f"{Colors.GREEN}Installed (v{installed_ver}){Colors.ENDC}"
-        if installed_ver
-        else f"{Colors.YELLOW}Not installed{Colors.ENDC}"
-    )
+    if installed_error:
+        installed_status = f"{Colors.YELLOW}Unknown (cannot query VS Code){Colors.ENDC}"
+    elif installed_ver:
+        installed_status = f"{Colors.GREEN}Installed (v{installed_ver}){Colors.ENDC}"
+    else:
+        installed_status = f"{Colors.YELLOW}Not installed{Colors.ENDC}"
 
     props = latest_ver_obj.get("properties", []) if latest_ver_obj else []
     repo_url = None
