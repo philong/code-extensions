@@ -2839,6 +2839,15 @@ def handle_update(args, config):
         print(f"{Colors.GREEN}{Colors.BOLD}Updates available:{Colors.ENDC}")
         print_updates_table(updates)
         selected_updates = [u for u in updates if u["eligible"]]
+        # Without a terminal there is nobody to confirm the selection, so stop at
+        # the report rather than installing everything unattended. A dry run
+        # changes nothing, so it can still list what an install would pick up.
+        if not dry_run:
+            print(
+                f"\n{Colors.YELLOW}Not a terminal: no updates were installed. "
+                f"Re-run with -y to install them.{Colors.ENDC}"
+            )
+            return
 
     if dry_run:
         print()

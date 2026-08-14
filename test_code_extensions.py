@@ -678,6 +678,31 @@ def make_mock_gallery_extension(
     }
 
 
+# Helper to construct a check_updates() entry
+def make_mock_update(
+    pub_name="ms-python",
+    ext_name="python",
+    installed="2024.1.0",
+    latest="2024.2.0",
+    eligible="2024.2.0",
+):
+    url = f"https://example.com/{ext_name}.vsix"
+    return {
+        "id": f"{pub_name}.{ext_name}",
+        "publisher": pub_name,
+        "name": ext_name,
+        "installed": installed,
+        "latest": latest,
+        "eligible": eligible,
+        "eligible_platform": "universal",
+        "latest_platform": "universal",
+        "latest_release_date": "2024-01-01",
+        "eligible_release_date": "2024-01-01",
+        "latest_download_url": url,
+        "eligible_download_url": url,
+    }
+
+
 # =====================================================================
 # Network Retry & Extension ID Validation Tests
 # =====================================================================
@@ -1368,6 +1393,23 @@ class TestHandleUpdateIntegration(unittest.TestCase):
     def setUp(self):
         self.config = {"extensions": {}}
 
+    def update_args(self, **overrides):
+        defaults = dict(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=[],
+            include_prerelease=False,
+            no_code_version_check=False,
+            dry_run=False,
+            download_dir=None,
+            yes=True,
+            min_release_age="24h",
+        )
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "check_updates", return_value=[])
     @patch.object(
@@ -1443,6 +1485,54 @@ class TestHandleUpdateIntegration(unittest.TestCase):
         mock_download.assert_called_once()
         mock_run.assert_called_once()
         self.assertIn("--install-extension", mock_run.call_args[0][0])
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.1.0"},
+    )
+    @patch.object(ce, "check_updates")
+    def test_handle_update_without_a_terminal_reports_but_installs_nothing(
+        self, mock_check, mock_installed, mock_vsver, mock_download, mock_run
+    ):
+        mock_check.return_value = [make_mock_update()]
+        args = self.update_args(yes=None)
+
+        # redirect_stdout hands handle_update a non-tty stream, which is what the
+        # piped/cron case looks like.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_update(args, self.config)
+
+        mock_download.assert_not_called()
+        mock_run.assert_not_called()
+        output = out.getvalue()
+        self.assertIn("Updates available", output)
+        self.assertIn("Re-run with -y", output)
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.1.0"},
+    )
+    @patch.object(ce, "check_updates")
+    def test_handle_update_dry_run_still_reports_without_a_terminal(
+        self, mock_check, mock_installed, mock_vsver, mock_download, mock_run
+    ):
+        mock_check.return_value = [make_mock_update()]
+        args = self.update_args(yes=None, dry_run=True)
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_update(args, self.config)
+
+        mock_download.assert_not_called()
+        mock_run.assert_not_called()
+        self.assertIn("Would update 1 extension(s)", out.getvalue())
 
     @patch.object(ce, "run_code_cmd")
     @patch.object(ce, "download_vsix")

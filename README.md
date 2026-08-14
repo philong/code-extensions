@@ -71,6 +71,7 @@ code-extensions update [extensions...] [options]
 ```
 
 * Scans installed extensions, queries marketplace for updates, and launches interactive TUI selection (or auto-installs if `-y`).
+* Without a terminal (piped output, cron, CI) the available updates are only reported; pass `-y` to install them.
 * Optionally limit the check to one or more extensions by passing full IDs (e.g. `ms-python.python`) or partial names (e.g. `python`, resolved against installed extensions like `info`). Without arguments, all installed extensions are checked.
 
 **Options**:
