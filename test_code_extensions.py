@@ -637,5 +637,41 @@ class TestNetworkRetry(unittest.TestCase):
         self.assertEqual(mock_sleep.call_count, 3)
 
 
+# =====================================================================
+# Extension ID Validation Tests
+# =====================================================================
+class TestExtensionIDValidation(unittest.TestCase):
+    def test_is_valid_extension_id(self):
+        valid_ids = [
+            "ms-python.python",
+            "charliermarsh.ruff",
+            "golang.go",
+            "pub.name-with-hyphens",
+            "pub_name.ext_name",
+            "pub.ext.sub",
+            "A.B",
+            "a1.b2",
+        ]
+        for vid in valid_ids:
+            with self.subTest(vid=vid):
+                self.assertTrue(ce.is_valid_extension_id(vid))
+
+        invalid_ids = [
+            "python",  # no dot
+            "ms-python.python&calc",
+            "ms-python.python|dir",
+            "ms-python.python;ls",
+            "../../etc/passwd",
+            "foo..bar",
+            "",
+            None,
+            123,
+            " . ",
+        ]
+        for iid in invalid_ids:
+            with self.subTest(iid=iid):
+                self.assertFalse(ce.is_valid_extension_id(iid))
+
+
 if __name__ == "__main__":
     unittest.main()

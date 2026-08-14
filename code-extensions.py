@@ -1173,17 +1173,36 @@ def save_config(config, config_path):
         f.write(content)
 
 
-def parse_config_key(key):
+EXTENSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$")
+
+
+def is_valid_extension_id(ext_id):
+    """Validate whether an extension identifier conforms to 'publisher.name' format."""
+    # Deliberately not stripping: callers key the marketplace response map by the
+    # exact string they validated, so accepting ' pub.name ' here while looking up
+    # the padded form there would report a real extension as missing.
+    if not ext_id or not isinstance(ext_id, str):
+        return False
+    return bool(EXTENSION_ID_PATTERN.fullmatch(ext_id))
+
+
+def parse_config_key(key, validate=True):
+    # `validate` is off for get/unset so that entries an older release wrote with
+    # a malformed id stay reachable; only `set` refuses to create new ones.
     key = str(key).strip()
     if key.startswith("extensions."):
         key = key[len("extensions.") :]
 
     if "." in key:
         parts = key.rsplit(".", 1)
-        ext_id, prop = parts[0].lower(), parts[1].lower()
-        return ("extension", ext_id, prop)
-    else:
-        return ("global", key.lower(), None)
+        ext_id, prop = parts[0].strip().lower(), parts[1].strip().lower()
+        if not validate or is_valid_extension_id(ext_id):
+            return ("extension", ext_id, prop)
+        # No global setting contains a dot, so a dotted key was meant as an
+        # extension rule. Reporting it as an unknown global would answer with
+        # the global option list instead of the actual problem.
+        return ("invalid", ext_id, prop)
+    return ("global", key.lower(), None)
 
 
 def handle_config(args, config):
@@ -1283,7 +1302,7 @@ def handle_config(args, config):
             )
             sys.exit(1)
 
-        target_type, ext_id, prop = parse_config_key(args.key)
+        target_type, ext_id, prop = parse_config_key(args.key, validate=False)
         if target_type == "global":
             val = config.get(ext_id.replace("-", "_"))
             if val is not None:
@@ -1316,6 +1335,13 @@ def handle_config(args, config):
             sys.exit(1)
 
         target_type, ext_id, prop = parse_config_key(args.key)
+        if target_type == "invalid":
+            print(
+                f"{Colors.RED}Error: Invalid extension ID '{ext_id}' in key '{args.key}'. Expected format '<publisher>.<name>.<setting>'.{Colors.ENDC}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         raw_val = args.value.strip()
         coerced_val = raw_val
         if raw_val.lower() == "true":
@@ -1365,7 +1391,7 @@ def handle_config(args, config):
             )
             sys.exit(1)
 
-        target_type, ext_id, prop = parse_config_key(args.key)
+        target_type, ext_id, prop = parse_config_key(args.key, validate=False)
         changed = False
 
         if target_type == "global":
@@ -2120,8 +2146,8 @@ def handle_install(args, config):
             req_ver = req_ver.strip() or None
         else:
             ext_id, req_ver = spec, None
-        ext_id_lower = ext_id.lower()
-        if "." not in ext_id_lower:
+        ext_id_lower = ext_id.strip().lower()
+        if not is_valid_extension_id(ext_id_lower):
             print(
                 f"{Colors.RED}Error: Invalid extension ID '{spec}'. Expected format 'publisher.name' or 'publisher.name@version'.{Colors.ENDC}",
                 file=sys.stderr,
@@ -2130,8 +2156,10 @@ def handle_install(args, config):
         parsed_targets.append((ext_id_lower, req_ver))
 
     if not parsed_targets:
-        print("No valid extensions specified for installation.")
-        return
+        # Every spec was rejected, so exit non-zero: a script that pipes a list
+        # of ids in has otherwise no way to tell this from a successful install.
+        print("No valid extensions specified for installation.", file=sys.stderr)
+        sys.exit(1)
 
     ext_ids = [t[0] for t in parsed_targets]
     print(f"{Colors.BLUE}Querying extension gallery for installation...{Colors.ENDC}")
@@ -3285,9 +3313,12 @@ def handle_info(args, config):
 
     ext_id = args.extension.strip().lower()
     if "@" in ext_id:
-        ext_id = ext_id.split("@")[0]
+        ext_id = ext_id.split("@")[0].strip()
 
-    if "." not in ext_id:
+    # Anything that is not a well-formed id is treated as a search term, so a
+    # malformed one falls back to the gallery search rather than being sent
+    # straight to a by-id query that can only answer 'not found'.
+    if not is_valid_extension_id(ext_id):
         print(
             f"{Colors.BLUE}Searching extension gallery for '{ext_id}'...{Colors.ENDC}"
         )
