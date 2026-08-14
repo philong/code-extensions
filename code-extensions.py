@@ -55,6 +55,9 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 DEFAULT_SERVICE_URL = "https://marketplace.visualstudio.com/_apis/public/gallery"
 OPEN_VSX_SERVICE_URL = "https://open-vsx.org/vscode/gallery"
 OPEN_VSX_HOST = "open-vsx.org"
+# Microsoft's gallery and the CDN hosts it serves packages from. An Open VSX
+# token is meaningless to them, so it is never worth the risk of sending it.
+MARKETPLACE_HOSTS = ("visualstudio.com", "vsassets.io")
 
 
 def url_host(url):
@@ -1501,6 +1504,16 @@ def is_open_vsx_url(url):
     return host == OPEN_VSX_HOST or host.endswith("." + OPEN_VSX_HOST)
 
 
+def is_marketplace_url(url):
+    """Whether a URL points at Microsoft's Marketplace or one of its CDN hosts."""
+    if not url:
+        return False
+    host = url_host(url)
+    return any(
+        host == known or host.endswith("." + known) for known in MARKETPLACE_HOSTS
+    )
+
+
 def resolve_open_vsx_token(args, config):
     config = config or {}
     token = resolve_option(
@@ -1527,7 +1540,12 @@ def resolve_token_for_service(service_url, args=None, config=None):
         and getattr(args, "open_vsx_token", None) is not None
     )
     has_cfg_token = bool(config.get("open_vsx_token"))
-    if is_open_vsx_url(service_url) or open_vsx or has_cli_token or has_cfg_token:
+    if is_open_vsx_url(service_url) or open_vsx:
+        return resolve_open_vsx_token(args, config)
+    # A configured token also covers self-hosted Open VSX registries, whose URLs
+    # this tool cannot recognize - but never Microsoft's Marketplace, which would
+    # otherwise be handed the credential simply because one happens to be set.
+    if (has_cli_token or has_cfg_token) and not is_marketplace_url(service_url):
         return resolve_open_vsx_token(args, config)
     return None
 
@@ -1872,6 +1890,18 @@ def download_vsix(url, filepath, token=None, service_url=None):
         is_open_vsx_url(url) or (service_url and is_open_vsx_url(service_url))
     ):
         token = os.environ.get("OVSX_PAT")
+
+    # The download host comes from the gallery response, not from the configured
+    # service, so it is only trusted with the token when it is the service itself
+    # or Open VSX. Anything else - a CDN, a redirector, a host a compromised
+    # response named - is served anonymously. Cross-host redirects are handled by
+    # _AuthStrippingRedirectHandler; this covers the first hop.
+    download_host = url_host(url)
+    if token and not (
+        is_open_vsx_url(url)
+        or (download_host and download_host == url_host(service_url or ""))
+    ):
+        token = None
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"

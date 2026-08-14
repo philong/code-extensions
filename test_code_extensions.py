@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 import urllib.request
+import zlib
 from unittest.mock import MagicMock, patch
 
 # Dynamically import code-extensions.py module (since filename contains a hyphen)
@@ -355,6 +356,64 @@ class TestSecurityAndHostValidation(unittest.TestCase):
         for url, expected in cases:
             with self.subTest(url=url):
                 self.assertEqual(ce.is_open_vsx_url(url), expected)
+
+    def test_is_marketplace_url(self):
+        cases = [
+            ("https://marketplace.visualstudio.com/_apis/public/gallery", True),
+            ("https://ms-python.gallerycdn.vsassets.io/file.vsix", True),
+            ("https://marketplace.visualstudio.com.attacker.com/gallery", False),
+            ("https://open-vsx.org/vscode/gallery", False),
+            ("https://vsx.internal.example.com/gallery", False),
+            ("", False),
+        ]
+        for url, expected in cases:
+            with self.subTest(url=url):
+                self.assertEqual(ce.is_marketplace_url(url), expected)
+
+    def test_resolve_token_for_service_withholds_from_the_marketplace(self):
+        args = argparse.Namespace(open_vsx_token="secret_pat", open_vsx=None)
+        config = {"open_vsx_token": "secret_pat"}
+
+        # A token set for some other registry must not reach Microsoft's.
+        self.assertIsNone(
+            ce.resolve_token_for_service(ce.DEFAULT_SERVICE_URL, args, config)
+        )
+        self.assertIsNone(
+            ce.resolve_token_for_service(
+                ce.DEFAULT_SERVICE_URL, argparse.Namespace(open_vsx=None), config
+            )
+        )
+
+        # Open VSX itself, an explicit --open-vsx, and a self-hosted registry all
+        # still get it.
+        self.assertEqual(
+            ce.resolve_token_for_service(ce.OPEN_VSX_SERVICE_URL, args, config),
+            "secret_pat",
+        )
+        self.assertEqual(
+            ce.resolve_token_for_service(
+                "https://vsx.internal.example.com/gallery", args, config
+            ),
+            "secret_pat",
+        )
+        self.assertEqual(
+            ce.resolve_token_for_service(
+                ce.DEFAULT_SERVICE_URL,
+                argparse.Namespace(open_vsx=True),
+                {"open_vsx_token": "secret_pat"},
+            ),
+            "secret_pat",
+        )
+
+    def test_resolve_token_for_service_without_a_token_configured(self):
+        args = argparse.Namespace(open_vsx=None)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(
+                ce.resolve_token_for_service(ce.DEFAULT_SERVICE_URL, args, {})
+            )
+            self.assertIsNone(
+                ce.resolve_token_for_service(ce.OPEN_VSX_SERVICE_URL, args, {})
+            )
 
     def test_auth_stripping_redirect_handler_cross_host(self):
         handler = ce._AuthStrippingRedirectHandler()
@@ -754,6 +813,113 @@ class TestNetworkRetryAndIDValidation(unittest.TestCase):
             )
         self.assertIsNone(result)
         self.assertEqual(mock_sleep.call_count, 3)
+
+
+# =====================================================================
+# Package Download Tests
+# =====================================================================
+class FakeDownloadResponse:
+    """Minimal stand-in for the object _url_opener.open() hands back."""
+
+    def __init__(self, body, headers=None):
+        self._body = body
+        self._pos = 0
+        self.headers = email.message_from_string("")
+        for key, value in (headers or {}).items():
+            self.headers[key] = value
+
+    def read(self, size):
+        chunk = self._body[self._pos : self._pos + size]
+        self._pos += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class TestDownloadVsix(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.filepath = os.path.join(self.tmpdir.name, "ext.vsix")
+
+    def download(self, response, url, **kwargs):
+        """Run download_vsix against a canned response, returning the Request."""
+        captured = {}
+
+        def fake_open(req, timeout=None):
+            captured["req"] = req
+            return response
+
+        with patch.object(ce._url_opener, "open", side_effect=fake_open):
+            ce.download_vsix(url, self.filepath, **kwargs)
+        return captured["req"]
+
+    def test_download_writes_the_package(self):
+        req = self.download(
+            FakeDownloadResponse(b"PK\x03\x04payload"),
+            "https://open-vsx.org/api/pub/ext/file.vsix",
+        )
+        self.assertNotIn("Authorization", req.headers)
+        with open(self.filepath, "rb") as f:
+            self.assertEqual(f.read(), b"PK\x03\x04payload")
+
+    def test_download_sends_the_token_to_open_vsx(self):
+        req = self.download(
+            FakeDownloadResponse(b"payload"),
+            "https://open-vsx.org/api/pub/ext/file.vsix",
+            token="secret_pat",
+        )
+        self.assertEqual(req.headers.get("Authorization"), "Bearer secret_pat")
+
+    def test_download_sends_the_token_to_the_configured_service(self):
+        req = self.download(
+            FakeDownloadResponse(b"payload"),
+            "https://vsx.internal.example.com/files/ext.vsix",
+            token="secret_pat",
+            service_url="https://vsx.internal.example.com/gallery",
+        )
+        self.assertEqual(req.headers.get("Authorization"), "Bearer secret_pat")
+
+    def test_download_withholds_the_token_from_any_other_host(self):
+        # The download URL comes out of the gallery response, so a host that is
+        # neither the configured service nor Open VSX is served anonymously -
+        # Microsoft's CDN, a redirector, or a host a compromised response named.
+        cases = [
+            (
+                "https://marketplace.visualstudio.com/_apis/public/gallery/vspackage",
+                None,
+            ),
+            ("https://ms-python.gallerycdn.vsassets.io/file.vsix", None),
+            (
+                "https://cdn.example.net/file.vsix",
+                "https://vsx.internal.example.com/gallery",
+            ),
+            ("https://open-vsx.org.attacker.com/file.vsix", ce.OPEN_VSX_SERVICE_URL),
+        ]
+        for url, service_url in cases:
+            with self.subTest(url=url):
+                req = self.download(
+                    FakeDownloadResponse(b"payload"),
+                    url,
+                    token="secret_pat",
+                    service_url=service_url,
+                )
+                self.assertNotIn("Authorization", req.headers)
+
+    def test_download_decompresses_a_gzip_encoded_package(self):
+        compressor = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
+        body = compressor.compress(b"PK\x03\x04payload") + compressor.flush()
+
+        self.download(
+            FakeDownloadResponse(body, {"Content-Encoding": "gzip"}),
+            "https://open-vsx.org/api/pub/ext/file.vsix",
+        )
+        with open(self.filepath, "rb") as f:
+            self.assertEqual(f.read(), b"PK\x03\x04payload")
 
 
 # =====================================================================
