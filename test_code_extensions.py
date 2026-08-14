@@ -295,6 +295,143 @@ class TestTOMLParserAndConfig(unittest.TestCase):
 
 
 # =====================================================================
+# In-Place Config Editing Tests
+# =====================================================================
+HAND_WRITTEN_CONFIG = """\
+# My config, hand written.
+min-release-age = "12h"   # keep a buffer
+unknown-key = "keep me"
+
+# Python is special
+[extensions."ms-python.python"]
+  ignore = true
+  skip-versions = [
+    "1.0.0",
+  ]
+"""
+
+
+class TestEditTomlText(unittest.TestCase):
+    def test_setting_a_key_keeps_comments_spelling_and_unknown_keys(self):
+        edited = ce.edit_toml_text(HAND_WRITTEN_CONFIG, None, "min_release_age", "3d")
+
+        self.assertIn('min-release-age = "3d"   # keep a buffer', edited)
+        self.assertIn("# My config, hand written.", edited)
+        self.assertIn('unknown-key = "keep me"', edited)
+        self.assertIn("# Python is special", edited)
+
+    def test_a_new_global_key_lands_above_the_first_table(self):
+        edited = ce.edit_toml_text(HAND_WRITTEN_CONFIG, None, "open_vsx", True)
+        lines = edited.splitlines()
+
+        self.assertIn("open_vsx = true", lines)
+        self.assertLess(
+            lines.index("open_vsx = true"), lines.index("# Python is special")
+        )
+        self.assertEqual(ce.parse_toml_text(edited)["open_vsx"], True)
+
+    def test_a_new_extension_key_lands_after_a_multi_line_value(self):
+        edited = ce.edit_toml_text(
+            HAND_WRITTEN_CONFIG,
+            ("extensions", "ms-python.python"),
+            "min_release_age",
+            "5d",
+        )
+
+        parsed = ce.parse_toml_text(edited)["extensions"]["ms-python.python"]
+        self.assertEqual(parsed["min_release_age"], "5d")
+        self.assertEqual(parsed["skip-versions"], ["1.0.0"])
+
+    def test_replacing_a_multi_line_value_drops_its_continuation(self):
+        edited = ce.edit_toml_text(
+            HAND_WRITTEN_CONFIG,
+            ("extensions", "ms-python.python"),
+            "skip_versions",
+            ["2.0.0", "2.1.0"],
+        )
+
+        self.assertNotIn("1.0.0", edited)
+        self.assertEqual(
+            ce.parse_toml_text(edited)["extensions"]["ms-python.python"][
+                "skip-versions"
+            ],
+            ["2.0.0", "2.1.0"],
+        )
+
+    def test_a_missing_table_is_appended(self):
+        edited = ce.edit_toml_text(
+            HAND_WRITTEN_CONFIG, ("extensions", "golang.go"), "ignore", True
+        )
+
+        self.assertTrue(ce.parse_toml_text(edited)["extensions"]["golang.go"]["ignore"])
+        self.assertIn("# My config, hand written.", edited)
+
+    def test_an_appended_table_matches_the_file_s_indentation(self):
+        edited = ce.edit_toml_text(
+            HAND_WRITTEN_CONFIG, ("extensions", "golang.go"), "ignore", True
+        )
+        self.assertIn('[extensions."golang.go"]\n  ignore = true', edited)
+
+        flat = '[extensions."ms-python.python"]\nignore = true\n'
+        edited = ce.edit_toml_text(flat, ("extensions", "golang.go"), "ignore", True)
+        self.assertIn('[extensions."golang.go"]\nignore = true', edited)
+
+    def test_editing_an_empty_file_writes_a_usable_config(self):
+        edited = ce.edit_toml_text("", None, "min_release_age", "2d")
+        self.assertEqual(ce.parse_toml_text(edited)["min_release_age"], "2d")
+
+    def test_deleting_the_last_key_removes_its_table(self):
+        edited = ce.edit_toml_text(
+            HAND_WRITTEN_CONFIG,
+            ("extensions", "ms-python.python"),
+            "skip_versions",
+            None,
+            delete=True,
+        )
+        edited = ce.edit_toml_text(
+            edited, ("extensions", "ms-python.python"), "ignore", None, delete=True
+        )
+
+        self.assertNotIn("extensions", ce.parse_toml_text(edited))
+        self.assertIn('unknown-key = "keep me"', edited)
+
+    def test_the_legacy_table_spelling_is_edited_in_place(self):
+        text = '[extension."ms-python.python"]\nignore = true\n'
+        edited = ce.edit_toml_text(
+            text, ("extensions", "ms-python.python"), "ignore", False
+        )
+
+        self.assertEqual(edited, '[extension."ms-python.python"]\nignore = false\n')
+
+    def test_deleting_a_key_that_is_not_there_changes_nothing(self):
+        edited = ce.edit_toml_text(HAND_WRITTEN_CONFIG, None, "open_vsx", None, True)
+        self.assertEqual(edited, HAND_WRITTEN_CONFIG)
+
+    def test_crlf_line_endings_survive(self):
+        text = 'min-release-age = "12h"\r\nopen_vsx = true\r\n'
+        edited = ce.edit_toml_text(text, None, "min_release_age", "3d")
+
+        self.assertEqual(edited, 'min-release-age = "3d"\r\nopen_vsx = true\r\n')
+
+    def test_config_edit_took_effect_rejects_an_unapplied_edit(self):
+        self.assertTrue(
+            ce.config_edit_took_effect(
+                'min-release-age = "3d"\n', None, "min_release_age", "3d", False
+            )
+        )
+        self.assertFalse(
+            ce.config_edit_took_effect(
+                'min-release-age = "12h"\n', None, "min_release_age", "3d", False
+            )
+        )
+        self.assertFalse(
+            ce.config_edit_took_effect(
+                'min-release-age = "3d"\n', None, "min_release_age", None, True
+            )
+        )
+
+
+# =====================================================================
 # Release Age Gating Tests
 # =====================================================================
 class TestReleaseAgeGating(unittest.TestCase):

@@ -743,8 +743,11 @@ def unquote_toml_value(text):
     return text
 
 
-def strip_comment(line):
-    """Drop a trailing '#' comment, ignoring '#' inside a quoted value."""
+def split_comment(line):
+    """Split a line into its code and its trailing '#' comment.
+
+    A '#' inside a quoted value is part of the value, not a comment.
+    """
     in_quote = None
     escaped = False
     for i, char in enumerate(line):
@@ -762,8 +765,12 @@ def strip_comment(line):
             elif in_quote is None:
                 in_quote = char
         elif char == "#" and in_quote is None:
-            return line[:i].strip()
-    return line.strip()
+            return line[:i], line[i:]
+    return line, ""
+
+
+def strip_comment(line):
+    return split_comment(line)[0].strip()
 
 
 def parse_toml_fallback(content):
@@ -998,6 +1005,29 @@ def resolve_min_release_age(args_val, config):
         sys.exit(1)
 
 
+def parse_toml_text(text):
+    """Parse TOML with the best parser available, stdlib first."""
+    try:
+        import tomllib
+
+        return tomllib.loads(text)
+    except ImportError:
+        pass
+    try:
+        import tomli
+
+        return tomli.loads(text)
+    except ImportError:
+        pass
+    try:
+        import toml
+
+        return toml.loads(text)
+    except ImportError:
+        pass
+    return parse_toml_fallback(text)
+
+
 def load_config():
     config_path = get_default_config_path()
     config = {"extensions": {}}
@@ -1005,26 +1035,8 @@ def load_config():
         return config
 
     try:
-        try:
-            import tomllib
-
-            with open(config_path, "rb") as f:
-                parsed = tomllib.load(f)
-        except ImportError:
-            try:
-                import tomli as tomllib
-
-                with open(config_path, "rb") as f:
-                    parsed = tomllib.load(f)
-            except ImportError:
-                try:
-                    import toml
-
-                    with open(config_path, encoding="utf-8") as f:
-                        parsed = toml.load(f)
-                except ImportError:
-                    with open(config_path, encoding="utf-8") as f:
-                        parsed = parse_toml_fallback(f.read())
+        with open(config_path, encoding="utf-8") as f:
+            parsed = parse_toml_text(f.read())
     # ValueError covers every parser's decode error: tomllib.TOMLDecodeError,
     # toml.TomlDecodeError, and UnicodeDecodeError all derive from it.
     except (OSError, ValueError) as e:
@@ -1205,7 +1217,7 @@ def restrict_to_owner(path, mode):
         os.chmod(path, mode)
 
 
-def save_config(config, config_path):
+def write_config_text(content, config_path):
     dir_path = os.path.dirname(config_path)
     if dir_path:
         existed = os.path.isdir(dir_path)
@@ -1215,13 +1227,303 @@ def save_config(config, config_path):
         # directory that happens to hold a config.toml.
         if not existed or os.path.basename(dir_path) == "code-extensions":
             restrict_to_owner(dir_path, 0o700)
-    content = dump_toml(config)
     # The config can hold an API token, so restrict an existing file before
     # writing and create a new one already restricted, never widening either.
     restrict_to_owner(config_path, 0o600)
     fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(content)
+
+
+def save_config(config, config_path):
+    write_config_text(dump_toml(config), config_path)
+
+
+def config_table_path(target_type, ext_id):
+    """The TOML table an edited key lives in: None for a global setting."""
+    return None if target_type == "global" else ("extensions", ext_id.lower())
+
+
+def normalize_toml_key(key):
+    return str(key).strip().replace("-", "_")
+
+
+def split_toml_table_header(line):
+    """Split a '[table.sub]' header into its parts, or return None.
+
+    Only the first dot separates the table from its subtable, matching how the
+    config is read back: '[extensions."ms-python.python"]' names one extension,
+    not a table nested three deep.
+    """
+    stripped = strip_comment(line)
+    if not stripped.startswith("[") or not stripped.endswith("]"):
+        return None
+    inner = stripped[1:-1].strip()
+    if not inner:
+        return None
+
+    parts = []
+    current = []
+    in_quote = None
+    for char in inner:
+        if char in ('"', "'"):
+            if in_quote == char:
+                in_quote = None
+            elif in_quote is None:
+                in_quote = char
+            current.append(char)
+        elif char == "." and in_quote is None:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current))
+
+    names = [unquote_toml_value(p.strip()) for p in parts]
+    top = names[0].strip()
+    # load_config accepts both spellings, so an edit has to find either.
+    if top == "extension":
+        top = "extensions"
+    if len(names) == 1:
+        return (top,)
+    return (top, ".".join(names[1:]).strip().lower())
+
+
+def toml_line_key(line):
+    """The key of a 'key = value' line, normalized, or None for any other line."""
+    stripped = strip_comment(line)
+    if not stripped or "=" not in stripped or stripped.startswith("["):
+        return None
+    return normalize_toml_key(unquote_toml_value(stripped.split("=", 1)[0].strip()))
+
+
+def toml_value_is_complete(text):
+    """Whether an array value opened on this text is already closed."""
+    depth = 0
+    in_quote = None
+    escaped = False
+    for char in text:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and in_quote != "'":
+            escaped = True
+            continue
+        if char in ('"', "'"):
+            if in_quote == char:
+                in_quote = None
+            elif in_quote is None:
+                in_quote = char
+        elif in_quote is None:
+            if char == "[":
+                depth += 1
+            elif char == "]":
+                depth -= 1
+    return depth <= 0
+
+
+def drop_empty_toml_table(lines, table):
+    """Drop `table`'s header once an edit has left it without keys.
+
+    Blank padding inside the emptied table goes with it; any comment there is
+    kept, since it may say something the header did not.
+    """
+    result = []
+    i = 0
+    while i < len(lines):
+        if split_toml_table_header(lines[i]) != table:
+            result.append(lines[i])
+            i += 1
+            continue
+
+        end = i + 1
+        while end < len(lines) and split_toml_table_header(lines[end]) is None:
+            end += 1
+        body = lines[i + 1 : end]
+        if any(toml_line_key(line) is not None for line in body):
+            result.extend(lines[i:end])
+        else:
+            result.extend(line for line in body if line.strip())
+        i = end
+    return result
+
+
+def edit_toml_text(text, table, key, value, delete=False):
+    """Return `text` with one key set or removed, leaving every other byte alone.
+
+    Rewriting the file from the parsed config would drop the user's comments,
+    their key order, and anything this tool does not model, so an edit rewrites
+    only the line it owns.
+    """
+    target_key = normalize_toml_key(key)
+    new_line_body = f"{toml_key(key)} = {toml_value(value)}"
+
+    lines = text.splitlines()
+    out = []
+    current = None
+    insert_after = None  # index in `out` of the last line of the target table
+    first_header = None  # index in `out` of the first table header
+    key_indent = None  # indentation the target table's existing keys use
+    table_key_indent = None  # indentation keys use elsewhere in the file
+    found = False
+    pending = None  # tail of a multi-line value being dropped
+    carry = None  # tail of a multi-line value being kept
+
+    for line in lines:
+        if pending is not None:
+            pending += " " + strip_comment(line)
+            if toml_value_is_complete(pending):
+                pending = None
+            continue
+
+        if carry is not None:
+            # Still inside somebody else's array; a new key must go after its
+            # closing bracket, not into the middle of it.
+            carry += " " + strip_comment(line)
+            out.append(line)
+            if current == table:
+                insert_after = len(out) - 1
+            if toml_value_is_complete(carry):
+                carry = None
+            continue
+
+        header = split_toml_table_header(line)
+        if header is not None:
+            current = header
+            if first_header is None:
+                first_header = len(out)
+            out.append(line)
+            if current == table:
+                insert_after = len(out) - 1
+            continue
+
+        if current == table and toml_line_key(line) == target_key:
+            found = True
+            code, comment = split_comment(line)
+            if not toml_value_is_complete(code):
+                pending = code
+            if not delete:
+                # Keep the key exactly as the file spells it, along with its
+                # indentation and any note the user left on the line.
+                indent = line[: len(line) - len(line.lstrip())]
+                written_key = code.split("=", 1)[0].strip()
+                gap = code[len(code.rstrip()) :] if comment else ""
+                out.append(f"{indent}{written_key} = {toml_value(value)}{gap}{comment}")
+                insert_after = len(out) - 1
+            continue
+
+        out.append(line)
+        code = strip_comment(line)
+        if toml_line_key(line) is not None:
+            if not toml_value_is_complete(code):
+                carry = code
+            indent = line[: len(line) - len(line.lstrip())]
+            if current is not None:
+                table_key_indent = indent
+            # Only a real key marks where a new one may follow: appending after
+            # a trailing comment would put the key under a heading meant for the
+            # next table.
+            if current == table:
+                insert_after = len(out) - 1
+                if key_indent is None:
+                    key_indent = indent
+
+    if not found and not delete:
+        if insert_after is not None:
+            indent = key_indent if key_indent is not None else ""
+            out.insert(insert_after + 1, f"{indent}{new_line_body}")
+        elif table is None:
+            # A global setting has to land above the first table header, or it
+            # would be read as a key of that table - and above the comment
+            # introducing that header, which is about the table, not the key.
+            if first_header is None:
+                pos = len(out)
+                while pos > 0 and not out[pos - 1].strip():
+                    pos -= 1
+            else:
+                pos = first_header
+                while pos > 0 and (
+                    not out[pos - 1].strip() or out[pos - 1].lstrip().startswith("#")
+                ):
+                    pos -= 1
+            out.insert(pos, new_line_body)
+        else:
+            if out and out[-1].strip():
+                out.append("")
+            out.append("[" + ".".join(toml_key(part) for part in table) + "]")
+            # Match how the file's other tables indent their keys.
+            out.append(f"{table_key_indent or ''}{new_line_body}")
+
+    if delete and found and table is not None:
+        out = drop_empty_toml_table(out, table)
+
+    if not out:
+        return ""
+    newline = "\r\n" if "\r\n" in text else "\n"
+    return newline.join(line.rstrip("\r") for line in out).rstrip("\r\n") + newline
+
+
+def config_edit_took_effect(text, table, key, value, delete):
+    """Whether re-reading the edited text really yields the requested change."""
+    try:
+        parsed = parse_toml_text(text)
+    except ValueError:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+
+    sections = []
+    if table is None:
+        sections.append(parsed)
+    else:
+        for top in ("extensions", "extension"):
+            entries = parsed.get(top)
+            if not isinstance(entries, dict):
+                continue
+            for name, data in entries.items():
+                if str(name).strip().lower() == table[1] and isinstance(data, dict):
+                    sections.append(data)
+
+    target_key = normalize_toml_key(key)
+    seen = False
+    for section in sections:
+        for k, v in section.items():
+            if normalize_toml_key(k) != target_key:
+                continue
+            if delete or v != value:
+                return False
+            seen = True
+    return not seen if delete else seen
+
+
+def update_config_file(config, config_path, table, key, value=None, delete=False):
+    """Write one config change, keeping the rest of the file as the user wrote it."""
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = ""
+    except (OSError, ValueError) as e:
+        print(
+            f"{Colors.RED}Error: Failed to read config file '{config_path}': {e}{Colors.ENDC}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    edited = edit_toml_text(text, table, key, value, delete=delete)
+    if config_edit_took_effect(edited, table, key, value, delete):
+        write_config_text(edited, config_path)
+        return
+
+    # Nothing in the file was recognizable enough to edit in place. Fall back to
+    # a full rewrite, which is correct but drops comments and anything this tool
+    # does not model, so say so rather than losing it silently.
+    print(
+        f"{Colors.YELLOW}Warning: Could not edit '{config_path}' in place; rewriting it. "
+        f"Comments and unrecognized entries will be lost.{Colors.ENDC}",
+        file=sys.stderr,
+    )
+    save_config(config, config_path)
 
 
 EXTENSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$")
@@ -1407,9 +1709,10 @@ def handle_config(args, config):
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            config[norm_key] = validate_config_value(
+            stored_val = validate_config_value(
                 args.key, norm_key, coerced_val, CONFIG_OPTION_TYPES[norm_key]
             )
+            config[norm_key] = stored_val
         else:
             norm_prop = prop.replace("-", "_")
             if norm_prop not in EXT_OPTION_KEYS:
@@ -1423,11 +1726,19 @@ def handle_config(args, config):
             norm_ext_id = ext_id.lower()
             if norm_ext_id not in config["extensions"]:
                 config["extensions"][norm_ext_id] = {}
-            config["extensions"][norm_ext_id][norm_prop] = validate_config_value(
+            stored_val = validate_config_value(
                 args.key, norm_prop, coerced_val, EXT_OPTION_TYPES[norm_prop]
             )
+            config["extensions"][norm_ext_id][norm_prop] = stored_val
+            norm_key = norm_prop
 
-        save_config(config, config_path)
+        update_config_file(
+            config,
+            config_path,
+            config_table_path(target_type, ext_id),
+            norm_key,
+            stored_val,
+        )
         print(
             f"  {Colors.GREEN}✓ Set '{args.key}' = {raw_val!r} in {config_path}{Colors.ENDC}"
         )
@@ -1452,15 +1763,21 @@ def handle_config(args, config):
         else:
             exts = config.get("extensions", {})
             norm_ext_id = ext_id.lower()
-            norm_prop = prop.replace("-", "_")
-            if norm_ext_id in exts and norm_prop in exts[norm_ext_id]:
-                del exts[norm_ext_id][norm_prop]
+            norm_key = prop.replace("-", "_")
+            if norm_ext_id in exts and norm_key in exts[norm_ext_id]:
+                del exts[norm_ext_id][norm_key]
                 if not exts[norm_ext_id]:
                     del exts[norm_ext_id]
                 changed = True
 
         if changed:
-            save_config(config, config_path)
+            update_config_file(
+                config,
+                config_path,
+                config_table_path(target_type, ext_id),
+                norm_key,
+                delete=True,
+            )
             print(f"  {Colors.GREEN}✓ Unset '{args.key}' in {config_path}{Colors.ENDC}")
         else:
             print(
