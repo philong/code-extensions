@@ -2060,9 +2060,10 @@ class TestHandleListIntegration(unittest.TestCase):
 # CLI Integration Tests: handle_search
 # =====================================================================
 class TestHandleSearchIntegration(unittest.TestCase):
+    @patch.object(ce, "get_installed_extensions", return_value={})
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_search")
-    def test_handle_search_quiet(self, mock_search, mock_vsver):
+    def test_handle_search_quiet(self, mock_search, mock_vsver, mock_installed):
         mock_search.return_value = [
             {
                 "id": "ms-python.python",
@@ -2088,6 +2089,8 @@ class TestHandleSearchIntegration(unittest.TestCase):
             ce.handle_search(args, {})
 
         self.assertEqual(out.getvalue().strip(), "ms-python.python")
+        # Quiet output never shows install status, so it must not pay for it.
+        mock_installed.assert_not_called()
 
     @patch.object(ce, "get_installed_extensions", return_value={})
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")

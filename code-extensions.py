@@ -3699,15 +3699,18 @@ def handle_search(args, config):
         print(f"No extensions found matching '{args.query}'.")
         return
 
-    installed_exts = get_installed_extensions(code_binary, ignore_errors=True)
-
-    if HAS_TTY and sys.stdin.isatty() and sys.stdout.isatty() and not args.quiet:
-        interactive_search_flow(results, config, args, installed_exts=installed_exts)
-        return
-
+    # Quiet output is just the ids, so it never reaches VS Code - and it is the
+    # form that gets piped into another command, where spawning the editor to
+    # answer a question nobody asked is pure latency.
     if args.quiet:
         for r in results:
             print(r["id"])
+        return
+
+    installed_exts = get_installed_extensions(code_binary, ignore_errors=True)
+
+    if HAS_TTY and sys.stdin.isatty() and sys.stdout.isatty():
+        interactive_search_flow(results, config, args, installed_exts=installed_exts)
         return
 
     max_id_len = max((display_width(r["id"]) for r in results), default=35)
