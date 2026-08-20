@@ -2722,8 +2722,11 @@ def handle_install(args, config):
             include_prerelease,
             min_release_age,
             min_release_age_str,
+            # bool() rather than `is not None`: programmatic callers (the
+            # search TUI, the test suite) pass False to mean "flag not
+            # given", which `is not None` would read as an override.
             cli_include_prerelease_override=bool(
-                getattr(args, "include_prerelease", False)
+                getattr(args, "include_prerelease", None)
             ),
             cli_min_release_age_override=args.min_release_age is not None,
         )
@@ -3287,9 +3290,7 @@ def handle_update(args, config):
         exclude_prerelease=not include_prerelease,
         min_release_age=min_release_age,
         extensions_config=extensions_config,
-        cli_include_prerelease_override=bool(
-            getattr(args, "include_prerelease", False)
-        ),
+        cli_include_prerelease_override=bool(getattr(args, "include_prerelease", None)),
         cli_min_release_age_override=cli_min_release_age_override,
         service_url=service_url,
         token=token,
@@ -3549,7 +3550,7 @@ def handle_list(args, config):
             min_release_age=min_release_age,
             extensions_config=config.get("extensions", {}),
             cli_include_prerelease_override=bool(
-                getattr(args, "include_prerelease", False)
+                getattr(args, "include_prerelease", None)
             ),
             cli_min_release_age_override=getattr(args, "min_release_age", None)
             is not None,
@@ -3773,9 +3774,7 @@ def handle_search(args, config):
         include_prerelease=include_prerelease,
         min_release_age=min_release_age,
         extensions_config=extensions_config,
-        cli_include_prerelease_override=bool(
-            getattr(args, "include_prerelease", False)
-        ),
+        cli_include_prerelease_override=bool(getattr(args, "include_prerelease", None)),
         cli_min_release_age_override=getattr(args, "min_release_age", None) is not None,
         service_url=service_url,
         token=token,
