@@ -10,12 +10,13 @@ import io
 import json
 import os
 import random
+import subprocess
 import tempfile
 import time
 import unittest
 import urllib.request
 import zlib
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 # Dynamically import code-extensions.py module (since filename contains a hyphen)
 CODE_EXTENSIONS_PATH = os.path.join(os.path.dirname(__file__), "code-extensions.py")
@@ -925,6 +926,32 @@ class TestCLIAndBinaryParsing(unittest.TestCase):
                 top=48,
             )
         self.assertEqual((action, cursor, top), ("quit", 50, 48))
+
+    @patch("subprocess.run")
+    @patch.object(ce.time, "sleep")
+    def test_run_code_cmd_backs_off_exponentially(self, mock_sleep, mock_run):
+        """Retries are kept (the code CLI can flake), but wait longer each time."""
+        mock_run.side_effect = [
+            subprocess.CalledProcessError(1, "code"),
+            subprocess.CalledProcessError(1, "code"),
+            subprocess.CalledProcessError(1, "code"),
+            subprocess.CompletedProcess("code", 0, stdout="ok", stderr=""),
+        ]
+        with contextlib.redirect_stderr(io.StringIO()):
+            result = ce.run_code_cmd(["code", "--version"], retries=3, delay=1.0)
+        self.assertEqual(result.stdout, "ok")
+        self.assertEqual(mock_sleep.call_args_list, [call(1.0), call(2.0), call(4.0)])
+
+    @patch("subprocess.run")
+    @patch.object(ce.time, "sleep")
+    def test_run_code_cmd_raises_after_exhausting_retries(self, mock_sleep, mock_run):
+        mock_run.side_effect = subprocess.CalledProcessError(1, "code")
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(subprocess.CalledProcessError),
+        ):
+            ce.run_code_cmd(["code", "--version"], retries=2, delay=1.0)
+        self.assertEqual(mock_sleep.call_args_list, [call(1.0), call(2.0)])
 
     @patch("subprocess.run")
     def test_get_installed_extensions(self, mock_run):

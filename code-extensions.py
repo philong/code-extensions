@@ -255,6 +255,11 @@ def run_code_cmd(args, retries=3, delay=1.0):
     # On Windows the `code` CLI is a batch script (code.cmd); CreateProcess
     # cannot launch .cmd/.bat directly, so route those through the shell, which
     # CPython wraps as `cmd /c "<quoted args>"`.
+    #
+    # The CLI can also fail sporadically and succeed on retry (a lock held by
+    # another instance, first-launch setup), so keep retrying - but back off
+    # exponentially: a fast first retry catches the common flake, and a
+    # genuinely broken binary is not hammered at a fixed interval.
     use_shell = os.name == "nt" and str(args[0]).lower().endswith((".cmd", ".bat"))
     for attempt in range(retries + 1):
         try:
@@ -263,12 +268,13 @@ def run_code_cmd(args, retries=3, delay=1.0):
             )
         except subprocess.CalledProcessError as e:
             if attempt < retries:
+                wait = delay * (2**attempt)
                 cmd_str = " ".join(args)
                 print(
-                    f"{Colors.YELLOW}Warning: Command '{cmd_str}' failed with exit code {e.returncode}. Retrying in {delay}s... (attempt {attempt + 1}/{retries}){Colors.ENDC}",
+                    f"{Colors.YELLOW}Warning: Command '{cmd_str}' failed with exit code {e.returncode}. Retrying in {wait:g}s... (attempt {attempt + 1}/{retries}){Colors.ENDC}",
                     file=sys.stderr,
                 )
-                time.sleep(delay)
+                time.sleep(wait)
                 continue
             raise
 
