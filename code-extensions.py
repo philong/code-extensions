@@ -3127,13 +3127,16 @@ def select_updates(updates, action_label="Install"):
     return chosen
 
 
-def resolve_update_targets(specs, installed_exts):
+def resolve_installed_targets(specs, installed_exts, exact_name=False):
     """Resolve user-supplied specs to a subset of installed extensions.
 
     Accepts full IDs (``publisher.name``) or partial names (matched as a
     case-insensitive substring against installed IDs, mirroring ``info``).
-    Returns a dict of the matched installed extensions; unresolved or
-    ambiguous specs are reported and skipped.
+    With ``exact_name`` a partial must equal the extension name (the part
+    after the publisher) rather than merely appear inside the ID, which
+    ``remove`` uses since a loose substring hit could delete the wrong
+    extension. Returns a dict of the matched installed extensions; unresolved
+    or ambiguous specs are reported and skipped.
     """
     resolved = {}
     for spec in specs:
@@ -3145,18 +3148,24 @@ def resolve_update_targets(specs, installed_exts):
         if s in installed_exts:
             resolved[s] = installed_exts[s]
             continue
-        matches = sorted(eid for eid in installed_exts if s in eid)
-        # Disambiguate a partial that hits several IDs by preferring one whose
-        # extension name (the part after the publisher) matches exactly, e.g.
-        # 'python' -> 'ms-python.python' rather than 'ms-python.debugpy'.
-        if len(matches) > 1:
-            exact_name = [eid for eid in matches if eid.split(".", 1)[-1] == s]
-            if len(exact_name) == 1:
-                matches = exact_name
+        if exact_name:
+            matches = sorted(
+                eid for eid in installed_exts if eid.split(".", 1)[-1] == s
+            )
+        else:
+            matches = sorted(eid for eid in installed_exts if s in eid)
+            # Disambiguate a partial that hits several IDs by preferring one
+            # whose extension name (the part after the publisher) matches
+            # exactly, e.g. 'python' -> 'ms-python.python' rather than
+            # 'ms-python.debugpy'.
+            if len(matches) > 1:
+                exact_name_hit = [eid for eid in matches if eid.split(".", 1)[-1] == s]
+                if len(exact_name_hit) == 1:
+                    matches = exact_name_hit
         if len(matches) == 1:
             match = matches[0]
             print(
-                f"{Colors.YELLOW}Notice: '{spec}' is not a full extension ID. Updating installed match '{match}'.{Colors.ENDC}"
+                f"{Colors.YELLOW}Notice: '{spec}' is not a full extension ID. Resolving to installed match '{match}'.{Colors.ENDC}"
             )
             resolved[match] = installed_exts[match]
         elif len(matches) > 1:
@@ -3203,7 +3212,7 @@ def handle_update(args, config):
 
     target_specs = list(getattr(args, "extensions", None) or [])
     if target_specs:
-        installed_exts = resolve_update_targets(target_specs, installed_exts)
+        installed_exts = resolve_installed_targets(target_specs, installed_exts)
         if not installed_exts:
             print("No matching installed extensions to update.")
             return
@@ -3404,15 +3413,15 @@ def handle_remove(args, config):
 
     targets = []
     if args.extensions:
-        for spec in args.extensions:
-            spec_lower = spec.strip().lower()
-            if spec_lower not in installed_exts:
-                print(
-                    f"{Colors.YELLOW}Warning: Extension '{spec}' is not currently installed.{Colors.ENDC}",
-                    file=sys.stderr,
-                )
-            else:
-                targets.append(spec_lower)
+        # Resolve partial names to exact extension IDs so 'remove python' can
+        # target ms-python.python. Unlike 'update'/'info' the match must equal
+        # the extension name, not merely appear inside the ID: removing the
+        # wrong extension is not recoverable. Unknown or ambiguous specs are
+        # reported as a side effect; a full ID and a partial name that
+        # resolves to it collapse onto one dict key.
+        targets = list(
+            resolve_installed_targets(args.extensions, installed_exts, exact_name=True)
+        )
         if not targets:
             print("No matching installed extensions to remove.")
             return

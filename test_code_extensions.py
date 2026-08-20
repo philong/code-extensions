@@ -2012,6 +2012,50 @@ class TestHandleRemoveIntegration(unittest.TestCase):
         mock_run.assert_not_called()
         self.assertIn("No matching installed extensions to remove", out.getvalue())
 
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.2.0"},
+    )
+    def test_handle_remove_resolves_partial_names(self, mock_installed, mock_run):
+        """Like update and info, remove accepts a partial name."""
+        args = argparse.Namespace(
+            code_binary="code",
+            yes=True,
+            extensions=["python"],
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            ce.handle_remove(args, {})
+
+        mock_run.assert_called_once()
+        self.assertEqual(
+            mock_run.call_args[0][0][1:],
+            ["--uninstall-extension", "ms-python.python"],
+        )
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.2.0"},
+    )
+    def test_handle_remove_dedupes_repeated_targets(self, mock_installed, mock_run):
+        """A full ID and a partial name resolving to it remove the extension once."""
+        args = argparse.Namespace(
+            code_binary="code",
+            yes=True,
+            extensions=["ms-python.python", "python"],
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            ce.handle_remove(args, {})
+
+        mock_run.assert_called_once()
+        self.assertEqual(
+            mock_run.call_args[0][0][1:],
+            ["--uninstall-extension", "ms-python.python"],
+        )
+
 
 # =====================================================================
 # CLI Integration Tests: handle_list
@@ -2522,6 +2566,50 @@ class TestHandleCompletionIntegration(unittest.TestCase):
                 self.assertIn("code-extensions", output)
                 self.assertIn("install", output)
                 self.assertIn("update", output)
+
+
+# =====================================================================
+# Target Resolution Tests
+# =====================================================================
+_RESOLVE_INSTALLED = {
+    "ms-python.python": "2024.0.0",
+    "foo-bar.python-tools": "1.0.0",
+}
+
+
+class TestResolveInstalledTargets(unittest.TestCase):
+    def _resolve(self, specs, **kwargs):
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            return ce.resolve_installed_targets(specs, _RESOLVE_INSTALLED, **kwargs)
+
+    def test_full_id_resolves_either_way(self):
+        spec = ["foo-bar.python-tools"]
+        self.assertEqual(self._resolve(spec), {"foo-bar.python-tools": "1.0.0"})
+        self.assertEqual(
+            self._resolve(spec, exact_name=True), {"foo-bar.python-tools": "1.0.0"}
+        )
+
+    def test_substring_match_only_in_loose_mode(self):
+        # 'tools' appears inside the ID but is not an extension name, so the
+        # strict mode 'remove' uses must not match it.
+        self.assertEqual(self._resolve(["tools"]), {"foo-bar.python-tools": "1.0.0"})
+        self.assertEqual(self._resolve(["tools"], exact_name=True), {})
+
+    def test_exact_extension_name_resolves_in_strict_mode(self):
+        self.assertEqual(
+            list(self._resolve(["python"], exact_name=True)), ["ms-python.python"]
+        )
+        self.assertEqual(
+            self._resolve(["python-tools"], exact_name=True),
+            {"foo-bar.python-tools": "1.0.0"},
+        )
+
+    def test_loose_mode_prefers_the_exact_name(self):
+        # Both IDs contain 'python'; the one named exactly 'python' wins.
+        self.assertEqual(self._resolve(["python"]), {"ms-python.python": "2024.0.0"})
 
 
 if __name__ == "__main__":
