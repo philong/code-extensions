@@ -95,7 +95,26 @@ class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
 _url_opener = urllib.request.build_opener(_AuthStrippingRedirectHandler)
 
 
-class Colors:
+class _ColorsMeta(type):
+    """Resolve public color codes through the class's `_enabled` flag."""
+
+    def __getattribute__(cls, name):
+        value = super().__getattribute__(name)
+        if (
+            not name.startswith("_")
+            and isinstance(value, str)
+            and not super().__getattribute__("_enabled")
+        ):
+            return ""
+        return value
+
+
+class Colors(metaclass=_ColorsMeta):
+    # The codes below stay intact; whether they render is decided per access
+    # by _enabled, so every reader agrees no matter when colors were
+    # disabled - and disabling is reversible, which rewriting the attributes
+    # was not.
+    _enabled = True
     BLUE = "\033[94m"
     CYAN = "\033[96m"
     GREEN = "\033[92m"
@@ -106,13 +125,7 @@ class Colors:
 
 
 def _disable_colors():
-    Colors.BLUE = ""
-    Colors.CYAN = ""
-    Colors.GREEN = ""
-    Colors.YELLOW = ""
-    Colors.RED = ""
-    Colors.ENDC = ""
-    Colors.BOLD = ""
+    Colors._enabled = False
 
 
 def _enable_windows_vt():

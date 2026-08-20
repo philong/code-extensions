@@ -2623,5 +2623,35 @@ class TestResolveInstalledTargets(unittest.TestCase):
         self.assertEqual(self._resolve(["python"]), {"ms-python.python": "2024.0.0"})
 
 
+# =====================================================================
+# Colors Tests
+# =====================================================================
+class TestColorsEnableFlag(unittest.TestCase):
+    """Codes resolve through _enabled at read time, not by rewriting attrs."""
+
+    def test_disable_resolves_every_code_to_empty(self):
+        self.assertNotEqual(ce.Colors.RED, "")
+        ce._disable_colors()
+        self.addCleanup(setattr, ce.Colors, "_enabled", True)
+        self.assertEqual(ce.Colors.RED, "")
+        self.assertEqual(ce.Colors.GREEN, "")
+        self.assertEqual(ce.Colors.ENDC, "")
+
+    def test_disable_is_reversible(self):
+        # The old attribute-mutation approach could not be undone; the flag
+        # can, and the stored codes are never touched.
+        original = ce.Colors.RED
+        ce._disable_colors()
+        self.addCleanup(setattr, ce.Colors, "_enabled", True)
+        self.assertEqual(ce.Colors.__dict__["RED"], original)
+        ce.Colors._enabled = True
+        self.assertEqual(ce.Colors.RED, original)
+
+    def test_underscore_attrs_are_not_filtered(self):
+        ce._disable_colors()
+        self.addCleanup(setattr, ce.Colors, "_enabled", True)
+        self.assertIs(ce.Colors._enabled, False)
+
+
 if __name__ == "__main__":
     unittest.main()
