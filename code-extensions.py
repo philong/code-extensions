@@ -2300,6 +2300,63 @@ def discard_download_dir(directory, is_private_temp):
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def download_and_install(
+    code_binary,
+    url,
+    filepath,
+    display_id,
+    version,
+    platform_name,
+    token=None,
+    service_url=None,
+    force=False,
+    cleanup=False,
+):
+    """Download a .vsix from url and install it with the code CLI.
+
+    Shared by `install` and `update` so the two cannot drift. Returns True
+    when the package was installed. A failed download skips the install
+    (the partial file is already removed by download_vsix); a failed install
+    still removes the file when cleanup is set.
+    """
+    # Accept a raw string as well as a parsed list, like the other code-CLI
+    # helpers, so callers cannot pass "code" and unpack it into characters.
+    code_binary = parse_code_binary(code_binary)
+    print(
+        f"Downloading {Colors.CYAN}{display_id}{Colors.ENDC} v{Colors.GREEN}{version}{Colors.ENDC} ({platform_name})..."
+    )
+    try:
+        download_vsix(url, filepath, token=token, service_url=service_url)
+    except DOWNLOAD_ERRORS as e:
+        print(f"{Colors.RED}✗ Download failed: {e}{Colors.ENDC}", file=sys.stderr)
+        return False
+
+    print(
+        f"Installing {Colors.CYAN}{display_id}{Colors.ENDC} v{Colors.GREEN}{version}{Colors.ENDC}..."
+    )
+    installed = False
+    try:
+        cmd = [*code_binary, "--install-extension", filepath]
+        if force:
+            cmd.append("--force")
+        run_code_cmd(cmd, retries=0)
+        print(f"  {Colors.GREEN}✓{Colors.ENDC} Installed successfully.")
+        installed = True
+    except subprocess.CalledProcessError as e:
+        print(
+            f"  {Colors.RED}✗ Installation failed: {e.stderr.strip() or e}{Colors.ENDC}",
+            file=sys.stderr,
+        )
+    # run_code_cmd raises OSError when the binary is missing or unexecutable.
+    except OSError as e:
+        print(f"  {Colors.RED}✗ Installation failed: {e}{Colors.ENDC}", file=sys.stderr)
+
+    if cleanup and os.path.exists(filepath):
+        with contextlib.suppress(OSError):
+            os.remove(filepath)
+    return installed
+
+
 def open_for_download(filepath):
     """Open a download target for writing, refusing to follow a symlink."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
@@ -2406,9 +2463,12 @@ def report_download_progress(show_progress, bytes_read, total_size):
         return
     read_mb = bytes_read / (1024 * 1024)
     if total_size and total_size > 0:
-        percent = (bytes_read * 100) // total_size
+        # Content-Length can understate the body (a re-encoding proxy), so
+        # clamp percent and the bar rather than drawing >100% or a bar wider
+        # than its frame.
+        percent = min(100, (bytes_read * 100) // total_size)
         bar_len = 30
-        filled_len = round(bar_len * bytes_read / float(total_size))
+        filled_len = min(bar_len, round(bar_len * bytes_read / float(total_size)))
         bar = "=" * filled_len + " " * (bar_len - filled_len)
         total_mb = total_size / (1024 * 1024)
         sys.stdout.write(f"\r  [{bar}] {percent}% ({read_mb:.2f}MB / {total_mb:.2f}MB)")
@@ -2760,42 +2820,24 @@ def handle_install(args, config):
         filename = vsix_filename(pub_name, ext_name, target_version, target_plat)
         filepath = os.path.join(download_dir_resolved, filename)
 
-        print(
-            f"Downloading {Colors.CYAN}{full_id}{Colors.ENDC} v{Colors.GREEN}{target_version}{Colors.ENDC} ({target_plat})..."
-        )
-        try:
-            download_vsix(url, filepath, token=token, service_url=service_url)
-        except DOWNLOAD_ERRORS as e:
-            print(f"{Colors.RED}✗ Download failed: {e}{Colors.ENDC}", file=sys.stderr)
-            continue
-
-        print(
-            f"Installing {Colors.CYAN}{full_id}{Colors.ENDC} v{Colors.GREEN}{target_version}{Colors.ENDC}..."
-        )
-        try:
-            cmd = [*code_binary, "--install-extension", filepath]
-            if force or (
+        # Downgrading to an older version needs --force, just like a
+        # re-install of the same version does.
+        download_and_install(
+            code_binary,
+            url,
+            filepath,
+            full_id,
+            target_version,
+            target_plat,
+            token=token,
+            service_url=service_url,
+            force=force
+            or bool(
                 installed_ver
                 and parse_version(installed_ver) > parse_version(target_version)
-            ):
-                cmd.append("--force")
-            run_code_cmd(cmd, retries=0)
-            print(f"  {Colors.GREEN}✓{Colors.ENDC} Installed successfully.")
-        except subprocess.CalledProcessError as e:
-            print(
-                f"  {Colors.RED}✗ Installation failed: {e.stderr.strip() or e}{Colors.ENDC}",
-                file=sys.stderr,
-            )
-        # run_code_cmd raises OSError when the binary is missing or unexecutable.
-        except OSError as e:
-            print(
-                f"  {Colors.RED}✗ Installation failed: {e}{Colors.ENDC}",
-                file=sys.stderr,
-            )
-
-        if download_dir_is_temp and os.path.exists(filepath):
-            with contextlib.suppress(OSError):
-                os.remove(filepath)
+            ),
+            cleanup=download_dir_is_temp,
+        )
 
     discard_download_dir(download_dir_resolved, download_dir_is_temp)
 
@@ -3310,36 +3352,17 @@ def handle_update(args, config):
             download_dir_resolved, vsix_filename(pub_name, ext_name, version, platform)
         )
 
-        print(
-            f"Downloading {Colors.CYAN}{update['id']}{Colors.ENDC} v{Colors.GREEN}{version}{Colors.ENDC} ({platform})..."
+        download_and_install(
+            code_binary,
+            url,
+            filepath,
+            update["id"],
+            version,
+            platform,
+            token=token,
+            service_url=service_url,
+            cleanup=download_dir_is_temp,
         )
-        try:
-            download_vsix(url, filepath, token=token, service_url=service_url)
-        except DOWNLOAD_ERRORS as e:
-            print(f"{Colors.RED}✗ Download failed: {e}{Colors.ENDC}", file=sys.stderr)
-            continue
-
-        print(
-            f"Installing {Colors.CYAN}{update['id']}{Colors.ENDC} v{Colors.GREEN}{version}{Colors.ENDC}..."
-        )
-        try:
-            run_code_cmd([*code_binary, "--install-extension", filepath], retries=0)
-            print(f"  {Colors.GREEN}✓{Colors.ENDC} Installed successfully.")
-        except subprocess.CalledProcessError as e:
-            print(
-                f"  {Colors.RED}✗ Installation failed: {e.stderr.strip() or e}{Colors.ENDC}",
-                file=sys.stderr,
-            )
-        # run_code_cmd raises OSError when the binary is missing or unexecutable.
-        except OSError as e:
-            print(
-                f"  {Colors.RED}✗ Installation failed: {e}{Colors.ENDC}",
-                file=sys.stderr,
-            )
-
-        if download_dir_is_temp and os.path.exists(filepath):
-            with contextlib.suppress(OSError):
-                os.remove(filepath)
 
     discard_download_dir(download_dir_resolved, download_dir_is_temp)
 

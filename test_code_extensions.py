@@ -1319,6 +1319,17 @@ class TestDownloadVsix(unittest.TestCase):
         with open(self.filepath, "rb") as f:
             self.assertEqual(f.read(), b"PK\x03\x04payload")
 
+    def test_progress_clamps_an_understated_content_length(self):
+        """A lying Content-Length must not draw >100% or an over-wide bar."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ce.report_download_progress(True, 200, 100)
+        text = buf.getvalue()
+        self.assertIn("100%", text)
+        self.assertNotIn("200%", text)
+        bar = text.split("[", 1)[1].split("]", 1)[0]
+        self.assertEqual(len(bar), 30)
+
 
 # =====================================================================
 # CLI Integration Tests: handle_install
