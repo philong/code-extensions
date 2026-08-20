@@ -73,8 +73,44 @@ class TestSemverAndEngineCompatibility(unittest.TestCase):
             ("2.5.0", "1.0.0 - 2.0.0", False),
             ("1.85.0", "^1.80.0 || ^1.85.0", True),
             ("1.70.0", "^1.80.0 || ^1.85.0", False),
+            # An operator spaced from its version is one constraint, not two
+            # tokens.
+            ("1.85.0", ">= 1.80.0", True),
+            ("1.79.0", ">= 1.80.0", False),
+            ("1.85.0", "> 1.80.0", True),
+            ("1.80.0", "> 1.80.0", False),
+            ("1.85.0", "^ 1.80.0", True),
+            ("2.0.0", "^ 1.80.0", False),
+            ("1.85.0", ">= 1.80.0 < 1.90.0", True),
+            ("1.91.0", ">= 1.80.0 < 1.90.0", False),
             ("1.85.0", "*", True),
             ("1.85.0", "", True),
+            # A wildcard the expander does not handle fails open instead of
+            # letting 'x' sort above every integer and inverting the check.
+            ("1.85.0", "1.2.3.x", True),
+            ("1.2.3", "1.2.3.x", True),
+            # An 'x' in a pre-release identifier is not a wildcard, so the
+            # constraint falls through to the normal comparison.
+            ("1.3.0", ">= 1.2.3-alpha.x", True),
+            ("1.1.0", ">= 1.2.3-alpha.x", False),
+            # A bare version is an exact match, not a lower bound.
+            ("1.86.0", "1.86.0", True),
+            ("1.86.0-insider", "1.86.0", True),  # Insider build of the same release
+            ("1.85.0", "1.86.0", False),
+            ("1.87.0", "1.86.0", False),
+            # A bare partial version is an x-range under npm semantics
+            # ('1.86' is '>=1.86.0 <1.87.0', '1' is '>=1.0.0 <2.0.0').
+            ("1.86.0", "1.86", True),
+            ("1.86.5", "1.86", True),
+            ("1.87.0", "1.86", False),
+            ("1.85.9", "1.86", False),
+            ("1.5.0", "1", True),
+            ("2.0.0", "1", False),
+            ("0.9.0", "0", True),
+            ("1.0.0", "0", False),
+            # With an operator a partial is zero-filled, not ranged.
+            ("1.86.5", ">= 1.86", True),
+            ("1.85.0", ">= 1.86", False),
         ]
         for vs_ver, constraint, expected in test_cases:
             with self.subTest(vs_ver=vs_ver, constraint=constraint):

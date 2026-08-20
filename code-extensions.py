@@ -385,6 +385,10 @@ def is_engine_compatible(vscode_version_str, engine_constraint):
     # such a build as satisfying the corresponding release constraint.
     vscode_version_str = vscode_version_str.split("-", 1)[0]
     constraint_str = engine_constraint.strip()
+    # An operator may be spaced from its version ('>= 1.80.0'). Fold it onto
+    # the version so the whitespace split below cannot tear the comparator off
+    # and evaluate it as its own token.
+    constraint_str = re.sub(r"([><=~^]+)\s+", r"\1", constraint_str)
     if constraint_str == "*" or constraint_str == "":
         return True
     if "||" in constraint_str:
@@ -411,6 +415,27 @@ def is_engine_compatible(vscode_version_str, engine_constraint):
     # parses as a string that sorts above every integer, which inverts the
     # comparison: '1.80.x' rejected 1.80.0 and accepted 1.81.0.
     x_range = expand_x_range(version_str)
+    # A bare partial version ('1', '1.26') is an x-range under npm semantics:
+    # '1.26' means '>=1.26.0 <1.27.0' and '1' means '>=1.0.0 <2.0.0'. A partial
+    # with an operator is zero-filled instead ('>=1.26' is '>=1.26.0'), which
+    # parse_version already does, so only the bare form needs expanding - and
+    # only when it carries no pre-release or build, which would make it a
+    # specific version rather than a range.
+    if x_range is None and not op:
+        core = version_str.split("-", 1)[0].split("+", 1)[0]
+        parts = core.split(".")
+        if (
+            version_str == core
+            and len(parts) in (1, 2)
+            and all(p.isdigit() for p in parts)
+        ):
+            if len(parts) == 1:
+                x_range = (f"{parts[0]}.0.0", f"{int(parts[0]) + 1}.0.0")
+            else:
+                x_range = (
+                    f"{parts[0]}.{parts[1]}.0",
+                    f"{parts[0]}.{int(parts[1]) + 1}.0",
+                )
     if x_range is not None:
         lower, upper = x_range
         if upper is None:
@@ -441,8 +466,18 @@ def is_engine_compatible(vscode_version_str, engine_constraint):
             return is_engine_compatible(vscode_version_str, f">={upper}")
         version_str = lower
 
+    # A wildcard expand_x_range did not handle (e.g. '1.2.3.x'): parse_version
+    # would rank 'x' above every integer and invert the comparison, so apply
+    # the fail-open policy for unparseable constraints instead. Only the core
+    # version counts: '1.2.3-alpha.x' is a pre-release identifier, not a
+    # wildcard, and must fall through to the normal comparison.
+    wildcard_core = version_str.split("-", 1)[0].split("+", 1)[0]
+    if any(part in ("x", "X", "*") for part in wildcard_core.split(".")):
+        return True
     if not op:
-        op = ">="
+        # A bare version ('1.86.0') means exactly that version under semver and
+        # npm semantics, not a lower bound, so map it onto the '=' handling.
+        op = "="
     parsed_vscode = parse_version(vscode_version_str)
     parsed_constraint = parse_version(version_str)
     if op in ("=", "=="):
