@@ -6,7 +6,7 @@ A Python script to install, update, list, search, and remove VS Code extensions 
 
 - **Subcommands**: Supports `install`, `update`, `list`, `search`, and `remove` commands.
 - **Direct VS Code Marketplace API Integration**: Queries extension metadata and package assets directly from the marketplace gallery API.
-- **Supply-Chain Security Mitigation**: Holds back releases newer than a specified age (default `24h`) across both `install` and `update` commands to ensure packages have not been compromised or flag-analyzed.
+- **Supply-Chain Security Mitigation**: Holds back releases newer than a specified age (default `24h`) across both `install` and `update` commands to ensure packages have not been compromised or flag-analyzed. This requires VS Code's own extension auto-update to be off (see the note after Installation).
 - **Interactive Terminal UI**: Scrollable interactive menus in your terminal to toggle, select, and review updates, search results, or removals.
 - **Auto Platform & Architecture Resolution**: Detects and downloads platform-specific `.vsix` packages (e.g. `linux-x64`, `darwin-arm64`, `win32-x64`).
 - **VS Code Version Compatibility Checks**: Verifies host VS Code version engine requirements so you never install incompatible extensions.
@@ -25,6 +25,16 @@ chmod +x code-extensions.py
 ```
 
 No external Python dependencies are required (uses standard library modules like `urllib`, `subprocess`, `argparse`, and `tomllib`). An unparseable config file is skipped with a warning, and `config set`/`config unset` refuse to modify one.
+
+### Disable VS Code's built-in extension auto-update
+
+Required for this tool's version guarantees to hold: the built-in auto-update installs new releases within hours, silently defeating `min-release-age` hold-backs and version pins for every extension. Set in VS Code's user settings:
+
+```json
+"extensions.autoUpdate": false
+```
+
+Optionally also `"extensions.autoCheckUpdates": false` - that only silences the "update available" indicator.
 
 ---
 
