@@ -17,14 +17,14 @@ A Python script to install, update, list, search, and remove VS Code extensions 
 
 ## Installation
 
-Ensure you have Python 3.9 or newer installed. Make the script executable and run:
+Python 3.11 or newer is required. Make the script executable and run:
 
 ```bash
 chmod +x code-extensions.py
 ./code-extensions --help
 ```
 
-No external Python dependencies are required (uses standard library modules like `urllib`, `subprocess`, and `argparse`). The config file is read with the standard library's `tomllib` on Python 3.11+, falling back to `tomli` or `toml` when either is installed, and to a built-in parser otherwise.
+No external Python dependencies are required (uses standard library modules like `urllib`, `subprocess`, `argparse`, and `tomllib`). An unparseable config file is skipped with a warning, and `config set`/`config unset` refuse to modify one.
 
 ---
 

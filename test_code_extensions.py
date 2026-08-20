@@ -237,10 +237,8 @@ class TestTOMLParserAndConfig(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(ce.unescape_toml_basic(text), text)
 
-    def test_config_value_round_trip_through_fallback(self):
-        """dump_toml output must read back identically on the no-tomllib path."""
-        import tomllib
-
+    def test_config_value_round_trip(self):
+        """dump_toml output must read back identically with a real parser."""
         cases = [
             {"open_vsx_token": 'a"b#c'},
             {"open_vsx_token": 'to"ken'},
@@ -253,28 +251,11 @@ class TestTOMLParserAndConfig(unittest.TestCase):
         ]
         for cfg in cases:
             with self.subTest(cfg=cfg):
-                text = ce.dump_toml(cfg)
-                self.assertEqual(tomllib.loads(text), cfg)
-                self.assertEqual(ce.parse_toml_fallback(text), cfg)
+                self.assertEqual(ce.parse_toml_text(ce.dump_toml(cfg)), cfg)
 
-    def test_parse_toml_fallback_structures(self):
-        toml_content = """
-        # Comment line
-        global_key = "value"
-
-        [charliermarsh.ruff]
-        min_release_age = "24h"
-        include_prerelease = true
-        max_results = 10
-
-        [sec.sub]
-        foo = "bar"
-        """
-        parsed = ce.parse_toml_fallback(toml_content)
-        self.assertEqual(parsed["global_key"], "value")
-        self.assertEqual(parsed["charliermarsh"]["ruff"]["min_release_age"], "24h")
-        self.assertTrue(parsed["charliermarsh"]["ruff"]["include_prerelease"])
-        self.assertEqual(parsed["sec"]["sub"]["foo"], "bar")
+    def test_parse_toml_text_rejects_invalid_toml(self):
+        with self.assertRaises(ValueError):
+            ce.parse_toml_text("open_vsx = ")
 
     def test_coerce_config_value(self):
         self.assertTrue(ce.coerce_config_value("true", bool))
@@ -464,6 +445,49 @@ class TestEditTomlText(unittest.TestCase):
         edited = ce.edit_toml_text(text, None, "min_release_age", "3d")
 
         self.assertEqual(edited, 'min-release-age = "3d"\r\nopen_vsx = true\r\n')
+
+    def test_update_aborts_when_the_file_cannot_be_parsed(self):
+        # If the file cannot be parsed, the in-memory config is just the
+        # empty fallback. The fallback rewrite must not run: it would
+        # clobber the user's existing settings.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, "config.toml")
+            original = 'min-release-age = "12h"\nopen_vsx = [\n'
+            with open(config_path, "w") as f:
+                f.write(original)
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                ce.update_config_file(
+                    {"min_release_age": "3d"},
+                    config_path,
+                    None,
+                    "min_release_age",
+                    "3d",
+                )
+            with open(config_path) as f:
+                self.assertEqual(f.read(), original)
+
+    def test_update_rewrites_a_parsable_file_when_in_place_fails(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, "config.toml")
+            with open(config_path, "w") as f:
+                f.write('min-release-age = "12h"\n')
+
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                patch.object(ce, "config_edit_took_effect", return_value=False),
+            ):
+                ce.update_config_file(
+                    {"min_release_age": "3d"},
+                    config_path,
+                    None,
+                    "min_release_age",
+                    "3d",
+                )
+            with open(config_path) as f:
+                self.assertEqual(ce.parse_toml_text(f.read())["min_release_age"], "3d")
 
     def test_config_edit_took_effect_rejects_an_unapplied_edit(self):
         self.assertTrue(

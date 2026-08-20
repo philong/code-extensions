@@ -37,6 +37,18 @@ import urllib.request
 import zlib
 from functools import lru_cache
 
+if sys.version_info < (3, 11):
+    # 3.11 is the minimum supported interpreter: it is the release that
+    # added both tomllib and the datetime.UTC alias used below. Check it
+    # before those uses so an older interpreter exits up front with an
+    # actionable message instead of dying with a less useful error.
+    sys.exit(
+        f"code-extensions requires Python 3.11 or newer; "
+        f"this interpreter is {platform.python_version()}."
+    )
+
+import tomllib
+
 try:
     import select
     import termios
@@ -637,7 +649,7 @@ def released_long_enough(ver_obj, min_age):
             last_updated[:-1] + "+00:00" if last_updated.endswith("Z") else last_updated
         )
         release_dt = datetime.datetime.fromisoformat(cleaned_ts)
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         return now - release_dt >= min_age
     # An unparsable timestamp (ValueError), a non-string one (AttributeError,
     # TypeError), or a naive one compared against an aware now (TypeError) all
@@ -827,131 +839,6 @@ def strip_comment(line):
     return split_comment(line)[0].strip()
 
 
-def parse_toml_fallback(content):
-    data = {}
-    current_section = None
-    lines = []
-    accumulator = []
-    in_array = False
-
-    for raw_line in content.splitlines():
-        line = strip_comment(raw_line)
-        if not line:
-            continue
-
-        if line.startswith("[") and line.endswith("]") and not in_array:
-            if accumulator:
-                lines.append(" ".join(accumulator))
-                accumulator = []
-            lines.append(line)
-            continue
-
-        if "=" in line or in_array:
-            if "=" in line and not in_array:
-                if accumulator:
-                    lines.append(" ".join(accumulator))
-                    accumulator = []
-                accumulator.append(line)
-            else:
-                accumulator.append(line)
-
-            joined = " ".join(accumulator)
-            open_brackets = 0
-            in_quote = None
-            for char in joined:
-                if char in ('"', "'"):
-                    if in_quote == char:
-                        in_quote = None
-                    elif in_quote is None:
-                        in_quote = char
-                elif in_quote is None:
-                    if char == "[":
-                        open_brackets += 1
-                    elif char == "]":
-                        open_brackets -= 1
-
-            if open_brackets <= 0:
-                lines.append(joined)
-                accumulator = []
-                in_array = False
-            else:
-                in_array = True
-        else:
-            if accumulator:
-                accumulator.append(line)
-            else:
-                lines.append(line)
-
-    if accumulator:
-        lines.append(" ".join(accumulator))
-
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-
-        if line.startswith("[") and line.endswith("]"):
-            sec = line[1:-1].strip()
-            if "." in sec:
-                parts = [unquote_toml_value(p) for p in sec.split(".", 1)]
-                top_sec, sub_sec = parts[0], parts[1]
-                if top_sec not in data or not isinstance(data[top_sec], dict):
-                    data[top_sec] = {}
-                if sub_sec not in data[top_sec] or not isinstance(
-                    data[top_sec][sub_sec], dict
-                ):
-                    data[top_sec][sub_sec] = {}
-                current_section = (top_sec, sub_sec)
-            else:
-                sec_name = unquote_toml_value(sec)
-                if sec_name not in data or not isinstance(data[sec_name], dict):
-                    data[sec_name] = {}
-                current_section = sec_name
-            continue
-
-        if "=" in line:
-            key, val = line.split("=", 1)
-            key = unquote_toml_value(key)
-            val = val.strip()
-
-            if val.startswith("[") and val.endswith("]"):
-                items = []
-                in_quote = None
-                current_item = []
-                for char in val[1:-1]:
-                    if char in ('"', "'"):
-                        if in_quote == char:
-                            in_quote = None
-                        elif in_quote is None:
-                            in_quote = char
-                    elif char == "," and in_quote is None:
-                        items.append(unquote_toml_value("".join(current_item)))
-                        current_item = []
-                    else:
-                        current_item.append(char)
-                if current_item:
-                    items.append(unquote_toml_value("".join(current_item)))
-                parsed_val = [x for x in items if x]
-            elif val.lower() == "true":
-                parsed_val = True
-            elif val.lower() == "false":
-                parsed_val = False
-            else:
-                parsed_val = unquote_toml_value(val)
-
-            if isinstance(current_section, tuple):
-                data[current_section[0]][current_section[1]][key] = parsed_val
-            elif current_section:
-                if current_section not in data or not isinstance(
-                    data[current_section], dict
-                ):
-                    data[current_section] = {}
-                data[current_section][key] = parsed_val
-            else:
-                data[key] = parsed_val
-    return data
-
-
 CONFIG_OPTION_TYPES = {
     "include_prerelease": bool,
     "no_code_version_check": bool,
@@ -1065,26 +952,12 @@ def resolve_min_release_age(args_val, config):
 
 
 def parse_toml_text(text):
-    """Parse TOML with the best parser available, stdlib first."""
-    try:
-        import tomllib
+    """Parse TOML text, raising a ValueError on invalid input.
 
-        return tomllib.loads(text)
-    except ImportError:
-        pass
-    try:
-        import tomli
-
-        return tomli.loads(text)
-    except ImportError:
-        pass
-    try:
-        import toml
-
-        return toml.loads(text)
-    except ImportError:
-        pass
-    return parse_toml_fallback(text)
+    tomllib ships with Python 3.11, so no fallback is needed. Kept as a
+    single indirection so tests can substitute the parser.
+    """
+    return tomllib.loads(text)
 
 
 def load_config():
@@ -1096,8 +969,8 @@ def load_config():
     try:
         with open(config_path, encoding="utf-8") as f:
             parsed = parse_toml_text(f.read())
-    # ValueError covers every parser's decode error: tomllib.TOMLDecodeError,
-    # toml.TomlDecodeError, and UnicodeDecodeError all derive from it.
+    # ValueError covers tomllib's decode errors (TOMLDecodeError derives
+    # from it) and UnicodeDecodeError.
     except (OSError, ValueError) as e:
         print(
             f"{Colors.YELLOW}Warning: Failed to parse config file '{config_path}': {e}{Colors.ENDC}",
@@ -1588,6 +1461,19 @@ def update_config_file(config, config_path, table, key, value=None, delete=False
     if config_edit_took_effect(edited, table, key, value, delete):
         write_config_text(edited, config_path)
         return
+
+    if text:
+        try:
+            parse_toml_text(text)
+        except ValueError as e:
+            # The original file did not parse, so the in-memory config is the
+            # empty fallback from load_config. A full rewrite from it would
+            # destroy the user's existing settings, so abort instead.
+            print(
+                f"{Colors.RED}Error: Cannot update '{config_path}': {e}{Colors.ENDC}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Nothing in the file was recognizable enough to edit in place. Fall back to
     # a full rewrite, which is correct but drops comments and anything this tool
