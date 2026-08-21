@@ -282,6 +282,28 @@ def parse_code_binary(code_binary):
     return [resolved_exec, *tokens[1:]]
 
 
+def _assert_safe_for_cmd_shell(args):
+    """Refuse tokens that could escape the quoting of a `cmd /c` command line.
+
+    Launching a .cmd/.bat needs cmd.exe, and CPython hands it
+    `cmd /c "<list2cmdline(args)>"`. Inside that one pair of quotes cmd treats
+    & | < > ^ ( ) as literals, but two things stay live: an embedded '"',
+    which list2cmdline doubles into a close-and-reopen pair that leaves the
+    metacharacters in between exposed to cmd itself, and %VAR%, which cmd
+    expands whether quoted or not. Neither character belongs in any value this
+    path builds itself - the configured binary, extension ids, sanitized .vsix
+    filenames - so they are refused outright rather than re-escaped. A
+    --download-dir may legitimately contain '%', so the error names the
+    offending argument rather than leaving the caller to guess.
+    """
+    unsafe = [str(arg) for arg in args if re.search(r'["%]', str(arg))]
+    if unsafe:
+        raise OSError(
+            "cannot safely run via cmd.exe; these arguments contain quote or "
+            f"percent characters: {', '.join(unsafe)}"
+        )
+
+
 def run_code_cmd(args, retries=3, delay=1.0):
     # On Windows the `code` CLI is a batch script (code.cmd); CreateProcess
     # cannot launch .cmd/.bat directly, so route those through the shell, which
@@ -292,6 +314,8 @@ def run_code_cmd(args, retries=3, delay=1.0):
     # exponentially: a fast first retry catches the common flake, and a
     # genuinely broken binary is not hammered at a fixed interval.
     use_shell = os.name == "nt" and str(args[0]).lower().endswith((".cmd", ".bat"))
+    if use_shell:
+        _assert_safe_for_cmd_shell(args)
     for attempt in range(retries + 1):
         try:
             return subprocess.run(

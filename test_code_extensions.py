@@ -980,6 +980,18 @@ class TestCLIAndBinaryParsing(unittest.TestCase):
             ce.run_code_cmd(["code", "--version"], retries=2, delay=1.0)
         self.assertEqual(mock_sleep.call_args_list, [call(1.0), call(2.0)])
 
+    def test_assert_safe_for_cmd_shell_accepts_plain_paths(self):
+        # Parentheses are inert inside the quoting cmd sees and appear in
+        # ordinary install dirs like 'Program Files (x86)'.
+        ce._assert_safe_for_cmd_shell(
+            ["C:\\Program Files (x86)\\Microsoft VS Code\\bin\\code.cmd", "-"]
+        )
+
+    def test_assert_safe_for_cmd_shell_rejects_quotes_and_percent(self):
+        for bad in (["code.cmd", 'a"b'], ["code.cmd", "%PATH%"]):
+            with self.assertRaises(OSError):
+                ce._assert_safe_for_cmd_shell(bad)
+
     @patch("subprocess.run")
     def test_get_installed_extensions(self, mock_run):
         mock_run.return_value = MagicMock(
