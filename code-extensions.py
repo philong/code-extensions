@@ -4226,6 +4226,55 @@ def main():
         help="Access token for Open VSX Registry",
     )
 
+    version_filter_parser = argparse.ArgumentParser(add_help=False)
+    version_filter_parser.add_argument(
+        "-p",
+        "--include-prerelease",
+        action="store_true",
+        default=None,
+        help="Allow pre-release versions (or include them in update/outdated check)",
+    )
+    version_filter_parser.add_argument(
+        "-V",
+        "--no-code-version-check",
+        dest="no_code_version_check",
+        action="store_true",
+        default=None,
+        help="Disable VS Code version compatibility check",
+    )
+    version_filter_parser.add_argument(
+        "-a",
+        "--min-release-age",
+        default=None,
+        help="Minimum release age threshold (e.g. 24h, 3d, 0)",
+    )
+
+    download_parser = argparse.ArgumentParser(add_help=False)
+    download_parser.add_argument(
+        "-d",
+        "--download-dir",
+        default=None,
+        help="Download directory for .vsix files",
+    )
+
+    yes_parser = argparse.ArgumentParser(add_help=False)
+    yes_parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        default=None,
+        help="Non-interactive mode / skip confirmation prompt",
+    )
+
+    quiet_parser = argparse.ArgumentParser(add_help=False)
+    quiet_parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        default=False,
+        help="Output raw extension IDs only (one per line, ideal for scripting)",
+    )
+
     parser = argparse.ArgumentParser(
         prog="code-extensions",
         description="VS Code Extension Manager: Install, update, list, search, and remove extensions with security controls.",
@@ -4235,7 +4284,11 @@ def main():
     # Install sub-parser
     parser_install = subparsers.add_parser(
         "install",
-        parents=[parent_parser],
+        parents=[
+            parent_parser,
+            version_filter_parser,
+            download_parser,
+        ],
         help="Install VS Code extension(s) by ID (e.g. publisher.name or publisher.name@version)",
     )
     parser_install.add_argument(
@@ -4251,24 +4304,10 @@ def main():
         help="File containing extension IDs to install (one per line)",
     )
     parser_install.add_argument(
-        "-p",
-        "--include-prerelease",
+        "--force",
         action="store_true",
-        default=None,
-        help="Allow pre-release versions",
-    )
-    parser_install.add_argument(
-        "-V",
-        "--no-code-version-check",
-        action="store_true",
-        default=None,
-        help="Disable VS Code version compatibility check",
-    )
-    parser_install.add_argument(
-        "-d",
-        "--download-dir",
-        default=None,
-        help="Download directory for .vsix files",
+        default=False,
+        help="Force re-installation even if the target version is already installed",
     )
     parser_install.add_argument(
         "-y",
@@ -4277,24 +4316,17 @@ def main():
         default=None,
         help="Non-interactive mode (install a pinned version even when held back; otherwise skip held-back extensions instead of prompting)",
     )
-    parser_install.add_argument(
-        "-a",
-        "--min-release-age",
-        default=None,
-        help="Minimum release age threshold (e.g. 24h, 3d, 0)",
-    )
-    parser_install.add_argument(
-        "--force",
-        action="store_true",
-        default=False,
-        help="Force re-installation even if the target version is already installed",
-    )
 
     # Update sub-parser
     parser_update = subparsers.add_parser(
         "update",
         aliases=["upgrade"],
-        parents=[parent_parser],
+        parents=[
+            parent_parser,
+            version_filter_parser,
+            download_parser,
+            yes_parser,
+        ],
         help="Check, download, and install updates for installed extensions",
     )
     parser_update.add_argument(
@@ -4303,52 +4335,18 @@ def main():
         help="Extension ID(s) or partial name(s) to update (default: all installed)",
     )
     parser_update.add_argument(
-        "-p",
-        "--include-prerelease",
-        action="store_true",
-        default=None,
-        help="Include pre-release versions in update check",
-    )
-    parser_update.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
         default=None,
         help="Perform a dry run (show available updates without downloading or installing)",
     )
-    parser_update.add_argument(
-        "-V",
-        "--no-code-version-check",
-        dest="no_code_version_check",
-        action="store_true",
-        default=None,
-        help="Disable VS Code version compatibility check",
-    )
-    parser_update.add_argument(
-        "-d",
-        "--download-dir",
-        default=None,
-        help="Download directory for .vsix files",
-    )
-    parser_update.add_argument(
-        "-y",
-        "--yes",
-        action="store_true",
-        default=None,
-        help="Automatically download and install all updates without prompting",
-    )
-    parser_update.add_argument(
-        "-a",
-        "--min-release-age",
-        default=None,
-        help="Minimum release age threshold (e.g. 24h, 3d, 0)",
-    )
 
     # Remove sub-parser
     parser_remove = subparsers.add_parser(
         "remove",
         aliases=["uninstall", "rm"],
-        parents=[parent_parser],
+        parents=[parent_parser, yes_parser],
         help="Remove installed extension(s)",
     )
     parser_remove.add_argument(
@@ -4357,19 +4355,12 @@ def main():
         default=[],
         help="Extension ID(s) to remove (if omitted, launches interactive removal TUI)",
     )
-    parser_remove.add_argument(
-        "-y",
-        "--yes",
-        action="store_true",
-        default=None,
-        help="Skip confirmation prompt",
-    )
 
     # List sub-parser
     parser_list = subparsers.add_parser(
         "list",
         aliases=["ls"],
-        parents=[parent_parser],
+        parents=[parent_parser, version_filter_parser, quiet_parser],
         help="List installed extension(s)",
     )
     parser_list.add_argument(
@@ -4379,45 +4370,17 @@ def main():
         help="Optional search query to filter extensions by ID",
     )
     parser_list.add_argument(
-        "-q",
-        "--quiet",
-        action="store_true",
-        default=False,
-        help="Output raw extension IDs only (one per line, ideal for scripting)",
-    )
-    parser_list.add_argument(
         "-u",
         "--outdated",
         action="store_true",
         default=False,
         help="List only extensions that have updates available",
     )
-    parser_list.add_argument(
-        "-p",
-        "--include-prerelease",
-        action="store_true",
-        default=None,
-        help="Count pre-release versions as updates (with --outdated)",
-    )
-    parser_list.add_argument(
-        "-V",
-        "--no-code-version-check",
-        dest="no_code_version_check",
-        action="store_true",
-        default=None,
-        help="Disable VS Code version compatibility check (with --outdated)",
-    )
-    parser_list.add_argument(
-        "-a",
-        "--min-release-age",
-        default=None,
-        help="Minimum release age threshold (e.g. 24h, 3d, 0), with --outdated",
-    )
 
     # Search sub-parser
     parser_search = subparsers.add_parser(
         "search",
-        parents=[parent_parser],
+        parents=[parent_parser, version_filter_parser, quiet_parser],
         help="Search VS Code Marketplace / Open VSX for extensions",
     )
     parser_search.add_argument(
@@ -4430,34 +4393,6 @@ def main():
         type=int,
         default=15,
         help="Maximum number of search results to return (default: 15)",
-    )
-    parser_search.add_argument(
-        "-q",
-        "--quiet",
-        action="store_true",
-        default=False,
-        help="Output raw extension IDs only (one per line, ideal for scripting)",
-    )
-    parser_search.add_argument(
-        "-p",
-        "--include-prerelease",
-        action="store_true",
-        default=None,
-        help="Allow pre-release versions",
-    )
-    parser_search.add_argument(
-        "-V",
-        "--no-code-version-check",
-        dest="no_code_version_check",
-        action="store_true",
-        default=None,
-        help="Disable VS Code version compatibility check",
-    )
-    parser_search.add_argument(
-        "-a",
-        "--min-release-age",
-        default=None,
-        help="Minimum release age threshold (e.g. 24h, 3d, 0)",
     )
 
     # Info / Show sub-parser
