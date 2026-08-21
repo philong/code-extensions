@@ -2641,7 +2641,8 @@ def handle_install(args, config):
         ext_obj = marketplace_data.get(ext_id)
         if not ext_obj:
             print(
-                f"{Colors.RED}✗ Extension '{ext_id}' not found on extension gallery.{Colors.ENDC}"
+                f"{Colors.RED}✗ Extension '{ext_id}' not found on extension gallery.{Colors.ENDC}",
+                file=sys.stderr,
             )
             continue
 
