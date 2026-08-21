@@ -4224,6 +4224,20 @@ def handle_completion(args, config):
         sys.exit(1)
 
 
+# Canonical subcommand names, aliases excluded, in the order they are registered.
+CANONICAL_SUBCOMMANDS = (
+    "install",
+    "update",
+    "remove",
+    "list",
+    "search",
+    "info",
+    "clean",
+    "config",
+    "completion",
+)
+
+
 def main():
     enable_colors()
     config = load_config()
@@ -4543,6 +4557,11 @@ def main():
         choices=["bash", "fish", "powershell", "zsh"],
         help="Target shell environment",
     )
+
+    # Exclude aliases from the usage and positional argument list in help output.
+    # Spelled out rather than derived from argparse's private _choices_actions,
+    # whose absence would break every invocation, including --help.
+    subparsers.metavar = "{" + ",".join(CANONICAL_SUBCOMMANDS) + "}"
 
     args = parser.parse_args()
 
