@@ -3964,16 +3964,231 @@ def subcommand_names(*names):
     return [n for name in names for n in (name, *SUBCOMMAND_ALIASES[name])]
 
 
+# Options, with the argparse help text and the shorter summary the completion
+# scripts show. `value` is None for switches, else (label, zsh completer).
+CliOption = namedtuple("CliOption", "flags help summary value kwargs")
+
+
+def _switch(flags, help_text, summary, default=None, **kwargs):
+    return CliOption(
+        flags,
+        help_text,
+        summary,
+        None,
+        {"action": "store_true", "default": default, **kwargs},
+    )
+
+
+def _valued(flags, help_text, summary, value, default=None, **kwargs):
+    return CliOption(flags, help_text, summary, value, {"default": default, **kwargs})
+
+
+# argparse adds -h/--help itself; the completion scripts have to offer it.
+HELP_OPTION = _switch(("-h", "--help"), "Show help message", "Show help message")
+
+GLOBAL_OPTIONS = (
+    _valued(
+        ("-b", "--code-binary"),
+        "Path to VS Code binary/executable or its fork (default: code)",
+        "VS Code executable binary or fork",
+        ("binary", "_files"),
+    ),
+    _valued(
+        ("-s", "--service-url"),
+        "VS Code Extension Gallery service API URL",
+        "VS Code Extension Gallery service API URL",
+        ("url", ""),
+    ),
+    _switch(
+        ("--open-vsx",),
+        "Use Open VSX Registry (https://open-vsx.org/vscode/gallery)",
+        "Use Open VSX Registry",
+    ),
+    _valued(
+        ("--open-vsx-token",),
+        "Access token for Open VSX Registry",
+        "Access token for Open VSX Registry",
+        ("token", ""),
+    ),
+)
+
+VERSION_FILTER_OPTIONS = (
+    _switch(
+        ("-p", "--include-prerelease"),
+        "Allow pre-release versions (or include them in update/outdated check)",
+        "Allow pre-release versions",
+    ),
+    _switch(
+        ("-V", "--no-code-version-check"),
+        "Disable VS Code version compatibility check",
+        "Disable VS Code version check",
+        dest="no_code_version_check",
+    ),
+    _valued(
+        ("-a", "--min-release-age"),
+        "Minimum release age threshold (e.g. 24h, 3d, 0)",
+        "Minimum release age threshold",
+        ("age", ""),
+    ),
+)
+
+DOWNLOAD_OPTIONS = (
+    _valued(
+        ("-d", "--download-dir"),
+        "Download directory for .vsix files",
+        "Download directory",
+        ("dir", "_files -/"),
+    ),
+)
+
+YES_OPTIONS = (
+    _switch(
+        ("-y", "--yes"),
+        "Non-interactive mode / skip confirmation prompt",
+        "Non-interactive mode",
+    ),
+)
+
+QUIET_OPTIONS = (
+    _switch(
+        ("-q", "--quiet"),
+        "Output raw extension IDs only (one per line, ideal for scripting)",
+        "Output raw extension IDs only",
+        default=False,
+    ),
+)
+
+# Options each subcommand adds on top of GLOBAL_OPTIONS, in help-output order.
+SUBCOMMAND_OPTIONS = {
+    "install": VERSION_FILTER_OPTIONS
+    + DOWNLOAD_OPTIONS
+    + (
+        _valued(
+            ("-f", "--file"),
+            "File containing extension IDs to install (one per line)",
+            "File containing extension IDs",
+            ("file", "_files"),
+        ),
+        _switch(
+            ("--force",),
+            "Force re-installation even if the target version is already installed",
+            "Force re-installation",
+            default=False,
+        ),
+        _switch(
+            ("-y", "--yes"),
+            "Non-interactive mode (install a pinned version even when held back; "
+            "otherwise skip held-back extensions instead of prompting)",
+            "Non-interactive mode",
+        ),
+    ),
+    "update": VERSION_FILTER_OPTIONS
+    + DOWNLOAD_OPTIONS
+    + YES_OPTIONS
+    + (
+        _switch(
+            ("-n", "--dry-run"),
+            "Perform a dry run (show available updates without downloading or installing)",
+            "Perform dry run without downloading or installing",
+        ),
+    ),
+    "remove": YES_OPTIONS,
+    "list": VERSION_FILTER_OPTIONS
+    + QUIET_OPTIONS
+    + (
+        _switch(
+            ("-u", "--outdated"),
+            "List only extensions that have updates available",
+            "List extensions with updates available",
+            default=False,
+        ),
+    ),
+    "search": VERSION_FILTER_OPTIONS
+    + QUIET_OPTIONS
+    + (
+        _valued(
+            ("-n", "--max-results"),
+            "Maximum number of search results to return (default: 15)",
+            "Maximum search results",
+            ("number", ""),
+            default=15,
+            type=int,
+        ),
+    ),
+    "info": (),
+    "clean": (),
+    "config": (),
+    "completion": (),
+}
+
+
+def add_options(parser, options):
+    for opt in options:
+        parser.add_argument(*opt.flags, help=opt.help, **opt.kwargs)
+    return parser
+
+
+def _fish_option(opt, predicate=None):
+    parts = ["complete -c code-extensions"]
+    if predicate:
+        parts.append(f'-n "{predicate}"')
+    parts += [
+        f"-l {flag[2:]}" if flag.startswith("--") else f"-s {flag[1:]}"
+        for flag in opt.flags
+    ]
+    parts.append(f'-d "{opt.summary}"')
+    if opt.value:
+        parts.append("-r")
+        if "_files" in opt.value[1]:
+            parts.append("-F")
+    return " ".join(parts)
+
+
+def _fish_subcommand_options():
+    """One completion line per option, listing every subcommand that takes it."""
+    grouped = {}
+    for name in CANONICAL_SUBCOMMANDS:
+        for opt in SUBCOMMAND_OPTIONS[name]:
+            grouped.setdefault((opt.flags, opt.summary), (opt, []))[1].append(name)
+    return "\n".join(
+        _fish_option(
+            opt,
+            "__fish_seen_subcommand_from " + " ".join(subcommand_names(*names)),
+        )
+        for opt, names in grouped.values()
+    )
+
+
+def _bash_flags(options):
+    return " ".join(flag for opt in options for flag in opt.flags)
+
+
+def _zsh_option(opt):
+    value = f":{opt.value[0]}:{opt.value[1]}" if opt.value else ""
+    if len(opt.flags) == 1:
+        return f"'{opt.flags[0]}[{opt.summary}]{value}'"
+    short, long = opt.flags
+    return f"'({short} {long})'{{{short},{long}}}'[{opt.summary}]{value}'"
+
+
+def _zsh_options(options, indent):
+    pad = " " * indent
+    return " \\\n".join(pad + _zsh_option(opt) for opt in options)
+
+
 # @@ALIASES:remove,info@@ expands to those subcommands and their aliases, joined
 # the way the target shell spells a set of alternatives; the other markers are
 # filled in per script below.
 _ALIAS_MARKER_RE = re.compile(r"@@ALIASES:([a-z,]+)@@")
+_FLAGS_MARKER_RE = re.compile(r"@@FLAGS:([a-z]+)@@")
 
 
-def _render_completion(template, join_names, markers):
+def _render_completion(template, join_names, markers, format_flags=None):
     script = _ALIAS_MARKER_RE.sub(
         lambda m: join_names(subcommand_names(*m.group(1).split(","))), template
     )
+    if format_flags:
+        script = _FLAGS_MARKER_RE.sub(lambda m: format_flags(m.group(1)), script)
     for marker, value in markers.items():
         script = script.replace(f"@@{marker}@@", value)
     if "@@" in script:
@@ -3988,25 +4203,12 @@ complete -c code-extensions -f
 
 @@SUBCOMMANDS@@
 
-complete -c code-extensions -s b -l code-binary -d "VS Code executable binary or fork" -r
-complete -c code-extensions -s s -l service-url -d "VS Code Extension Gallery service API URL" -r
-complete -c code-extensions -l open-vsx -d "Use Open VSX Registry"
-complete -c code-extensions -s h -l help -d "Show help message"
+@@GLOBAL_OPTIONS@@
 
 complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:config@@" -a "@@CONFIG_ACTIONS@@"
 complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:completion@@" -a "@@SHELLS@@"
 
-complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install@@" -s f -l file -d "File containing extension IDs" -r -F
-complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install,update,search,list@@" -s p -l include-prerelease -d "Allow pre-release versions"
-complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install,update,search,list@@" -s V -l no-code-version-check -d "Disable VS Code version check"
-complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:update@@" -s n -l dry-run -d "Perform dry run without downloading or installing"
-complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install,update@@" -s d -l download-dir -d "Download directory for VSIX files" -r -F
-complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install,update@@" -s y -l yes -d "Non-interactive mode"
-complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install,update,search,list@@" -s a -l min-release-age -d "Minimum release age threshold" -r
-complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install@@" -l force -d "Force re-installation"
-complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:search@@" -s n -l max-results -d "Maximum search results" -r
-complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:list,search@@" -s q -l quiet -d "Output raw extension IDs only"
-complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:list@@" -s u -l outdated -d "List extensions with updates available"
+@@SUBCOMMAND_OPTIONS@@
 
 complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:remove,info,update@@" -a "(code-extensions list -q 2>/dev/null)"
 """
@@ -4022,6 +4224,10 @@ FISH_COMPLETION_SCRIPT = _render_completion(
         ),
         "CONFIG_ACTIONS": " ".join(c.name for c in CONFIG_ACTIONS),
         "SHELLS": " ".join(COMPLETION_SHELLS),
+        "GLOBAL_OPTIONS": "\n".join(
+            _fish_option(opt) for opt in (*GLOBAL_OPTIONS, HELP_OPTION)
+        ),
+        "SUBCOMMAND_OPTIONS": _fish_subcommand_options(),
     },
 )
 
@@ -4056,9 +4262,27 @@ _code_extensions_completion() {
                 COMPREPLY=( $(compgen -W "$shells" -- "$cur") )
             fi
             ;;
-        @@ALIASES:remove,info@@)
+        @@ALIASES:remove@@)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-y --yes -h --help" -- "$cur") )
+                COMPREPLY=( $(compgen -W "@@FLAGS:remove@@" -- "$cur") )
+            else
+                local installed
+                installed=$(code-extensions list -q 2>/dev/null)
+                COMPREPLY=( $(compgen -W "$installed" -- "$cur") )
+            fi
+            ;;
+        @@ALIASES:update@@)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "@@FLAGS:update@@" -- "$cur") )
+            else
+                local installed
+                installed=$(code-extensions list -q 2>/dev/null)
+                COMPREPLY=( $(compgen -W "$installed" -- "$cur") )
+            fi
+            ;;
+        @@ALIASES:info@@)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "@@FLAGS:info@@" -- "$cur") )
             else
                 local installed
                 installed=$(code-extensions list -q 2>/dev/null)
@@ -4066,25 +4290,16 @@ _code_extensions_completion() {
             fi
             ;;
         @@ALIASES:install@@)
-            COMPREPLY=( $(compgen -W "-f --file -p --include-prerelease -V --no-code-version-check -d --download-dir -y --yes -a --min-release-age --force -h --help" -- "$cur") )
-            ;;
-        @@ALIASES:update@@)
-            if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "-p --include-prerelease -n --dry-run -V --no-code-version-check -d --download-dir -y --yes -a --min-release-age -h --help" -- "$cur") )
-            else
-                local installed
-                installed=$(code-extensions list -q 2>/dev/null)
-                COMPREPLY=( $(compgen -W "$installed" -- "$cur") )
-            fi
+            COMPREPLY=( $(compgen -W "@@FLAGS:install@@" -- "$cur") )
             ;;
         @@ALIASES:list@@)
-            COMPREPLY=( $(compgen -W "-q --quiet -u --outdated -p --include-prerelease -V --no-code-version-check -a --min-release-age -h --help" -- "$cur") )
+            COMPREPLY=( $(compgen -W "@@FLAGS:list@@" -- "$cur") )
             ;;
         @@ALIASES:search@@)
-            COMPREPLY=( $(compgen -W "-n --max-results -q --quiet -p --include-prerelease -V --no-code-version-check -a --min-release-age -h --help" -- "$cur") )
+            COMPREPLY=( $(compgen -W "@@FLAGS:search@@" -- "$cur") )
             ;;
         *)
-            COMPREPLY=( $(compgen -W "-b --code-binary -s --service-url --open-vsx -h --help" -- "$cur") )
+            COMPREPLY=( $(compgen -W "@@GLOBAL_FLAGS@@" -- "$cur") )
             ;;
     esac
 }
@@ -4099,7 +4314,13 @@ BASH_COMPLETION_SCRIPT = _render_completion(
         "COMMANDS": " ".join(CANONICAL_SUBCOMMANDS),
         "CONFIG_ACTIONS": " ".join(c.name for c in CONFIG_ACTIONS),
         "SHELLS": " ".join(COMPLETION_SHELLS),
+        "GLOBAL_FLAGS": _bash_flags((*GLOBAL_OPTIONS, HELP_OPTION)),
     },
+    # bash has no per-subcommand option state, so every branch offers the
+    # global options too, exactly like the parser accepts them.
+    format_flags=lambda name: _bash_flags(
+        (*SUBCOMMAND_OPTIONS[name], *GLOBAL_OPTIONS, HELP_OPTION)
+    ),
 )
 
 _ZSH_TEMPLATE = """#compdef code-extensions
@@ -4119,10 +4340,7 @@ _code_extensions() {
     shells=(@@ZSH_SHELLS@@)
 
     _arguments -C \\
-        '(-b --code-binary)'{-b,--code-binary}'[Path to VS Code binary/executable]:binary:_files' \\
-        '(-s --service-url)'{-s,--service-url}'[Extension Gallery API URL]:url:' \\
-        '--open-vsx[Use Open VSX Registry]' \\
-        '(-h --help)'{-h,--help}'[Show help message]' \\
+@@ZSH_GLOBAL_OPTIONS@@ \\
         '1: :->command' \\
         '*:: :->args'
 
@@ -4138,7 +4356,14 @@ _code_extensions() {
                 @@ALIASES:completion@@)
                     _values 'shell' $shells
                     ;;
-                @@ALIASES:remove,info@@)
+                @@ALIASES:remove@@)
+                    local -a installed
+                    installed=($(code-extensions list -q 2>/dev/null))
+                    _arguments \\
+@@FLAGS:remove@@ \\
+                        '*:installed extension:($installed)'
+                    ;;
+                @@ALIASES:info@@)
                     local -a installed
                     installed=($(code-extensions list -q 2>/dev/null))
                     _values 'installed extensions' $installed
@@ -4147,39 +4372,20 @@ _code_extensions() {
                     local -a installed
                     installed=($(code-extensions list -q 2>/dev/null))
                     _arguments \\
-                        '(-p --include-prerelease)'{-p,--include-prerelease}'[Allow pre-release versions]' \\
-                        '(-n --dry-run)'{-n,--dry-run}'[Perform dry run without downloading or installing]' \\
-                        '(-V --no-code-version-check)'{-V,--no-code-version-check}'[Disable VS Code version check]' \\
-                        '(-d --download-dir)'{-d,--download-dir}'[Download directory]:dir:_files -/' \\
-                        '(-y --yes)'{-y,--yes}'[Non-interactive mode]' \\
-                        '(-a --min-release-age)'{-a,--min-release-age}'[Minimum release age threshold]:age:' \\
+@@FLAGS:update@@ \\
                         '*:installed extension:($installed)'
                     ;;
                 @@ALIASES:install@@)
                     _arguments \\
-                        '(-f --file)'{-f,--file}'[File containing extension IDs]:file:_files' \\
-                        '(-p --include-prerelease)'{-p,--include-prerelease}'[Allow pre-release versions]' \\
-                        '(-V --no-code-version-check)'{-V,--no-code-version-check}'[Disable VS Code version check]' \\
-                        '(-d --download-dir)'{-d,--download-dir}'[Download directory]:dir:_files -/' \\
-                        '(-y --yes)'{-y,--yes}'[Non-interactive mode]' \\
-                        '(-a --min-release-age)'{-a,--min-release-age}'[Minimum release age threshold]:age:' \\
-                        '--force[Force re-installation]'
+@@FLAGS:install@@
                     ;;
                 @@ALIASES:list@@)
                     _arguments \\
-                        '(-q --quiet)'{-q,--quiet}'[Output raw extension IDs only]' \\
-                        '(-u --outdated)'{-u,--outdated}'[List extensions with updates available]' \\
-                        '(-p --include-prerelease)'{-p,--include-prerelease}'[Count pre-release versions as updates]' \\
-                        '(-V --no-code-version-check)'{-V,--no-code-version-check}'[Disable VS Code version check]' \\
-                        '(-a --min-release-age)'{-a,--min-release-age}'[Minimum release age threshold]:age:'
+@@FLAGS:list@@
                     ;;
                 @@ALIASES:search@@)
                     _arguments \\
-                        '(-n --max-results)'{-n,--max-results}'[Maximum search results]:number:' \\
-                        '(-q --quiet)'{-q,--quiet}'[Output raw extension IDs only]' \\
-                        '(-p --include-prerelease)'{-p,--include-prerelease}'[Allow pre-release versions]' \\
-                        '(-V --no-code-version-check)'{-V,--no-code-version-check}'[Disable VS Code version check]' \\
-                        '(-a --min-release-age)'{-a,--min-release-age}'[Minimum release age threshold]:age:'
+@@FLAGS:search@@
                     ;;
             esac
             ;;
@@ -4200,7 +4406,9 @@ ZSH_COMPLETION_SCRIPT = _render_completion(
             f"        '{c.name}:{c.summary}'" for c in CONFIG_ACTIONS
         ),
         "ZSH_SHELLS": " ".join(f"'{sh}'" for sh in COMPLETION_SHELLS),
+        "ZSH_GLOBAL_OPTIONS": _zsh_options((*GLOBAL_OPTIONS, HELP_OPTION), 8),
     },
+    format_flags=lambda name: _zsh_options(SUBCOMMAND_OPTIONS[name], 24),
 )
 
 _POWERSHELL_TEMPLATE = """# PowerShell completion script for code-extensions
@@ -4287,79 +4495,9 @@ def main():
     enable_colors()
     config = load_config()
 
-    parent_parser = argparse.ArgumentParser(add_help=False)
-    parent_parser.add_argument(
-        "-b",
-        "--code-binary",
-        default=None,
-        help="Path to VS Code binary/executable or its fork (default: code)",
-    )
-    parent_parser.add_argument(
-        "-s",
-        "--service-url",
-        default=None,
-        help="VS Code Extension Gallery service API URL",
-    )
-    parent_parser.add_argument(
-        "--open-vsx",
-        action="store_true",
-        default=None,
-        help="Use Open VSX Registry (https://open-vsx.org/vscode/gallery)",
-    )
-    parent_parser.add_argument(
-        "--open-vsx-token",
-        default=None,
-        help="Access token for Open VSX Registry",
-    )
-
-    version_filter_parser = argparse.ArgumentParser(add_help=False)
-    version_filter_parser.add_argument(
-        "-p",
-        "--include-prerelease",
-        action="store_true",
-        default=None,
-        help="Allow pre-release versions (or include them in update/outdated check)",
-    )
-    version_filter_parser.add_argument(
-        "-V",
-        "--no-code-version-check",
-        dest="no_code_version_check",
-        action="store_true",
-        default=None,
-        help="Disable VS Code version compatibility check",
-    )
-    version_filter_parser.add_argument(
-        "-a",
-        "--min-release-age",
-        default=None,
-        help="Minimum release age threshold (e.g. 24h, 3d, 0)",
-    )
-
-    download_parser = argparse.ArgumentParser(add_help=False)
-    download_parser.add_argument(
-        "-d",
-        "--download-dir",
-        default=None,
-        help="Download directory for .vsix files",
-    )
-
-    yes_parser = argparse.ArgumentParser(add_help=False)
-    yes_parser.add_argument(
-        "-y",
-        "--yes",
-        action="store_true",
-        default=None,
-        help="Non-interactive mode / skip confirmation prompt",
-    )
-
-    quiet_parser = argparse.ArgumentParser(add_help=False)
-    quiet_parser.add_argument(
-        "-q",
-        "--quiet",
-        action="store_true",
-        default=False,
-        help="Output raw extension IDs only (one per line, ideal for scripting)",
-    )
+    # Options come from SUBCOMMAND_OPTIONS so the parser and the completion
+    # scripts cannot disagree about what a subcommand accepts.
+    parent_parser = add_options(argparse.ArgumentParser(add_help=False), GLOBAL_OPTIONS)
 
     parser = argparse.ArgumentParser(
         prog="code-extensions",
@@ -4370,71 +4508,39 @@ def main():
     # Install sub-parser
     parser_install = subparsers.add_parser(
         "install",
-        parents=[
-            parent_parser,
-            version_filter_parser,
-            download_parser,
-        ],
+        parents=[parent_parser],
         help="Install VS Code extension(s) by ID (e.g. publisher.name or publisher.name@version)",
     )
+    add_options(parser_install, SUBCOMMAND_OPTIONS["install"])
     parser_install.add_argument(
         "extensions",
         nargs="*",
         default=[],
         help="Extension ID(s) to install (e.g. ms-python.python or ms-python.python@2024.1.0)",
     )
-    parser_install.add_argument(
-        "-f",
-        "--file",
-        default=None,
-        help="File containing extension IDs to install (one per line)",
-    )
-    parser_install.add_argument(
-        "--force",
-        action="store_true",
-        default=False,
-        help="Force re-installation even if the target version is already installed",
-    )
-    parser_install.add_argument(
-        "-y",
-        "--yes",
-        action="store_true",
-        default=None,
-        help="Non-interactive mode (install a pinned version even when held back; otherwise skip held-back extensions instead of prompting)",
-    )
 
     # Update sub-parser
     parser_update = subparsers.add_parser(
         "update",
         aliases=SUBCOMMAND_ALIASES["update"],
-        parents=[
-            parent_parser,
-            version_filter_parser,
-            download_parser,
-            yes_parser,
-        ],
+        parents=[parent_parser],
         help="Check, download, and install updates for installed extensions",
     )
+    add_options(parser_update, SUBCOMMAND_OPTIONS["update"])
     parser_update.add_argument(
         "extensions",
         nargs="*",
         help="Extension ID(s) or partial name(s) to update (default: all installed)",
-    )
-    parser_update.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        default=None,
-        help="Perform a dry run (show available updates without downloading or installing)",
     )
 
     # Remove sub-parser
     parser_remove = subparsers.add_parser(
         "remove",
         aliases=SUBCOMMAND_ALIASES["remove"],
-        parents=[parent_parser, yes_parser],
+        parents=[parent_parser],
         help="Remove installed extension(s)",
     )
+    add_options(parser_remove, SUBCOMMAND_OPTIONS["remove"])
     parser_remove.add_argument(
         "extensions",
         nargs="*",
@@ -4446,39 +4552,27 @@ def main():
     parser_list = subparsers.add_parser(
         "list",
         aliases=SUBCOMMAND_ALIASES["list"],
-        parents=[parent_parser, version_filter_parser, quiet_parser],
+        parents=[parent_parser],
         help="List installed extension(s)",
     )
+    add_options(parser_list, SUBCOMMAND_OPTIONS["list"])
     parser_list.add_argument(
         "query",
         nargs="?",
         default=None,
         help="Optional search query to filter extensions by ID",
     )
-    parser_list.add_argument(
-        "-u",
-        "--outdated",
-        action="store_true",
-        default=False,
-        help="List only extensions that have updates available",
-    )
 
     # Search sub-parser
     parser_search = subparsers.add_parser(
         "search",
-        parents=[parent_parser, version_filter_parser, quiet_parser],
+        parents=[parent_parser],
         help="Search VS Code Marketplace / Open VSX for extensions",
     )
+    add_options(parser_search, SUBCOMMAND_OPTIONS["search"])
     parser_search.add_argument(
         "query",
         help="Search query text (e.g. python, rust, gitlens)",
-    )
-    parser_search.add_argument(
-        "-n",
-        "--max-results",
-        type=int,
-        default=15,
-        help="Maximum number of search results to return (default: 15)",
     )
 
     # Info / Show sub-parser

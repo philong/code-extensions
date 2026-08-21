@@ -10,7 +10,9 @@ import io
 import json
 import os
 import random
+import re
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -2711,6 +2713,164 @@ class TestExecutionContextLazyOptions(unittest.TestCase):
 
         self.assertEqual(out.getvalue().strip(), "ms-python.python")
         self.assertEqual(err.getvalue(), "")
+
+
+# =====================================================================
+# CLI Surface / Completion Sync Tests
+# =====================================================================
+def _cli_help(argv):
+    """Capture a --help run of the real parser, the way a user sees it."""
+    with (
+        patch.object(sys, "argv", ["code-extensions", *argv, "--help"]),
+        # main() calls enable_colors(), which would otherwise leave the module's
+        # color state set for whatever test runs next.
+        patch.object(ce.Colors, "_enabled", ce.Colors._enabled),
+        contextlib.redirect_stdout(io.StringIO()) as out,
+        contextlib.suppress(SystemExit),
+    ):
+        ce.main()
+    return out.getvalue()
+
+
+def _help_flags(argv):
+    """Option strings argparse itself advertises for a subcommand."""
+    options = _cli_help(argv).partition("options:")[2]
+    return {
+        flag
+        for line in options.splitlines()
+        if line.startswith("  -")
+        for flag in re.findall(r"-{1,2}[a-zA-Z][\w-]*", line.split("  ", 2)[1])
+    }
+
+
+def _table_flags(name, globals_included=True):
+    options = list(ce.SUBCOMMAND_OPTIONS[name])
+    if globals_included:
+        options += [*ce.GLOBAL_OPTIONS, ce.HELP_OPTION]
+    return {flag for opt in options for flag in opt.flags}
+
+
+def _bash_branch_flags(script, name):
+    """Flags the bash script offers inside the case branch for `name`."""
+    pattern = "|".join(ce.subcommand_names(name))
+    branch = script.partition(f"\n        {pattern})\n")[2].partition(";;")[0]
+    offered = re.search(r'compgen -W "([^"]*)"', branch)
+    return set(re.findall(r"-{1,2}[a-zA-Z][\w-]*", offered.group(1) if offered else ""))
+
+
+def _fish_flags(script, name):
+    """Flags fish offers for `name`, whether globally or behind a predicate."""
+    flags = set()
+    for line in script.splitlines():
+        if not line.startswith("complete "):
+            continue
+        predicate = re.search(r'-n "__fish_seen_subcommand_from ([^"]+)"', line)
+        if predicate and name not in predicate.group(1).split():
+            continue
+        if not predicate and "__fish_use_subcommand" in line:
+            continue
+        flags.update("-" + short for short in re.findall(r"(?<= )-s (\w+)", line))
+        flags.update("--" + long for long in re.findall(r"(?<= )-l ([\w-]+)", line))
+    return flags
+
+
+def _zsh_branch_flags(script, name):
+    pattern = "|".join(ce.subcommand_names(name))
+    branch = script.partition(f"\n                {pattern})\n")[2].partition(";;")[0]
+    # Only the quoted _arguments specs are option specs; the surrounding shell
+    # lines mention 'code-extensions list -q'. Descriptions live in [...] and
+    # contain hyphenated words of their own.
+    specs = [ln for ln in branch.splitlines() if ln.strip().startswith("'")]
+    return set(
+        re.findall(r"-{1,2}[a-zA-Z][\w-]*", re.sub(r"\[[^\]]*\]", "", "\n".join(specs)))
+    )
+
+
+class TestCliSurfaceTables(unittest.TestCase):
+    """The tables the parser and the completion scripts are generated from."""
+
+    def test_every_subcommand_has_an_option_entry(self):
+        self.assertEqual(
+            sorted(ce.SUBCOMMAND_OPTIONS), sorted(ce.CANONICAL_SUBCOMMANDS)
+        )
+
+    def test_completion_scripts_cover_exactly_the_supported_shells(self):
+        self.assertEqual(
+            sorted(ce.SHELL_COMPLETION_SCRIPTS), sorted(ce.COMPLETION_SHELLS)
+        )
+
+    def test_no_unfilled_marker_reaches_a_generated_script(self):
+        for shell, script in ce.SHELL_COMPLETION_SCRIPTS.items():
+            with self.subTest(shell=shell):
+                self.assertNotIn("@@", script)
+
+    def test_every_subcommand_and_alias_dispatches(self):
+        expected = ce.subcommand_names(*ce.CANONICAL_SUBCOMMANDS)
+        for name in expected:
+            with self.subTest(command=name):
+                self.assertEqual(_cli_help([name]).count("usage:"), 1)
+
+    def test_parser_flags_match_the_option_table(self):
+        # Ties the table to what argparse really accepts, so a subcommand that
+        # stops taking an option cannot keep advertising it in completions.
+        for name in ce.CANONICAL_SUBCOMMANDS:
+            with self.subTest(command=name):
+                self.assertEqual(_help_flags([name]), _table_flags(name))
+
+
+class TestCompletionScriptsMatchTheParser(unittest.TestCase):
+    """Each shell must offer exactly the flags its subcommand accepts."""
+
+    def test_bash_branches_match(self):
+        script = ce.SHELL_COMPLETION_SCRIPTS["bash"]
+        for name in ("install", "update", "remove", "list", "search", "info"):
+            with self.subTest(command=name):
+                self.assertEqual(_bash_branch_flags(script, name), _table_flags(name))
+
+    def test_fish_lines_match(self):
+        script = ce.SHELL_COMPLETION_SCRIPTS["fish"]
+        for name in ce.CANONICAL_SUBCOMMANDS:
+            with self.subTest(command=name):
+                self.assertEqual(_fish_flags(script, name), _table_flags(name))
+
+    def test_zsh_branches_match(self):
+        script = ce.SHELL_COMPLETION_SCRIPTS["zsh"]
+        # zsh handles the global options once, before dispatching on the
+        # subcommand, so a branch only carries the subcommand's own options.
+        for name in ("install", "update", "remove", "list", "search"):
+            with self.subTest(command=name):
+                self.assertEqual(
+                    _zsh_branch_flags(script, name),
+                    _table_flags(name, globals_included=False),
+                )
+
+    def test_zsh_offers_the_global_options_up_front(self):
+        script = ce.SHELL_COMPLETION_SCRIPTS["zsh"]
+        top_level = script.partition("_arguments -C")[2].partition("case $state")[0]
+        self.assertEqual(
+            set(
+                re.findall(
+                    r"-{1,2}[a-zA-Z][\w-]*", re.sub(r"\[[^\]]*\]", "", top_level)
+                )
+            ),
+            {
+                flag
+                for opt in (*ce.GLOBAL_OPTIONS, ce.HELP_OPTION)
+                for flag in opt.flags
+            },
+        )
+
+    def test_subcommands_and_choices_reach_every_script(self):
+        for shell, script in ce.SHELL_COMPLETION_SCRIPTS.items():
+            for name in ce.CANONICAL_SUBCOMMANDS:
+                with self.subTest(shell=shell, command=name):
+                    self.assertIn(name, script)
+            for action in ce.CONFIG_ACTIONS:
+                with self.subTest(shell=shell, action=action.name):
+                    self.assertIn(action.name, script)
+            for target in ce.COMPLETION_SHELLS:
+                with self.subTest(shell=shell, target=target):
+                    self.assertIn(target, script)
 
 
 # =====================================================================
