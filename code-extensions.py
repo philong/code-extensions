@@ -1937,6 +1937,12 @@ class ExecutionContext:
         return self._vscode_version
 
 
+# Upper bound on a Retry-After delay. The header comes from the remote
+# service, so a hostile or misbehaving gallery must not be able to park the
+# tool for hours on end.
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
 def _post_extension_query(payload, service_url, token=None):
     """POST an extensionquery payload, with a 1h on-disk cache and retries.
 
@@ -2009,7 +2015,7 @@ def _post_extension_query(payload, service_url, token=None):
                 retry_reason = "rate limited (HTTP 429)"
                 ra = e.headers.get("Retry-After")
                 if ra and ra.strip().isdigit():
-                    retry_after = float(ra.strip())
+                    retry_after = min(float(ra.strip()), MAX_RETRY_AFTER_SECONDS)
         except (urllib.error.URLError, TimeoutError) as e:
             err = e
             # urllib wraps any OSError raised while connecting or sending into
