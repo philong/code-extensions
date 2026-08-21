@@ -2204,6 +2204,10 @@ def query_marketplace_search(
         for ext in extensions
         if ext.get("publisher", {}).get("publisherName") and ext.get("extensionName")
     ]
+    # Re-query each hit by ID instead of trusting the search payload: the
+    # detail path is cached, batched, and identical to what install/update
+    # consume, so eligibility filtering sees exactly the data those commands
+    # see rather than whatever the search endpoint chose to include.
     ext_details_map = query_marketplace_extensions(
         ext_ids, service_url=service_url, token=token
     )
