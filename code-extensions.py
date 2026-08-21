@@ -839,25 +839,70 @@ def strip_comment(line):
     return split_comment(line)[0].strip()
 
 
-CONFIG_OPTION_TYPES = {
-    "include_prerelease": bool,
-    "no_code_version_check": bool,
-    "yes": bool,
-    "code_binary": str,
-    "download_dir": str,
-    "min_release_age": str,
-    "service_url": str,
-    "open_vsx": bool,
-    "open_vsx_token": str,
-}
+GLOBAL_CONFIG_SCHEMA = [
+    (
+        "min_release_age",
+        str,
+        "Minimum release age threshold (e.g. '24h', '3d', '0')",
+        "24h",
+    ),
+    (
+        "code_binary",
+        str,
+        "VS Code executable path or command (e.g. 'code', 'codium')",
+        "code",
+    ),
+    (
+        "include_prerelease",
+        bool,
+        "Allow pre-release versions by default (true/false)",
+        "false",
+    ),
+    (
+        "no_code_version_check",
+        bool,
+        "Disable engine version check (true/false)",
+        "false",
+    ),
+    (
+        "download_dir",
+        str,
+        "Custom directory path for downloaded .vsix files",
+        "system temp",
+    ),
+    ("open_vsx", bool, "Use Open VSX registry by default (true/false)", "false"),
+    (
+        "open_vsx_token",
+        str,
+        "Personal access token for Open VSX Registry authentication",
+        "none",
+    ),
+    (
+        "service_url",
+        str,
+        "Custom Extension Gallery API endpoint URL",
+        "Marketplace API",
+    ),
+    ("yes", bool, "Non-interactive mode by default (true/false)", "false"),
+]
 
-EXT_OPTION_TYPES = {
-    "ignore": bool,
-    "min_release_age": str,
-    "skip_versions": list,
-    "include_prerelease": bool,
-}
+EXT_CONFIG_SCHEMA = [
+    (
+        "min_release_age",
+        str,
+        "Per-extension minimum release age override (e.g. '6h', '0')",
+    ),
+    ("ignore", bool, "Exclude extension from automatic updates (true/false)"),
+    (
+        "include_prerelease",
+        bool,
+        "Allow pre-release versions for this extension (true/false)",
+    ),
+    ("skip_versions", list, "List of version strings to skip (e.g. ['1.2.3'])"),
+]
 
+CONFIG_OPTION_TYPES = {entry[0]: entry[1] for entry in GLOBAL_CONFIG_SCHEMA}
+EXT_OPTION_TYPES = {entry[0]: entry[1] for entry in EXT_CONFIG_SCHEMA}
 EXT_OPTION_KEYS = frozenset(EXT_OPTION_TYPES)
 
 
@@ -1529,63 +1574,13 @@ def handle_config(args, config):
         print(
             f"\n{Colors.BOLD}Available Global Settings{Colors.ENDC} (use 'code-extensions config set <key> <val>'):"
         )
-        global_ref = [
-            (
-                "min_release_age",
-                "Minimum release age threshold (e.g. '24h', '3d', '0')",
-                "24h",
-            ),
-            (
-                "code_binary",
-                "VS Code executable path or command (e.g. 'code', 'codium')",
-                "code",
-            ),
-            (
-                "include_prerelease",
-                "Allow pre-release versions by default (true/false)",
-                "false",
-            ),
-            (
-                "no_code_version_check",
-                "Disable engine version check (true/false)",
-                "false",
-            ),
-            (
-                "download_dir",
-                "Custom directory path for downloaded .vsix files",
-                "system temp",
-            ),
-            ("open_vsx", "Use Open VSX registry by default (true/false)", "false"),
-            (
-                "open_vsx_token",
-                "Personal access token for Open VSX Registry authentication",
-                "none",
-            ),
-            (
-                "service_url",
-                "Custom Extension Gallery API endpoint URL",
-                "Marketplace API",
-            ),
-        ]
-        for key, desc, default in global_ref:
+        for key, _type, desc, default in GLOBAL_CONFIG_SCHEMA:
             print(f"  {Colors.CYAN}{key:<22}{Colors.ENDC} {desc} [Default: {default}]")
 
         print(
             f"\n{Colors.BOLD}Available Per-Extension Rules{Colors.ENDC} (use 'code-extensions config set <pub.name>.<key> <val>'):"
         )
-        ext_ref = [
-            (
-                "min_release_age",
-                "Per-extension minimum release age override (e.g. '6h', '0')",
-            ),
-            ("ignore", "Exclude extension from automatic updates (true/false)"),
-            (
-                "include_prerelease",
-                "Allow pre-release versions for this extension (true/false)",
-            ),
-            ("skip_versions", "List of version strings to skip (e.g. ['1.2.3'])"),
-        ]
-        for key, desc in ext_ref:
+        for key, _type, desc in EXT_CONFIG_SCHEMA:
             print(f"  {Colors.CYAN}{key:<22}{Colors.ENDC} {desc}")
         print()
         return
