@@ -216,6 +216,10 @@ def get_local_target_platform():
     return "universal"
 
 
+def _comparable_version_parts(parts):
+    return tuple((0, x) if isinstance(x, int) else (1, str(x)) for x in parts)
+
+
 @lru_cache(maxsize=4096)
 def parse_version(v_str):
     parts = v_str.split("-")
@@ -248,10 +252,11 @@ def parse_version(v_str):
                 pre_parsed.append(x)
         prerelease_parts = tuple(pre_parsed)
 
-    def comparable(parts):
-        return tuple((0, x) if isinstance(x, int) else (1, str(x)) for x in parts)
-
-    return (comparable(parsed_ints), is_release, comparable(prerelease_parts))
+    return (
+        _comparable_version_parts(parsed_ints),
+        is_release,
+        _comparable_version_parts(prerelease_parts),
+    )
 
 
 def parse_code_binary(code_binary):
