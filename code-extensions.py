@@ -1848,6 +1848,89 @@ def resolve_token_for_service(service_url, args=None, config=None):
     return None
 
 
+class ExecutionContext:
+    """Resolved runtime options and environment for command execution."""
+
+    def __init__(self, args, config):
+        config = config or {}
+        self._args = args
+        self._config = config
+        self.code_binary = parse_code_binary(
+            resolve_option(
+                getattr(args, "code_binary", None), config, "code_binary", "code"
+            )
+        )
+        self.include_prerelease = resolve_option(
+            getattr(args, "include_prerelease", None),
+            config,
+            "include_prerelease",
+            False,
+        )
+        self.no_code_version_check = resolve_option(
+            getattr(args, "no_code_version_check", None),
+            config,
+            "no_code_version_check",
+            False,
+        )
+        self.yes = resolve_option(getattr(args, "yes", None), config, "yes", False)
+        self.target_platform = get_local_target_platform()
+        self.extensions_config = config.get("extensions", {})
+        self._vscode_version = None
+        self._vscode_version_fetched = False
+        self._service_url = None
+        self._token = None
+        self._token_resolved = False
+        self._min_release_age = None
+        self._min_release_age_str = None
+        self._min_release_age_resolved = False
+
+    # Resolved on demand: resolve_service_url warns about insecure HTTP and
+    # resolve_min_release_age exits on an unparseable value, neither of which a
+    # command that never consults the setting (`list`, `remove`) should trigger.
+    @property
+    def service_url(self):
+        if self._service_url is None:
+            self._service_url = resolve_service_url(self._args, self._config)
+        return self._service_url
+
+    @property
+    def token(self):
+        if not self._token_resolved:
+            self._token = resolve_token_for_service(
+                self.service_url, self._args, self._config
+            )
+            self._token_resolved = True
+        return self._token
+
+    def _resolve_min_release_age(self):
+        if not self._min_release_age_resolved:
+            self._min_release_age, self._min_release_age_str = resolve_min_release_age(
+                getattr(self._args, "min_release_age", None), self._config
+            )
+            self._min_release_age_resolved = True
+
+    @property
+    def min_release_age(self):
+        self._resolve_min_release_age()
+        return self._min_release_age
+
+    @property
+    def min_release_age_str(self):
+        self._resolve_min_release_age()
+        return self._min_release_age_str
+
+    @property
+    def vscode_version(self):
+        if not self._vscode_version_fetched:
+            self._vscode_version = (
+                None
+                if self.no_code_version_check
+                else get_vscode_version(self.code_binary)
+            )
+            self._vscode_version_fetched = True
+        return self._vscode_version
+
+
 def _post_extension_query(payload, service_url, token=None):
     """POST an extensionquery payload, with a 1h on-disk cache and retries.
 
@@ -2481,26 +2564,7 @@ def prompt_yes_no(question, default=False):
 
 
 def handle_install(args, config):
-    code_binary = parse_code_binary(
-        resolve_option(args.code_binary, config, "code_binary", "code")
-    )
-    service_url = resolve_service_url(args, config)
-    token = resolve_token_for_service(service_url, args, config)
-
-    include_prerelease = resolve_option(
-        args.include_prerelease, config, "include_prerelease", False
-    )
-    no_code_version_check = resolve_option(
-        args.no_code_version_check, config, "no_code_version_check", False
-    )
-    yes = resolve_option(args.yes, config, "yes", False)
-    min_release_age, min_release_age_str = resolve_min_release_age(
-        args.min_release_age, config
-    )
-
-    vscode_version = None if no_code_version_check else get_vscode_version(code_binary)
-    target_platform = get_local_target_platform()
-    extensions_config = config.get("extensions", {})
+    ctx = ExecutionContext(args, config)
 
     target_specs = list(args.extensions or [])
     file_option = getattr(args, "file", None)
@@ -2561,9 +2625,9 @@ def handle_install(args, config):
     ext_ids = [t[0] for t in parsed_targets]
     print(f"{Colors.BLUE}Querying extension gallery for installation...{Colors.ENDC}")
     marketplace_data = query_marketplace_extensions(
-        ext_ids, service_url=service_url, token=token
+        ext_ids, service_url=ctx.service_url, token=ctx.token
     )
-    installed_exts = get_installed_extensions(code_binary)
+    installed_exts = get_installed_extensions(ctx.code_binary)
 
     download_dir_resolved, download_dir_is_temp = resolve_download_target(args, config)
 
@@ -2579,12 +2643,12 @@ def handle_install(args, config):
         ext_name = ext_obj.get("extensionName", "")
         full_id = f"{pub_name}.{ext_name}".lower()
 
-        ext_cfg = extensions_config.get(full_id, {})
+        ext_cfg = ctx.extensions_config.get(full_id, {})
         eff_include_prerelease, eff_min_age, eff_min_age_str = effective_ext_options(
             ext_cfg,
-            include_prerelease,
-            min_release_age,
-            min_release_age_str,
+            ctx.include_prerelease,
+            ctx.min_release_age,
+            ctx.min_release_age_str,
             # bool() rather than `is not None`: programmatic callers (the
             # search TUI, the test suite) pass False to mean "flag not
             # given", which `is not None` would read as an override.
@@ -2601,8 +2665,8 @@ def handle_install(args, config):
 
         compatible_versions = filter_versions(
             ext_obj.get("versions", []),
-            target_platform,
-            vscode_version=vscode_version,
+            ctx.target_platform,
+            vscode_version=ctx.vscode_version,
             include_prerelease=eff_include_prerelease or bool(req_ver),
             skip_versions=skipped_versions,
             required_version=req_ver,
@@ -2632,7 +2696,7 @@ def handle_install(args, config):
                 print(
                     f"{Colors.YELLOW}Warning: Requested version '{req_ver}' of '{full_id}' was released less than {eff_min_age} ago.{Colors.ENDC}"
                 )
-                if not yes:
+                if not ctx.yes:
                     if not sys.stdin.isatty() or not prompt_yes_no(
                         f"Do you want to install '{full_id}@{req_ver}' despite minimum release age policy?"
                     ):
@@ -2655,7 +2719,7 @@ def handle_install(args, config):
                 print(
                     f"{Colors.YELLOW}Warning: Latest version '{latest_ver_str}' of '{full_id}' is held back by minimum release age policy, and no older compatible release was found.{Colors.ENDC}"
                 )
-                if not yes and sys.stdin.isatty():
+                if not ctx.yes and sys.stdin.isatty():
                     if prompt_yes_no(
                         f"Install held-back version '{latest_ver_str}' anyway?"
                     ):
@@ -2694,7 +2758,7 @@ def handle_install(args, config):
             ext_name,
             target_version,
             target_plat,
-            service_url,
+            ctx.service_url,
         )
         filename = vsix_filename(pub_name, ext_name, target_version, target_plat)
         filepath = os.path.join(download_dir_resolved, filename)
@@ -2702,14 +2766,14 @@ def handle_install(args, config):
         # Downgrading to an older version needs --force, just like a
         # re-install of the same version does.
         download_and_install(
-            code_binary,
+            ctx.code_binary,
             url,
             filepath,
             full_id,
             target_version,
             target_plat,
-            token=token,
-            service_url=service_url,
+            token=ctx.token,
+            service_url=ctx.service_url,
             force=force
             or bool(
                 installed_ver
@@ -2725,7 +2789,7 @@ def check_updates(
     installed_exts,
     target_platform,
     vscode_version=None,
-    exclude_prerelease=True,
+    include_prerelease=False,
     min_release_age=None,
     extensions_config=None,
     cli_include_prerelease_override=False,
@@ -2757,7 +2821,7 @@ def check_updates(
         skipped_versions = ext_cfg.get("skip_versions", [])
         eff_include_prerelease, eff_min_age, _ = effective_ext_options(
             ext_cfg,
-            not exclude_prerelease,
+            include_prerelease,
             min_release_age,
             cli_include_prerelease_override=cli_include_prerelease_override,
             cli_min_release_age_override=cli_min_release_age_override,
@@ -3104,29 +3168,11 @@ def resolve_installed_targets(specs, installed_exts, exact_name=False):
 
 
 def handle_update(args, config):
-    code_binary = parse_code_binary(
-        resolve_option(args.code_binary, config, "code_binary", "code")
-    )
-    service_url = resolve_service_url(args, config)
-    token = resolve_token_for_service(service_url, args, config)
-
-    include_prerelease = resolve_option(
-        args.include_prerelease, config, "include_prerelease", False
-    )
-    no_code_version_check = resolve_option(
-        args.no_code_version_check, config, "no_code_version_check", False
-    )
-    yes = resolve_option(args.yes, config, "yes", False)
+    ctx = ExecutionContext(args, config)
     dry_run = bool(getattr(args, "dry_run", None))
-    min_release_age, _min_release_age_str = resolve_min_release_age(
-        args.min_release_age, config
-    )
-
-    vscode_version = None if no_code_version_check else get_vscode_version(code_binary)
-    target_platform = get_local_target_platform()
 
     print(f"{Colors.BLUE}Fetching installed VS Code extensions...{Colors.ENDC}")
-    installed_exts = get_installed_extensions(code_binary)
+    installed_exts = get_installed_extensions(ctx.code_binary)
     if not installed_exts:
         print("No extensions found installed.")
         return
@@ -3141,22 +3187,21 @@ def handle_update(args, config):
     else:
         print(f"Found {len(installed_exts)} extensions installed.")
     print(
-        f"{Colors.BLUE}Checking updates (including pre-releases: {include_prerelease})...{Colors.ENDC}"
+        f"{Colors.BLUE}Checking updates (including pre-releases: {ctx.include_prerelease})...{Colors.ENDC}"
     )
 
     cli_min_release_age_override = args.min_release_age is not None
-    extensions_config = config.get("extensions", {})
     updates = check_updates(
         installed_exts,
-        target_platform,
-        vscode_version=vscode_version,
-        exclude_prerelease=not include_prerelease,
-        min_release_age=min_release_age,
-        extensions_config=extensions_config,
+        ctx.target_platform,
+        vscode_version=ctx.vscode_version,
+        include_prerelease=ctx.include_prerelease,
+        min_release_age=ctx.min_release_age,
+        extensions_config=ctx.extensions_config,
         cli_include_prerelease_override=bool(getattr(args, "include_prerelease", None)),
         cli_min_release_age_override=cli_min_release_age_override,
-        service_url=service_url,
-        token=token,
+        service_url=ctx.service_url,
+        token=ctx.token,
     )
 
     print()
@@ -3164,7 +3209,7 @@ def handle_update(args, config):
         print(f"{Colors.GREEN}All extensions are up to date!{Colors.ENDC}")
         return
 
-    if yes:
+    if ctx.yes:
         print(f"{Colors.GREEN}{Colors.BOLD}Updates available:{Colors.ENDC}")
         print_updates_table(updates)
         print()
@@ -3211,7 +3256,7 @@ def handle_update(args, config):
             print(
                 f"  {Colors.CYAN}{update['id']}{Colors.ENDC}: {Colors.YELLOW}{update['installed']}{Colors.ENDC} -> {Colors.GREEN}{version}{Colors.ENDC} ({platform})"
             )
-            print(f"    Download URL: {resolve_update_url(update, service_url)}")
+            print(f"    Download URL: {resolve_update_url(update, ctx.service_url)}")
         print(
             f"\n{Colors.YELLOW}[Dry-run] No extensions were downloaded or installed.{Colors.ENDC}"
         )
@@ -3224,20 +3269,20 @@ def handle_update(args, config):
         ext_name = update["name"]
         version = update["eligible"]
         platform = update["eligible_platform"]
-        url = resolve_update_url(update, service_url)
+        url = resolve_update_url(update, ctx.service_url)
         filepath = os.path.join(
             download_dir_resolved, vsix_filename(pub_name, ext_name, version, platform)
         )
 
         download_and_install(
-            code_binary,
+            ctx.code_binary,
             url,
             filepath,
             update["id"],
             version,
             platform,
-            token=token,
-            service_url=service_url,
+            token=ctx.token,
+            service_url=ctx.service_url,
             cleanup=download_dir_is_temp,
         )
 
@@ -3301,12 +3346,9 @@ def select_removals(installed_exts):
 
 
 def handle_remove(args, config):
-    code_binary = parse_code_binary(
-        resolve_option(args.code_binary, config, "code_binary", "code")
-    )
-    yes = resolve_option(args.yes, config, "yes", False)
+    ctx = ExecutionContext(args, config)
 
-    installed_exts = get_installed_extensions(code_binary)
+    installed_exts = get_installed_extensions(ctx.code_binary)
     if not installed_exts:
         print("No extensions found installed.")
         return
@@ -3342,7 +3384,7 @@ def handle_remove(args, config):
     for t in targets:
         print(f"  - {t} (v{installed_exts.get(t, 'unknown')})")
 
-    if not yes and not prompt_yes_no(
+    if not ctx.yes and not prompt_yes_no(
         f"Are you sure you want to remove {len(targets)} extension(s)?",
         default=False,
     ):
@@ -3352,7 +3394,7 @@ def handle_remove(args, config):
     for ext_id in targets:
         print(f"Removing {Colors.CYAN}{ext_id}{Colors.ENDC}...")
         try:
-            run_code_cmd([*code_binary, "--uninstall-extension", ext_id], retries=0)
+            run_code_cmd([*ctx.code_binary, "--uninstall-extension", ext_id], retries=0)
             print(f"  {Colors.GREEN}✓{Colors.ENDC} Removed successfully.")
         except subprocess.CalledProcessError as e:
             print(
@@ -3365,10 +3407,8 @@ def handle_remove(args, config):
 
 
 def handle_list(args, config):
-    code_binary = parse_code_binary(
-        resolve_option(args.code_binary, config, "code_binary", "code")
-    )
-    installed_exts = get_installed_extensions(code_binary)
+    ctx = ExecutionContext(args, config)
+    installed_exts = get_installed_extensions(ctx.code_binary)
 
     if not installed_exts:
         print("No extensions found installed.")
@@ -3381,44 +3421,21 @@ def handle_list(args, config):
         ext_items = [item for item in ext_items if q in item[0]]
 
     if args.outdated:
-        service_url = resolve_service_url(args, config)
-        token = resolve_token_for_service(service_url, args, config)
-        # Same settings as `update`, so the two agree on what counts as outdated.
-        include_prerelease = resolve_option(
-            getattr(args, "include_prerelease", None),
-            config,
-            "include_prerelease",
-            False,
-        )
-        no_code_version_check = resolve_option(
-            getattr(args, "no_code_version_check", None),
-            config,
-            "no_code_version_check",
-            False,
-        )
-        vscode_version = (
-            None if no_code_version_check else get_vscode_version(code_binary)
-        )
-        target_platform = get_local_target_platform()
-        min_release_age, _min_release_age_str = resolve_min_release_age(
-            getattr(args, "min_release_age", None), config
-        )
-
         filtered_dict = dict(ext_items)
         updates = check_updates(
             filtered_dict,
-            target_platform,
-            vscode_version=vscode_version,
-            exclude_prerelease=not include_prerelease,
-            min_release_age=min_release_age,
-            extensions_config=config.get("extensions", {}),
+            ctx.target_platform,
+            vscode_version=ctx.vscode_version,
+            include_prerelease=ctx.include_prerelease,
+            min_release_age=ctx.min_release_age,
+            extensions_config=ctx.extensions_config,
             cli_include_prerelease_override=bool(
                 getattr(args, "include_prerelease", None)
             ),
             cli_min_release_age_override=getattr(args, "min_release_age", None)
             is not None,
-            service_url=service_url,
-            token=token,
+            service_url=ctx.service_url,
+            token=ctx.token,
         )
         update_ids = {u["id"]: u for u in updates}
         ext_items = [item for item in ext_items if item[0] in update_ids]
@@ -3461,17 +3478,16 @@ def handle_list(args, config):
 
 
 def show_search_item_info(item, config, args):
-    ext_id = item["id"]
-
-    class DummyArgs:
-        pass
-
-    info_args = DummyArgs()
-    info_args.extension = ext_id
-    info_args.code_binary = getattr(args, "code_binary", None)
-    info_args.service_url = getattr(args, "service_url", None)
-    info_args.open_vsx = getattr(args, "open_vsx", None)
-    info_args.min_release_age = getattr(args, "min_release_age", None)
+    info_args = argparse.Namespace(
+        extension=item["id"],
+        code_binary=getattr(args, "code_binary", None),
+        service_url=getattr(args, "service_url", None),
+        open_vsx=getattr(args, "open_vsx", None),
+        open_vsx_token=getattr(args, "open_vsx_token", None),
+        min_release_age=getattr(args, "min_release_age", None),
+        include_prerelease=getattr(args, "include_prerelease", None),
+        no_code_version_check=getattr(args, "no_code_version_check", None),
+    )
 
     sys.stdout.write("\033[2J\033[H")
     sys.stdout.flush()
@@ -3503,13 +3519,21 @@ def install_search_items(ext_ids, config, args):
     print(
         f"\n{Colors.GREEN}{Colors.BOLD}Installing selected extension(s):{Colors.ENDC} {', '.join(ext_ids)}\n"
     )
-    args.extensions = ext_ids
-    args.include_prerelease = getattr(args, "include_prerelease", False)
-    args.no_code_version_check = getattr(args, "no_code_version_check", False)
-    args.download_dir = getattr(args, "download_dir", None)
-    args.yes = True
-    args.min_release_age = getattr(args, "min_release_age", None)
-    handle_install(args, config)
+    install_args = argparse.Namespace(
+        extensions=ext_ids,
+        file=None,
+        include_prerelease=getattr(args, "include_prerelease", False),
+        no_code_version_check=getattr(args, "no_code_version_check", False),
+        download_dir=getattr(args, "download_dir", None),
+        yes=True,
+        min_release_age=getattr(args, "min_release_age", None),
+        force=False,
+        code_binary=getattr(args, "code_binary", None),
+        service_url=getattr(args, "service_url", None),
+        open_vsx=getattr(args, "open_vsx", None),
+        open_vsx_token=getattr(args, "open_vsx_token", None),
+    )
+    handle_install(install_args, config)
 
 
 def interactive_search_flow(search_results, config, args, installed_exts=None):
@@ -3605,25 +3629,7 @@ def interactive_search_flow(search_results, config, args, installed_exts=None):
 
 
 def handle_search(args, config):
-    code_binary = parse_code_binary(
-        resolve_option(args.code_binary, config, "code_binary", "code")
-    )
-    service_url = resolve_service_url(args, config)
-    token = resolve_token_for_service(service_url, args, config)
-
-    include_prerelease = resolve_option(
-        args.include_prerelease, config, "include_prerelease", False
-    )
-    no_code_version_check = resolve_option(
-        args.no_code_version_check, config, "no_code_version_check", False
-    )
-    min_release_age, _min_release_age_str = resolve_min_release_age(
-        args.min_release_age, config
-    )
-
-    vscode_version = None if no_code_version_check else get_vscode_version(code_binary)
-    target_platform = get_local_target_platform()
-    extensions_config = config.get("extensions", {})
+    ctx = ExecutionContext(args, config)
 
     if not args.quiet:
         print(
@@ -3632,15 +3638,15 @@ def handle_search(args, config):
     results = query_marketplace_search(
         args.query,
         max_results=args.max_results,
-        target_platform=target_platform,
-        vscode_version=vscode_version,
-        include_prerelease=include_prerelease,
-        min_release_age=min_release_age,
-        extensions_config=extensions_config,
+        target_platform=ctx.target_platform,
+        vscode_version=ctx.vscode_version,
+        include_prerelease=ctx.include_prerelease,
+        min_release_age=ctx.min_release_age,
+        extensions_config=ctx.extensions_config,
         cli_include_prerelease_override=bool(getattr(args, "include_prerelease", None)),
         cli_min_release_age_override=getattr(args, "min_release_age", None) is not None,
-        service_url=service_url,
-        token=token,
+        service_url=ctx.service_url,
+        token=ctx.token,
     )
 
     if not results:
@@ -3655,7 +3661,7 @@ def handle_search(args, config):
             print(r["id"])
         return
 
-    installed_exts = get_installed_extensions(code_binary, ignore_errors=True)
+    installed_exts = get_installed_extensions(ctx.code_binary, ignore_errors=True)
 
     if HAS_TTY and sys.stdin.isatty() and sys.stdout.isatty():
         interactive_search_flow(results, config, args, installed_exts=installed_exts)
@@ -3689,11 +3695,7 @@ def handle_search(args, config):
 
 
 def handle_info(args, config):
-    service_url = resolve_service_url(args, config)
-    token = resolve_token_for_service(service_url, args, config)
-    code_binary = parse_code_binary(
-        resolve_option(args.code_binary, config, "code_binary", "code")
-    )
+    ctx = ExecutionContext(args, config)
 
     ext_id = args.extension.strip().lower()
     if "@" in ext_id:
@@ -3707,7 +3709,7 @@ def handle_info(args, config):
             f"{Colors.BLUE}Searching extension gallery for '{ext_id}'...{Colors.ENDC}"
         )
         search_results = query_marketplace_search(
-            ext_id, max_results=5, service_url=service_url, token=token
+            ext_id, max_results=5, service_url=ctx.service_url, token=ctx.token
         )
         if not search_results:
             print(
@@ -3723,7 +3725,7 @@ def handle_info(args, config):
 
     print(f"{Colors.BLUE}Fetching extension metadata for '{ext_id}'...{Colors.ENDC}")
     marketplace_data = query_marketplace_extensions(
-        [ext_id], service_url=service_url, token=token
+        [ext_id], service_url=ctx.service_url, token=ctx.token
     )
     ext_obj = marketplace_data.get(ext_id)
 
@@ -3743,32 +3745,12 @@ def handle_info(args, config):
 
     versions = ext_obj.get("versions", [])
 
-    include_prerelease = resolve_option(
-        getattr(args, "include_prerelease", None), config, "include_prerelease", False
-    )
-    no_code_version_check = resolve_option(
-        getattr(args, "no_code_version_check", None),
-        config,
-        "no_code_version_check",
-        False,
-    )
-    vscode_version = None if no_code_version_check else get_vscode_version(code_binary)
-    target_platform = get_local_target_platform()
-
-    min_release_age_str = resolve_option(
-        getattr(args, "min_release_age", None), config, "min_release_age", "24h"
-    )
-    try:
-        min_release_age = parse_age_threshold(min_release_age_str)
-    except ValueError:
-        min_release_age = datetime.timedelta(hours=24)
-
-    ext_cfg = config.get("extensions", {}).get(full_id, {})
+    ext_cfg = ctx.extensions_config.get(full_id, {})
     skipped_versions = ext_cfg.get("skip_versions", [])
     eff_include_prerelease, eff_min_age, _ = effective_ext_options(
         ext_cfg,
-        include_prerelease,
-        min_release_age,
+        ctx.include_prerelease,
+        ctx.min_release_age,
         cli_include_prerelease_override=bool(getattr(args, "include_prerelease", None)),
         cli_min_release_age_override=getattr(args, "min_release_age", None) is not None,
     )
@@ -3777,8 +3759,8 @@ def handle_info(args, config):
     # eligible is what those commands would actually pick.
     compatible_versions = filter_versions(
         versions,
-        target_platform,
-        vscode_version=vscode_version,
+        ctx.target_platform,
+        vscode_version=ctx.vscode_version,
         include_prerelease=eff_include_prerelease,
         skip_versions=skipped_versions,
     )
@@ -3814,7 +3796,7 @@ def handle_info(args, config):
 
     # Almost everything reported here is gallery metadata, so a missing or
     # broken 'code' binary costs the installed-version line, not the command.
-    installed_exts, installed_error = query_installed_extensions(code_binary)
+    installed_exts, installed_error = query_installed_extensions(ctx.code_binary)
     installed_ver = installed_exts.get(full_id)
     if installed_error:
         installed_status = f"{Colors.YELLOW}Unknown (cannot query VS Code){Colors.ENDC}"

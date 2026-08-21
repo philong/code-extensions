@@ -671,7 +671,7 @@ class TestEffectiveExtOptions(unittest.TestCase):
                 installed,
                 "universal",
                 vscode_version="1.85.0",
-                exclude_prerelease=False,
+                include_prerelease=True,
                 min_release_age=datetime.timedelta(0),
                 extensions_config=extensions_config,
                 **kwargs,
@@ -2645,6 +2645,72 @@ class TestResolveInstalledTargets(unittest.TestCase):
     def test_loose_mode_prefers_the_exact_name(self):
         # Both IDs contain 'python'; the one named exactly 'python' wins.
         self.assertEqual(self._resolve(["python"]), {"ms-python.python": "2024.0.0"})
+
+
+# =====================================================================
+# ExecutionContext Tests
+# =====================================================================
+_BAD_CONFIG = {
+    "min_release_age": "bogus",
+    "service_url": "http://insecure.example.com",
+}
+
+
+class TestExecutionContextLazyOptions(unittest.TestCase):
+    """Settings a command never consults must not be resolved for it."""
+
+    def test_construction_touches_neither_setting(self):
+        # load_config does not check that min_release_age parses, so an invalid
+        # hand-edited value must only fail the commands that actually use it.
+        args = argparse.Namespace(code_binary="code")
+        with (
+            patch.object(ce, "resolve_min_release_age") as mock_age,
+            patch.object(ce, "resolve_service_url") as mock_url,
+        ):
+            ce.ExecutionContext(args, _BAD_CONFIG)
+        mock_age.assert_not_called()
+        mock_url.assert_not_called()
+
+    def test_min_release_age_is_resolved_once_on_demand(self):
+        args = argparse.Namespace(code_binary="code", min_release_age=None)
+        ctx = ce.ExecutionContext(args, {"min_release_age": "2h"})
+        with patch.object(
+            ce,
+            "resolve_min_release_age",
+            wraps=ce.resolve_min_release_age,
+        ) as mock_age:
+            self.assertEqual(ctx.min_release_age, datetime.timedelta(hours=2))
+            self.assertEqual(ctx.min_release_age_str, "2h")
+            self.assertEqual(ctx.min_release_age, datetime.timedelta(hours=2))
+        self.assertEqual(mock_age.call_count, 1)
+
+    def test_insecure_url_warning_waits_for_the_first_use(self):
+        args = argparse.Namespace(code_binary="code", open_vsx=None, service_url=None)
+        ctx = ce.ExecutionContext(args, _BAD_CONFIG)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(ctx.service_url, "http://insecure.example.com")
+        self.assertIn("insecure HTTP", err.getvalue())
+
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.2.0"},
+    )
+    def test_list_survives_an_unparseable_min_release_age(self, mock_installed):
+        args = argparse.Namespace(
+            code_binary="code",
+            query=None,
+            quiet=True,
+            outdated=False,
+        )
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as out,
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            ce.handle_list(args, _BAD_CONFIG)
+
+        self.assertEqual(out.getvalue().strip(), "ms-python.python")
+        self.assertEqual(err.getvalue(), "")
 
 
 # =====================================================================
