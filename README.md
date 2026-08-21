@@ -53,7 +53,17 @@ code-extensions <command> [options]
 * `info` (or `show`): Display detailed metadata and local installation status for an extension.
 * `clean`: Purge cached API response JSON files and temporary VSIX downloads.
 * `config`: View or modify global settings and extension-specific rules in `config.toml`.
-* `remove`: Remove installed extension(s) by ID or interactively select extensions to remove.
+* `completion`: Generate a shell completion script for bash, fish, powershell or zsh.
+* `remove` (or `uninstall`, `rm`): Remove installed extension(s) by ID or interactively select extensions to remove.
+
+### Global Options
+
+Accepted by every command:
+
+* `-b`, `--code-binary <path>`: Path to the VS Code binary/executable or its fork (default: `code`).
+* `-s`, `--service-url <url>`: Extension Gallery service API URL.
+* `--open-vsx`: Use the Open VSX Registry (`https://open-vsx.org/vscode/gallery`) instead of the Marketplace.
+* `--open-vsx-token <token>`: Access token for the Open VSX Registry.
 
 ### 1. `install` Command
 

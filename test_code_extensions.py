@@ -6,6 +6,7 @@ import datetime
 import email
 import http.client
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -2816,6 +2817,56 @@ class TestCliSurfaceTables(unittest.TestCase):
         for name in ce.CANONICAL_SUBCOMMANDS:
             with self.subTest(command=name):
                 self.assertEqual(_help_flags([name]), _table_flags(name))
+
+
+class TestDocumentedCliSurface(unittest.TestCase):
+    """README and dispatch table have to keep up with the tables too."""
+
+    README = os.path.join(os.path.dirname(__file__), "README.md")
+
+    @classmethod
+    def setUpClass(cls):
+        with open(cls.README, encoding="utf-8") as f:
+            cls.readme = f.read()
+
+    def test_every_name_and_alias_has_a_handler(self):
+        # A subcommand registered without a handler would only fail when a user
+        # actually runs it, after argparse has accepted the command line.
+        self.assertEqual(
+            sorted(ce.HANDLERS), sorted(ce.subcommand_names(*ce.CANONICAL_SUBCOMMANDS))
+        )
+
+    def test_every_config_action_is_implemented(self):
+        # handle_config dispatches on the action string, so an action offered by
+        # the parser and the completions but never handled would silently no-op.
+        source = inspect.getsource(ce.handle_config)
+        for action in ce.CONFIG_ACTIONS:
+            for name in (action.name, *action.aliases):
+                with self.subTest(action=name):
+                    self.assertIn(f'"{name}"', source)
+
+    def test_readme_lists_every_command_and_alias(self):
+        commands = self.readme.partition("### Commands")[2].partition("### Global")[0]
+        for name in ce.subcommand_names(*ce.CANONICAL_SUBCOMMANDS):
+            with self.subTest(command=name):
+                self.assertIn(f"`{name}`", commands)
+
+    def test_readme_documents_every_option(self):
+        sections = {
+            m.group(1): m.group(2)
+            for m in re.finditer(
+                r"^### \d+\. `([a-z]+)`.*?Command\s*$(.*?)(?=^### |\Z)",
+                self.readme,
+                re.MULTILINE | re.DOTALL,
+            )
+        }
+        for name in ce.CANONICAL_SUBCOMMANDS:
+            for opt in ce.SUBCOMMAND_OPTIONS[name]:
+                with self.subTest(command=name, option=opt.flags[-1]):
+                    self.assertIn(opt.flags[-1], sections.get(name, ""))
+        for opt in (*ce.GLOBAL_OPTIONS, ce.HELP_OPTION):
+            with self.subTest(option=opt.flags[-1]):
+                self.assertIn(opt.flags[-1], self.readme)
 
 
 class TestCompletionScriptsMatchTheParser(unittest.TestCase):

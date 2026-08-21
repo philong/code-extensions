@@ -4491,6 +4491,22 @@ def handle_completion(args, config):
     sys.stdout.write(script.strip() + "\n")
 
 
+HANDLERS = {
+    "install": handle_install,
+    "update": handle_update,
+    "remove": handle_remove,
+    "list": handle_list,
+    "search": handle_search,
+    "info": handle_info,
+    "clean": handle_clean,
+    "config": handle_config,
+    "completion": handle_completion,
+}
+for _name, _aliases in SUBCOMMAND_ALIASES.items():
+    for _alias in _aliases:
+        HANDLERS[_alias] = HANDLERS[_name]
+
+
 def main():
     enable_colors()
     config = load_config()
@@ -4645,21 +4661,7 @@ def main():
         # subcommand from a successful run of one.
         sys.exit(2)
 
-    handlers = {
-        "install": handle_install,
-        "update": handle_update,
-        "remove": handle_remove,
-        "list": handle_list,
-        "search": handle_search,
-        "info": handle_info,
-        "clean": handle_clean,
-        "config": handle_config,
-        "completion": handle_completion,
-    }
-    for name, aliases in SUBCOMMAND_ALIASES.items():
-        for alias in aliases:
-            handlers[alias] = handlers[name]
-    handlers[args.command](args, config)
+    HANDLERS[args.command](args, config)
 
 
 if __name__ == "__main__":
