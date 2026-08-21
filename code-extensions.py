@@ -3860,7 +3860,10 @@ def handle_info(args, config):
     print(
         f"\n{Colors.BOLD}{Colors.CYAN}{display_name}{Colors.ENDC} ({Colors.BOLD}{full_id}{Colors.ENDC})"
     )
-    print("=" * (len(display_name) + len(full_id) + 5))
+    # Width, not len: CJK and other wide characters occupy two terminal
+    # columns, so an underline sized by len() falls short of the name.
+    # +3 for the ' (' and ')' that wrap the id on the line above.
+    print("=" * (display_width(display_name) + display_width(full_id) + 3))
     print(f"  {Colors.BOLD}Publisher:{Colors.ENDC}   {pub_disp} ({pub_name})")
     print(f"  {Colors.BOLD}Latest Ver:{Colors.ENDC}  v{latest_ver} ({release_date})")
     if is_held_back:
