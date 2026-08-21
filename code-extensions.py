@@ -35,6 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from collections import namedtuple
 from functools import lru_cache
 
 if sys.version_info < (3, 11):
@@ -3923,44 +3924,108 @@ def handle_clean(args, config):
     )
 
 
-FISH_COMPLETION_SCRIPT = """# Fish completion script for code-extensions
+# --- CLI surface shared with the shell completion scripts --------------------
+#
+# The completion scripts repeat the subcommand, alias, config-action and shell
+# names that argparse also needs. Both sides are generated from these tables, so
+# a name added here reaches the parser and all four scripts at once instead of
+# silently going missing from one of them.
+
+CliChoice = namedtuple("CliChoice", "name aliases summary")
+
+SUBCOMMANDS = (
+    CliChoice("install", (), "Install VS Code extension(s)"),
+    CliChoice("update", ("upgrade",), "Check and install updates"),
+    CliChoice("remove", ("uninstall", "rm"), "Remove installed extension(s)"),
+    CliChoice("list", ("ls",), "List installed extensions"),
+    CliChoice("search", (), "Search the extension gallery"),
+    CliChoice("info", ("show",), "Show detailed metadata for an extension"),
+    CliChoice("clean", (), "Purge the API cache and temporary files"),
+    CliChoice("config", (), "View or modify configuration settings"),
+    CliChoice("completion", (), "Generate a shell completion script"),
+)
+
+CONFIG_ACTIONS = (
+    CliChoice("list", (), "List all configuration settings"),
+    CliChoice("get", (), "Get a configuration key value"),
+    CliChoice("set", (), "Set a configuration key value"),
+    CliChoice("unset", ("delete",), "Unset a configuration key"),
+)
+
+COMPLETION_SHELLS = ("bash", "fish", "powershell", "zsh")
+
+CANONICAL_SUBCOMMANDS = tuple(c.name for c in SUBCOMMANDS)
+SUBCOMMAND_ALIASES = {c.name: list(c.aliases) for c in SUBCOMMANDS}
+CONFIG_ACTION_CHOICES = [n for c in CONFIG_ACTIONS for n in (c.name, *c.aliases)]
+
+
+def subcommand_names(*names):
+    """Canonical subcommand names plus their aliases, in registration order."""
+    return [n for name in names for n in (name, *SUBCOMMAND_ALIASES[name])]
+
+
+# @@ALIASES:remove,info@@ expands to those subcommands and their aliases, joined
+# the way the target shell spells a set of alternatives; the other markers are
+# filled in per script below.
+_ALIAS_MARKER_RE = re.compile(r"@@ALIASES:([a-z,]+)@@")
+
+
+def _render_completion(template, join_names, markers):
+    script = _ALIAS_MARKER_RE.sub(
+        lambda m: join_names(subcommand_names(*m.group(1).split(","))), template
+    )
+    for marker, value in markers.items():
+        script = script.replace(f"@@{marker}@@", value)
+    if "@@" in script:
+        # An unresolved marker would be emitted into the user's shell startup.
+        raise RuntimeError(f"unfilled marker in completion script: {script}")
+    return script
+
+
+_FISH_TEMPLATE = """# Fish completion script for code-extensions
 
 complete -c code-extensions -f
 
-complete -c code-extensions -n "__fish_use_subcommand" -a "install" -d "Install VS Code extension(s)"
-complete -c code-extensions -n "__fish_use_subcommand" -a "update" -d "Update installed extensions"
-complete -c code-extensions -n "__fish_use_subcommand" -a "remove" -d "Remove installed extension(s)"
-complete -c code-extensions -n "__fish_use_subcommand" -a "list" -d "List installed extensions"
-complete -c code-extensions -n "__fish_use_subcommand" -a "search" -d "Search extension gallery"
-complete -c code-extensions -n "__fish_use_subcommand" -a "info" -d "Show extension metadata"
-complete -c code-extensions -n "__fish_use_subcommand" -a "clean" -d "Purge cache and temp VSIX files"
-complete -c code-extensions -n "__fish_use_subcommand" -a "config" -d "View or modify configuration"
-complete -c code-extensions -n "__fish_use_subcommand" -a "completion" -d "Generate shell completion script"
+@@SUBCOMMANDS@@
 
 complete -c code-extensions -s b -l code-binary -d "VS Code executable binary or fork" -r
 complete -c code-extensions -s s -l service-url -d "VS Code Extension Gallery service API URL" -r
 complete -c code-extensions -l open-vsx -d "Use Open VSX Registry"
 complete -c code-extensions -s h -l help -d "Show help message"
 
-complete -c code-extensions -n "__fish_seen_subcommand_from config" -a "list get set unset"
-complete -c code-extensions -n "__fish_seen_subcommand_from completion" -a "bash zsh fish powershell"
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:config@@" -a "@@CONFIG_ACTIONS@@"
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:completion@@" -a "@@SHELLS@@"
 
-complete -c code-extensions -n "__fish_seen_subcommand_from install" -s f -l file -d "File containing extension IDs" -r -F
-complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade search list ls" -s p -l include-prerelease -d "Allow pre-release versions"
-complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade search list ls" -s V -l no-code-version-check -d "Disable VS Code version check"
-complete -c code-extensions -n "__fish_seen_subcommand_from update upgrade" -s n -l dry-run -d "Perform dry run without downloading or installing"
-complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade" -s d -l download-dir -d "Download directory for VSIX files" -r -F
-complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade" -s y -l yes -d "Non-interactive mode"
-complete -c code-extensions -n "__fish_seen_subcommand_from install update upgrade search list ls" -s a -l min-release-age -d "Minimum release age threshold" -r
-complete -c code-extensions -n "__fish_seen_subcommand_from install" -l force -d "Force re-installation"
-complete -c code-extensions -n "__fish_seen_subcommand_from search" -s n -l max-results -d "Maximum search results" -r
-complete -c code-extensions -n "__fish_seen_subcommand_from list ls search" -s q -l quiet -d "Output raw extension IDs only"
-complete -c code-extensions -n "__fish_seen_subcommand_from list ls" -s u -l outdated -d "List extensions with updates available"
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install@@" -s f -l file -d "File containing extension IDs" -r -F
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install,update,search,list@@" -s p -l include-prerelease -d "Allow pre-release versions"
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install,update,search,list@@" -s V -l no-code-version-check -d "Disable VS Code version check"
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:update@@" -s n -l dry-run -d "Perform dry run without downloading or installing"
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install,update@@" -s d -l download-dir -d "Download directory for VSIX files" -r -F
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install,update@@" -s y -l yes -d "Non-interactive mode"
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install,update,search,list@@" -s a -l min-release-age -d "Minimum release age threshold" -r
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:install@@" -l force -d "Force re-installation"
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:search@@" -s n -l max-results -d "Maximum search results" -r
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:list,search@@" -s q -l quiet -d "Output raw extension IDs only"
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:list@@" -s u -l outdated -d "List extensions with updates available"
 
-complete -c code-extensions -n "__fish_seen_subcommand_from remove uninstall rm info show update upgrade" -a "(code-extensions list -q 2>/dev/null)"
+complete -c code-extensions -n "__fish_seen_subcommand_from @@ALIASES:remove,info,update@@" -a "(code-extensions list -q 2>/dev/null)"
 """
 
-BASH_COMPLETION_SCRIPT = """# Bash completion script for code-extensions
+FISH_COMPLETION_SCRIPT = _render_completion(
+    _FISH_TEMPLATE,
+    " ".join,
+    {
+        "SUBCOMMANDS": "\n".join(
+            f'complete -c code-extensions -n "__fish_use_subcommand"'
+            f' -a "{c.name}" -d "{c.summary}"'
+            for c in SUBCOMMANDS
+        ),
+        "CONFIG_ACTIONS": " ".join(c.name for c in CONFIG_ACTIONS),
+        "SHELLS": " ".join(COMPLETION_SHELLS),
+    },
+)
+
+_BASH_TEMPLATE = """# Bash completion script for code-extensions
 
 _code_extensions_completion() {
     local cur prev words cword
@@ -3969,9 +4034,9 @@ _code_extensions_completion() {
         prev="${COMP_WORDS[COMP_CWORD-1]}"
     }
 
-    local commands="install update remove list search info clean config completion"
-    local config_actions="list get set unset"
-    local shells="bash zsh fish powershell"
+    local commands="@@COMMANDS@@"
+    local config_actions="@@CONFIG_ACTIONS@@"
+    local shells="@@SHELLS@@"
 
     if [[ $COMP_CWORD -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -3981,17 +4046,17 @@ _code_extensions_completion() {
     local cmd="${COMP_WORDS[1]}"
 
     case "$cmd" in
-        config)
+        @@ALIASES:config@@)
             if [[ $COMP_CWORD -eq 2 ]]; then
                 COMPREPLY=( $(compgen -W "$config_actions" -- "$cur") )
             fi
             ;;
-        completion)
+        @@ALIASES:completion@@)
             if [[ $COMP_CWORD -eq 2 ]]; then
                 COMPREPLY=( $(compgen -W "$shells" -- "$cur") )
             fi
             ;;
-        remove|uninstall|rm|info|show)
+        @@ALIASES:remove,info@@)
             if [[ "$cur" == -* ]]; then
                 COMPREPLY=( $(compgen -W "-y --yes -h --help" -- "$cur") )
             else
@@ -4000,10 +4065,10 @@ _code_extensions_completion() {
                 COMPREPLY=( $(compgen -W "$installed" -- "$cur") )
             fi
             ;;
-        install)
+        @@ALIASES:install@@)
             COMPREPLY=( $(compgen -W "-f --file -p --include-prerelease -V --no-code-version-check -d --download-dir -y --yes -a --min-release-age --force -h --help" -- "$cur") )
             ;;
-        update|upgrade)
+        @@ALIASES:update@@)
             if [[ "$cur" == -* ]]; then
                 COMPREPLY=( $(compgen -W "-p --include-prerelease -n --dry-run -V --no-code-version-check -d --download-dir -y --yes -a --min-release-age -h --help" -- "$cur") )
             else
@@ -4012,10 +4077,10 @@ _code_extensions_completion() {
                 COMPREPLY=( $(compgen -W "$installed" -- "$cur") )
             fi
             ;;
-        list|ls)
+        @@ALIASES:list@@)
             COMPREPLY=( $(compgen -W "-q --quiet -u --outdated -p --include-prerelease -V --no-code-version-check -a --min-release-age -h --help" -- "$cur") )
             ;;
-        search)
+        @@ALIASES:search@@)
             COMPREPLY=( $(compgen -W "-n --max-results -q --quiet -p --include-prerelease -V --no-code-version-check -a --min-release-age -h --help" -- "$cur") )
             ;;
         *)
@@ -4027,32 +4092,31 @@ _code_extensions_completion() {
 complete -F _code_extensions_completion code-extensions
 """
 
-ZSH_COMPLETION_SCRIPT = """#compdef code-extensions
+BASH_COMPLETION_SCRIPT = _render_completion(
+    _BASH_TEMPLATE,
+    "|".join,
+    {
+        "COMMANDS": " ".join(CANONICAL_SUBCOMMANDS),
+        "CONFIG_ACTIONS": " ".join(c.name for c in CONFIG_ACTIONS),
+        "SHELLS": " ".join(COMPLETION_SHELLS),
+    },
+)
+
+_ZSH_TEMPLATE = """#compdef code-extensions
 
 _code_extensions() {
     local -a commands
     commands=(
-        'install:Install VS Code extension(s)'
-        'update:Check and install updates'
-        'remove:Remove installed extension(s)'
-        'list:List installed extensions'
-        'search:Search extension gallery'
-        'info:Show detailed metadata for an extension'
-        'clean:Purge API cache and temporary files'
-        'config:View or modify configuration settings'
-        'completion:Generate shell completion script'
+@@ZSH_COMMANDS@@
     )
 
     local -a config_actions
     config_actions=(
-        'list:List all configuration settings'
-        'get:Get a configuration key value'
-        'set:Set a configuration key value'
-        'unset:Unset a configuration key'
+@@ZSH_CONFIG_ACTIONS@@
     )
 
     local -a shells
-    shells=('bash' 'zsh' 'fish' 'powershell')
+    shells=(@@ZSH_SHELLS@@)
 
     _arguments -C \\
         '(-b --code-binary)'{-b,--code-binary}'[Path to VS Code binary/executable]:binary:_files' \\
@@ -4068,18 +4132,18 @@ _code_extensions() {
             ;;
         args)
             case $words[1] in
-                config)
+                @@ALIASES:config@@)
                     _values 'config action' $config_actions
                     ;;
-                completion)
+                @@ALIASES:completion@@)
                     _values 'shell' $shells
                     ;;
-                remove|uninstall|rm|info|show)
+                @@ALIASES:remove,info@@)
                     local -a installed
                     installed=($(code-extensions list -q 2>/dev/null))
                     _values 'installed extensions' $installed
                     ;;
-                update|upgrade)
+                @@ALIASES:update@@)
                     local -a installed
                     installed=($(code-extensions list -q 2>/dev/null))
                     _arguments \\
@@ -4091,7 +4155,7 @@ _code_extensions() {
                         '(-a --min-release-age)'{-a,--min-release-age}'[Minimum release age threshold]:age:' \\
                         '*:installed extension:($installed)'
                     ;;
-                install)
+                @@ALIASES:install@@)
                     _arguments \\
                         '(-f --file)'{-f,--file}'[File containing extension IDs]:file:_files' \\
                         '(-p --include-prerelease)'{-p,--include-prerelease}'[Allow pre-release versions]' \\
@@ -4101,7 +4165,7 @@ _code_extensions() {
                         '(-a --min-release-age)'{-a,--min-release-age}'[Minimum release age threshold]:age:' \\
                         '--force[Force re-installation]'
                     ;;
-                list|ls)
+                @@ALIASES:list@@)
                     _arguments \\
                         '(-q --quiet)'{-q,--quiet}'[Output raw extension IDs only]' \\
                         '(-u --outdated)'{-u,--outdated}'[List extensions with updates available]' \\
@@ -4109,7 +4173,7 @@ _code_extensions() {
                         '(-V --no-code-version-check)'{-V,--no-code-version-check}'[Disable VS Code version check]' \\
                         '(-a --min-release-age)'{-a,--min-release-age}'[Minimum release age threshold]:age:'
                     ;;
-                search)
+                @@ALIASES:search@@)
                     _arguments \\
                         '(-n --max-results)'{-n,--max-results}'[Maximum search results]:number:' \\
                         '(-q --quiet)'{-q,--quiet}'[Output raw extension IDs only]' \\
@@ -4125,7 +4189,21 @@ _code_extensions() {
 _code_extensions "$@"
 """
 
-POWERSHELL_COMPLETION_SCRIPT = """# PowerShell completion script for code-extensions
+ZSH_COMPLETION_SCRIPT = _render_completion(
+    _ZSH_TEMPLATE,
+    "|".join,
+    {
+        "ZSH_COMMANDS": "\n".join(
+            f"        '{c.name}:{c.summary}'" for c in SUBCOMMANDS
+        ),
+        "ZSH_CONFIG_ACTIONS": "\n".join(
+            f"        '{c.name}:{c.summary}'" for c in CONFIG_ACTIONS
+        ),
+        "ZSH_SHELLS": " ".join(f"'{sh}'" for sh in COMPLETION_SHELLS),
+    },
+)
+
+_POWERSHELL_TEMPLATE = """# PowerShell completion script for code-extensions
 
 Register-ArgumentCompleter -Native -CommandName 'code-extensions' -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
@@ -4133,9 +4211,9 @@ Register-ArgumentCompleter -Native -CommandName 'code-extensions' -ScriptBlock {
     $commandElements = $commandAst.CommandElements
     $command = $commandElements[1].Value
 
-    $subcommands = @('install', 'update', 'remove', 'list', 'search', 'info', 'clean', 'config', 'completion')
-    $configActions = @('list', 'get', 'set', 'unset')
-    $shells = @('bash', 'zsh', 'fish', 'powershell')
+    $subcommands = @@PS_COMMANDS@@
+    $configActions = @@PS_CONFIG_ACTIONS@@
+    $shells = @@PS_SHELLS@@
 
     if ($commandElements.Count -eq 2) {
         $subcommands | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
@@ -4145,21 +4223,21 @@ Register-ArgumentCompleter -Native -CommandName 'code-extensions' -ScriptBlock {
     }
 
     switch ($command) {
-        'config' {
+        { $_ -in @@ALIASES:config@@ } {
             if ($commandElements.Count -eq 3) {
                 $configActions | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
                     [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
                 }
             }
         }
-        'completion' {
+        { $_ -in @@ALIASES:completion@@ } {
             if ($commandElements.Count -eq 3) {
                 $shells | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
                     [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
                 }
             }
         }
-        { $_ -in @('remove', 'uninstall', 'rm', 'info', 'show', 'update', 'upgrade') } {
+        { $_ -in @@ALIASES:remove,info,update@@ } {
             $installed = code-extensions list -q 2>$null
             $installed | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
                 [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
@@ -4170,36 +4248,39 @@ Register-ArgumentCompleter -Native -CommandName 'code-extensions' -ScriptBlock {
 """
 
 
+def _ps_array(names):
+    return "@(" + ", ".join(f"'{n}'" for n in names) + ")"
+
+
+POWERSHELL_COMPLETION_SCRIPT = _render_completion(
+    _POWERSHELL_TEMPLATE,
+    _ps_array,
+    {
+        "PS_COMMANDS": _ps_array(CANONICAL_SUBCOMMANDS),
+        "PS_CONFIG_ACTIONS": _ps_array([c.name for c in CONFIG_ACTIONS]),
+        "PS_SHELLS": _ps_array(COMPLETION_SHELLS),
+    },
+)
+
+SHELL_COMPLETION_SCRIPTS = {
+    "bash": BASH_COMPLETION_SCRIPT,
+    "fish": FISH_COMPLETION_SCRIPT,
+    "powershell": POWERSHELL_COMPLETION_SCRIPT,
+    "zsh": ZSH_COMPLETION_SCRIPT,
+}
+
+
 def handle_completion(args, config):
     shell = args.shell.lower().strip()
-    if shell == "fish":
-        sys.stdout.write(FISH_COMPLETION_SCRIPT.strip() + "\n")
-    elif shell == "bash":
-        sys.stdout.write(BASH_COMPLETION_SCRIPT.strip() + "\n")
-    elif shell == "zsh":
-        sys.stdout.write(ZSH_COMPLETION_SCRIPT.strip() + "\n")
-    elif shell == "powershell":
-        sys.stdout.write(POWERSHELL_COMPLETION_SCRIPT.strip() + "\n")
-    else:
+    script = SHELL_COMPLETION_SCRIPTS.get(shell)
+    if script is None:
         print(
-            f"{Colors.RED}Error: Unsupported shell '{shell}'. Supported: bash, fish, powershell, zsh{Colors.ENDC}",
+            f"{Colors.RED}Error: Unsupported shell '{shell}'. "
+            f"Supported: {', '.join(COMPLETION_SHELLS)}{Colors.ENDC}",
             file=sys.stderr,
         )
         sys.exit(1)
-
-
-# Canonical subcommand names, aliases excluded, in the order they are registered.
-CANONICAL_SUBCOMMANDS = (
-    "install",
-    "update",
-    "remove",
-    "list",
-    "search",
-    "info",
-    "clean",
-    "config",
-    "completion",
-)
+    sys.stdout.write(script.strip() + "\n")
 
 
 def main():
@@ -4325,7 +4406,7 @@ def main():
     # Update sub-parser
     parser_update = subparsers.add_parser(
         "update",
-        aliases=["upgrade"],
+        aliases=SUBCOMMAND_ALIASES["update"],
         parents=[
             parent_parser,
             version_filter_parser,
@@ -4350,7 +4431,7 @@ def main():
     # Remove sub-parser
     parser_remove = subparsers.add_parser(
         "remove",
-        aliases=["uninstall", "rm"],
+        aliases=SUBCOMMAND_ALIASES["remove"],
         parents=[parent_parser, yes_parser],
         help="Remove installed extension(s)",
     )
@@ -4364,7 +4445,7 @@ def main():
     # List sub-parser
     parser_list = subparsers.add_parser(
         "list",
-        aliases=["ls"],
+        aliases=SUBCOMMAND_ALIASES["list"],
         parents=[parent_parser, version_filter_parser, quiet_parser],
         help="List installed extension(s)",
     )
@@ -4403,7 +4484,7 @@ def main():
     # Info / Show sub-parser
     parser_info = subparsers.add_parser(
         "info",
-        aliases=["show"],
+        aliases=SUBCOMMAND_ALIASES["info"],
         parents=[parent_parser],
         help="Show detailed metadata for an extension",
     )
@@ -4428,7 +4509,7 @@ def main():
     parser_config.add_argument(
         "action",
         nargs="?",
-        choices=["list", "get", "set", "unset", "delete"],
+        choices=CONFIG_ACTION_CHOICES,
         default="list",
         help="Action to perform: list, get, set, unset",
     )
@@ -4449,11 +4530,11 @@ def main():
     parser_completion = subparsers.add_parser(
         "completion",
         parents=[parent_parser],
-        help="Generate shell completion script (bash, fish, powershell, zsh)",
+        help=f"Generate shell completion script ({', '.join(COMPLETION_SHELLS)})",
     )
     parser_completion.add_argument(
         "shell",
-        choices=["bash", "fish", "powershell", "zsh"],
+        choices=COMPLETION_SHELLS,
         help="Target shell environment",
     )
 
@@ -4473,19 +4554,17 @@ def main():
     handlers = {
         "install": handle_install,
         "update": handle_update,
-        "upgrade": handle_update,
         "remove": handle_remove,
-        "uninstall": handle_remove,
-        "rm": handle_remove,
         "list": handle_list,
-        "ls": handle_list,
         "search": handle_search,
         "info": handle_info,
-        "show": handle_info,
         "clean": handle_clean,
         "config": handle_config,
         "completion": handle_completion,
     }
+    for name, aliases in SUBCOMMAND_ALIASES.items():
+        for alias in aliases:
+            handlers[alias] = handlers[name]
     handlers[args.command](args, config)
 
 
