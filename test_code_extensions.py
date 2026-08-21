@@ -1929,6 +1929,34 @@ class TestHandleUpdateIntegration(unittest.TestCase):
         self.assertIn("--install-extension", mock_run.call_args[0][0])
 
     @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix", side_effect=OSError("connection reset"))
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.1.0"},
+    )
+    @patch.object(ce, "check_updates")
+    def test_handle_update_failed_install_exits_nonzero(
+        self, mock_check, mock_installed, mock_vsver, mock_download, mock_run
+    ):
+        mock_check.return_value = [make_mock_update()]
+        args = self.update_args()
+
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+            self.assertRaises(SystemExit) as exit_ctx,
+        ):
+            ce.handle_update(args, self.config)
+
+        # An update that installed nothing must not look like a clean run to
+        # whatever scheduled it.
+        self.assertEqual(exit_ctx.exception.code, 1)
+        self.assertIn("failed to update", err.getvalue())
+        mock_run.assert_not_called()
+
+    @patch.object(ce, "run_code_cmd")
     @patch.object(ce, "download_vsix")
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(

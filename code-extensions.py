@@ -3336,6 +3336,7 @@ def handle_update(args, config):
 
     download_dir_resolved, download_dir_is_temp = resolve_download_target(args, config)
 
+    failures = []
     try:
         for update in selected_updates:
             pub_name = update["publisher"]
@@ -3348,7 +3349,7 @@ def handle_update(args, config):
                 vsix_filename(pub_name, ext_name, version, platform),
             )
 
-            download_and_install(
+            installed_ok = download_and_install(
                 ctx.code_binary,
                 url,
                 filepath,
@@ -3359,10 +3360,19 @@ def handle_update(args, config):
                 service_url=ctx.service_url,
                 cleanup=download_dir_is_temp,
             )
+            if not installed_ok:
+                failures.append(update["id"])
 
     finally:
         # same as install: `clean` is a backstop, not the plan.
         discard_download_dir(download_dir_resolved, download_dir_is_temp)
+
+    if failures:
+        print(
+            f"{Colors.RED}✗ {len(failures)} of the selected extension(s) failed to update.{Colors.ENDC}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def select_removals(installed_exts):
