@@ -1690,12 +1690,56 @@ class TestHandleInstallIntegration(unittest.TestCase):
         with (
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()) as err,
+            self.assertRaises(SystemExit) as exit_ctx,
         ):
             ce.handle_install(args, self.config)
 
-        # A rejected package is a reported failure, not a traceback.
+        # A rejected package is a reported failure, not a traceback, and it
+        # has to be distinguishable from a successful install.
+        self.assertEqual(exit_ctx.exception.code, 1)
         self.assertIn("Download failed", err.getvalue())
         mock_run.assert_not_called()
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_install_partial_failure_exits_nonzero(
+        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
+    ):
+        mock_query.return_value = {
+            "ms-python.python": make_mock_gallery_extension(
+                "ms-python", "python", "2024.2.0"
+            )
+        }
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=["no-such.gone", "ms-python.python"],
+            file=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            yes=True,
+            min_release_age="0",
+            download_dir=None,
+            force=False,
+        )
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+            self.assertRaises(SystemExit) as exit_ctx,
+        ):
+            ce.handle_install(args, self.config)
+
+        # The missing extension fails the run, but must not stop the
+        # requested ones from being installed first.
+        self.assertEqual(exit_ctx.exception.code, 1)
+        self.assertIn("not found", err.getvalue())
+        mock_download.assert_called_once()
+        mock_run.assert_called_once()
 
     @patch.object(ce, "download_vsix")
     @patch.object(ce, "get_installed_extensions", return_value={})

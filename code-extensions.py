@@ -2603,6 +2603,7 @@ def handle_install(args, config):
         sys.exit(1)
 
     parsed_targets = []
+    failures = []
     for spec in target_specs:
         spec = spec.strip()
         if "@" in spec:
@@ -2619,6 +2620,7 @@ def handle_install(args, config):
                 f"{Colors.RED}Error: Invalid extension ID '{spec}'. Expected format 'publisher.name' or 'publisher.name@version'.{Colors.ENDC}",
                 file=sys.stderr,
             )
+            failures.append(ext_id_lower)
             continue
         parsed_targets.append((ext_id_lower, req_ver))
 
@@ -2644,6 +2646,7 @@ def handle_install(args, config):
                 f"{Colors.RED}✗ Extension '{ext_id}' not found on extension gallery.{Colors.ENDC}",
                 file=sys.stderr,
             )
+            failures.append(ext_id)
             continue
 
         pub_name = ext_obj.get("publisher", {}).get("publisherName", "")
@@ -2688,6 +2691,7 @@ def handle_install(args, config):
                 print(
                     f"{Colors.RED}✗ No compatible version of '{full_id}' found.{Colors.ENDC}"
                 )
+            failures.append(full_id)
             continue
 
         latest_ver_obj = compatible_versions[0]
@@ -2704,7 +2708,13 @@ def handle_install(args, config):
                     f"{Colors.YELLOW}Warning: Requested version '{req_ver}' of '{full_id}' was released less than {eff_min_age} ago.{Colors.ENDC}"
                 )
                 if not ctx.yes:
-                    if not sys.stdin.isatty() or not prompt_yes_no(
+                    if not sys.stdin.isatty():
+                        # Nobody to ask, so the age gate stands: that is a
+                        # failure for whoever scripted the install.
+                        print(f"Skipping installation of '{full_id}@{req_ver}'.")
+                        failures.append(full_id)
+                        continue
+                    if not prompt_yes_no(
                         f"Do you want to install '{full_id}@{req_ver}' despite minimum release age policy?"
                     ):
                         print(f"Skipping installation of '{full_id}@{req_ver}'.")
@@ -2738,6 +2748,7 @@ def handle_install(args, config):
                     print(
                         f"{Colors.RED}Skipping '{full_id}' (held back by release age requirement). Use --min-release-age 0 to override.{Colors.ENDC}"
                     )
+                    failures.append(full_id)
                     continue
 
         target_version = selected_ver_obj["version"]
@@ -2772,7 +2783,7 @@ def handle_install(args, config):
 
         # Downgrading to an older version needs --force, just like a
         # re-install of the same version does.
-        download_and_install(
+        installed_ok = download_and_install(
             ctx.code_binary,
             url,
             filepath,
@@ -2788,8 +2799,17 @@ def handle_install(args, config):
             ),
             cleanup=download_dir_is_temp,
         )
+        if not installed_ok:
+            failures.append(full_id)
 
     discard_download_dir(download_dir_resolved, download_dir_is_temp)
+
+    if failures:
+        print(
+            f"{Colors.RED}✗ {len(failures)} of the requested extension(s) failed to install.{Colors.ENDC}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def check_updates(
