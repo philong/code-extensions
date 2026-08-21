@@ -990,34 +990,16 @@ def load_config():
         ext_id_lower = str(ext_id).strip().lower()
         norm_ext_cfg = {}
 
-        if "ignore" in ext_data:
-            val = ext_data["ignore"]
-            if isinstance(val, bool):
-                norm_ext_cfg["ignore"] = val
-            elif isinstance(val, str) and val.strip().lower() in ("true", "false"):
-                norm_ext_cfg["ignore"] = val.strip().lower() == "true"
-
-        for prerelease_key in ("include_prerelease", "include-prerelease"):
-            if prerelease_key in ext_data:
-                val = ext_data[prerelease_key]
-                if isinstance(val, bool):
-                    norm_ext_cfg["include_prerelease"] = val
-                elif isinstance(val, str) and val.strip().lower() in ("true", "false"):
-                    norm_ext_cfg["include_prerelease"] = val.strip().lower() == "true"
-
-        for age_key in ("min_release_age", "min-release-age"):
-            if age_key in ext_data:
-                norm_ext_cfg["min_release_age"] = str(ext_data[age_key])
-
-        for skip_key in ("skip_versions", "skip-versions"):
-            if skip_key in ext_data:
-                val = ext_data[skip_key]
-                if isinstance(val, str):
-                    norm_ext_cfg["skip_versions"] = [val]
-                elif isinstance(val, list):
-                    norm_ext_cfg["skip_versions"] = [str(v) for v in val]
-                else:
-                    norm_ext_cfg["skip_versions"] = [str(val)]
+        for key, val in ext_data.items():
+            norm_key = key.replace("-", "_")
+            if norm_key not in EXT_OPTION_TYPES:
+                continue
+            try:
+                norm_ext_cfg[norm_key] = coerce_config_value(
+                    val, EXT_OPTION_TYPES[norm_key]
+                )
+            except ValueError:
+                pass
 
         config["extensions"][ext_id_lower] = norm_ext_cfg
 
