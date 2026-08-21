@@ -2675,170 +2675,175 @@ def handle_install(args, config):
 
     download_dir_resolved, download_dir_is_temp = resolve_download_target(args, config)
 
-    for ext_id, req_ver in parsed_targets:
-        ext_obj = marketplace_data.get(ext_id)
-        if not ext_obj:
-            print(
-                f"{Colors.RED}✗ Extension '{ext_id}' not found on extension gallery.{Colors.ENDC}",
-                file=sys.stderr,
+    try:
+        for ext_id, req_ver in parsed_targets:
+            ext_obj = marketplace_data.get(ext_id)
+            if not ext_obj:
+                print(
+                    f"{Colors.RED}✗ Extension '{ext_id}' not found on extension gallery.{Colors.ENDC}",
+                    file=sys.stderr,
+                )
+                failures.append(ext_id)
+                continue
+
+            pub_name = ext_obj.get("publisher", {}).get("publisherName", "")
+            ext_name = ext_obj.get("extensionName", "")
+            full_id = f"{pub_name}.{ext_name}".lower()
+
+            ext_cfg = ctx.extensions_config.get(full_id, {})
+            eff_include_prerelease, eff_min_age, eff_min_age_str = (
+                effective_ext_options(
+                    ext_cfg,
+                    ctx.include_prerelease,
+                    ctx.min_release_age,
+                    ctx.min_release_age_str,
+                    # bool() rather than `is not None`: programmatic callers (the
+                    # search TUI, the test suite) pass False to mean "flag not
+                    # given", which `is not None` would read as an override.
+                    cli_include_prerelease_override=bool(
+                        getattr(args, "include_prerelease", None)
+                    ),
+                    cli_min_release_age_override=args.min_release_age is not None,
+                )
             )
-            failures.append(ext_id)
-            continue
 
-        pub_name = ext_obj.get("publisher", {}).get("publisherName", "")
-        ext_name = ext_obj.get("extensionName", "")
-        full_id = f"{pub_name}.{ext_name}".lower()
+            # An explicitly requested version overrides the config's opinion about
+            # pre-releases and skipped versions, the same way it overrides the
+            # min-release-age gate below.
+            skipped_versions = [] if req_ver else ext_cfg.get("skip_versions", [])
 
-        ext_cfg = ctx.extensions_config.get(full_id, {})
-        eff_include_prerelease, eff_min_age, eff_min_age_str = effective_ext_options(
-            ext_cfg,
-            ctx.include_prerelease,
-            ctx.min_release_age,
-            ctx.min_release_age_str,
-            # bool() rather than `is not None`: programmatic callers (the
-            # search TUI, the test suite) pass False to mean "flag not
-            # given", which `is not None` would read as an override.
-            cli_include_prerelease_override=bool(
-                getattr(args, "include_prerelease", None)
-            ),
-            cli_min_release_age_override=args.min_release_age is not None,
-        )
+            compatible_versions = filter_versions(
+                ext_obj.get("versions", []),
+                ctx.target_platform,
+                vscode_version=ctx.vscode_version,
+                include_prerelease=eff_include_prerelease or bool(req_ver),
+                skip_versions=skipped_versions,
+                required_version=req_ver,
+            )
 
-        # An explicitly requested version overrides the config's opinion about
-        # pre-releases and skipped versions, the same way it overrides the
-        # min-release-age gate below.
-        skipped_versions = [] if req_ver else ext_cfg.get("skip_versions", [])
+            if not compatible_versions:
+                if req_ver:
+                    print(
+                        f"{Colors.RED}✗ Version '{req_ver}' for '{full_id}' not found or incompatible with host platform/VS Code.{Colors.ENDC}"
+                    )
+                else:
+                    print(
+                        f"{Colors.RED}✗ No compatible version of '{full_id}' found.{Colors.ENDC}"
+                    )
+                failures.append(full_id)
+                continue
 
-        compatible_versions = filter_versions(
-            ext_obj.get("versions", []),
-            ctx.target_platform,
-            vscode_version=ctx.vscode_version,
-            include_prerelease=eff_include_prerelease or bool(req_ver),
-            skip_versions=skipped_versions,
-            required_version=req_ver,
-        )
+            latest_ver_obj = compatible_versions[0]
+            eligible_ver_obj = first_eligible_version(compatible_versions, eff_min_age)
 
-        if not compatible_versions:
+            selected_ver_obj = None
+
             if req_ver:
-                print(
-                    f"{Colors.RED}✗ Version '{req_ver}' for '{full_id}' not found or incompatible with host platform/VS Code.{Colors.ENDC}"
-                )
+                target_ver_obj = compatible_versions[0]
+                is_too_fresh = not released_long_enough(target_ver_obj, eff_min_age)
+
+                if is_too_fresh:
+                    print(
+                        f"{Colors.YELLOW}Warning: Requested version '{req_ver}' of '{full_id}' was released less than {eff_min_age} ago.{Colors.ENDC}"
+                    )
+                    if not ctx.yes:
+                        if not sys.stdin.isatty():
+                            # Nobody to ask, so the age gate stands: that is a
+                            # failure for whoever scripted the install.
+                            print(f"Skipping installation of '{full_id}@{req_ver}'.")
+                            failures.append(full_id)
+                            continue
+                        if not prompt_yes_no(
+                            f"Do you want to install '{full_id}@{req_ver}' despite minimum release age policy?"
+                        ):
+                            print(f"Skipping installation of '{full_id}@{req_ver}'.")
+                            continue
+                    else:
+                        print(
+                            f"Installing '{full_id}@{req_ver}' due to explicit version parameter."
+                        )
+                selected_ver_obj = target_ver_obj
             else:
-                print(
-                    f"{Colors.RED}✗ No compatible version of '{full_id}' found.{Colors.ENDC}"
-                )
-            failures.append(full_id)
-            continue
-
-        latest_ver_obj = compatible_versions[0]
-        eligible_ver_obj = first_eligible_version(compatible_versions, eff_min_age)
-
-        selected_ver_obj = None
-
-        if req_ver:
-            target_ver_obj = compatible_versions[0]
-            is_too_fresh = not released_long_enough(target_ver_obj, eff_min_age)
-
-            if is_too_fresh:
-                print(
-                    f"{Colors.YELLOW}Warning: Requested version '{req_ver}' of '{full_id}' was released less than {eff_min_age} ago.{Colors.ENDC}"
-                )
-                if not ctx.yes:
-                    if not sys.stdin.isatty():
-                        # Nobody to ask, so the age gate stands: that is a
-                        # failure for whoever scripted the install.
-                        print(f"Skipping installation of '{full_id}@{req_ver}'.")
+                if eligible_ver_obj:
+                    selected_ver_obj = eligible_ver_obj
+                    if eligible_ver_obj != latest_ver_obj:
+                        print(
+                            f"{Colors.YELLOW}Notice: Latest version '{latest_ver_obj['version']}' of '{full_id}' is held back by minimum release age policy ({eff_min_age_str}). Installing latest eligible version '{eligible_ver_obj['version']}'.{Colors.ENDC}"
+                        )
+                else:
+                    latest_ver_str = latest_ver_obj["version"]
+                    print(
+                        f"{Colors.YELLOW}Warning: Latest version '{latest_ver_str}' of '{full_id}' is held back by minimum release age policy, and no older compatible release was found.{Colors.ENDC}"
+                    )
+                    if not ctx.yes and sys.stdin.isatty():
+                        if prompt_yes_no(
+                            f"Install held-back version '{latest_ver_str}' anyway?"
+                        ):
+                            selected_ver_obj = latest_ver_obj
+                        else:
+                            print(f"Skipping '{full_id}'.")
+                            continue
+                    else:
+                        print(
+                            f"{Colors.RED}Skipping '{full_id}' (held back by release age requirement). Use --min-release-age 0 to override.{Colors.ENDC}"
+                        )
                         failures.append(full_id)
                         continue
-                    if not prompt_yes_no(
-                        f"Do you want to install '{full_id}@{req_ver}' despite minimum release age policy?"
-                    ):
-                        print(f"Skipping installation of '{full_id}@{req_ver}'.")
-                        continue
-                else:
+
+            target_version = selected_ver_obj["version"]
+            installed_ver = installed_exts.get(full_id)
+            force = getattr(args, "force", False)
+
+            if installed_ver and not force and not req_ver:
+                parsed_installed = parse_version(installed_ver)
+                parsed_target = parse_version(target_version)
+                if parsed_installed == parsed_target:
                     print(
-                        f"Installing '{full_id}@{req_ver}' due to explicit version parameter."
+                        f"  {Colors.GREEN}✓ Extension '{full_id}' is already installed at version v{installed_ver} (latest eligible version). Skipping.{Colors.ENDC}"
                     )
-            selected_ver_obj = target_ver_obj
-        else:
-            if eligible_ver_obj:
-                selected_ver_obj = eligible_ver_obj
-                if eligible_ver_obj != latest_ver_obj:
+                    continue
+                elif parsed_installed > parsed_target:
                     print(
-                        f"{Colors.YELLOW}Notice: Latest version '{latest_ver_obj['version']}' of '{full_id}' is held back by minimum release age policy ({eff_min_age_str}). Installing latest eligible version '{eligible_ver_obj['version']}'.{Colors.ENDC}"
+                        f"  {Colors.GREEN}✓ Extension '{full_id}' is already installed at newer version v{installed_ver} (eligible version is v{target_version}). Skipping.{Colors.ENDC}"
                     )
-            else:
-                latest_ver_str = latest_ver_obj["version"]
-                print(
-                    f"{Colors.YELLOW}Warning: Latest version '{latest_ver_str}' of '{full_id}' is held back by minimum release age policy, and no older compatible release was found.{Colors.ENDC}"
-                )
-                if not ctx.yes and sys.stdin.isatty():
-                    if prompt_yes_no(
-                        f"Install held-back version '{latest_ver_str}' anyway?"
-                    ):
-                        selected_ver_obj = latest_ver_obj
-                    else:
-                        print(f"Skipping '{full_id}'.")
-                        continue
-                else:
-                    print(
-                        f"{Colors.RED}Skipping '{full_id}' (held back by release age requirement). Use --min-release-age 0 to override.{Colors.ENDC}"
-                    )
-                    failures.append(full_id)
                     continue
 
-        target_version = selected_ver_obj["version"]
-        installed_ver = installed_exts.get(full_id)
-        force = getattr(args, "force", False)
+            target_plat = selected_ver_obj.get("targetPlatform") or "universal"
+            url = get_vsix_download_url(
+                selected_ver_obj,
+                pub_name,
+                ext_name,
+                target_version,
+                target_plat,
+                ctx.service_url,
+            )
+            filename = vsix_filename(pub_name, ext_name, target_version, target_plat)
+            filepath = os.path.join(download_dir_resolved, filename)
 
-        if installed_ver and not force and not req_ver:
-            parsed_installed = parse_version(installed_ver)
-            parsed_target = parse_version(target_version)
-            if parsed_installed == parsed_target:
-                print(
-                    f"  {Colors.GREEN}✓ Extension '{full_id}' is already installed at version v{installed_ver} (latest eligible version). Skipping.{Colors.ENDC}"
-                )
-                continue
-            elif parsed_installed > parsed_target:
-                print(
-                    f"  {Colors.GREEN}✓ Extension '{full_id}' is already installed at newer version v{installed_ver} (eligible version is v{target_version}). Skipping.{Colors.ENDC}"
-                )
-                continue
+            # Downgrading to an older version needs --force, just like a
+            # re-install of the same version does.
+            installed_ok = download_and_install(
+                ctx.code_binary,
+                url,
+                filepath,
+                full_id,
+                target_version,
+                target_plat,
+                token=ctx.token,
+                service_url=ctx.service_url,
+                force=force
+                or bool(
+                    installed_ver
+                    and parse_version(installed_ver) > parse_version(target_version)
+                ),
+                cleanup=download_dir_is_temp,
+            )
+            if not installed_ok:
+                failures.append(full_id)
 
-        target_plat = selected_ver_obj.get("targetPlatform") or "universal"
-        url = get_vsix_download_url(
-            selected_ver_obj,
-            pub_name,
-            ext_name,
-            target_version,
-            target_plat,
-            ctx.service_url,
-        )
-        filename = vsix_filename(pub_name, ext_name, target_version, target_plat)
-        filepath = os.path.join(download_dir_resolved, filename)
-
-        # Downgrading to an older version needs --force, just like a
-        # re-install of the same version does.
-        installed_ok = download_and_install(
-            ctx.code_binary,
-            url,
-            filepath,
-            full_id,
-            target_version,
-            target_plat,
-            token=ctx.token,
-            service_url=ctx.service_url,
-            force=force
-            or bool(
-                installed_ver
-                and parse_version(installed_ver) > parse_version(target_version)
-            ),
-            cleanup=download_dir_is_temp,
-        )
-        if not installed_ok:
-            failures.append(full_id)
-
-    discard_download_dir(download_dir_resolved, download_dir_is_temp)
+    finally:
+        # An exit or Ctrl-C mid-batch must not leak the private temp directory;
+        discard_download_dir(download_dir_resolved, download_dir_is_temp)
 
     if failures:
         print(
@@ -3327,29 +3332,33 @@ def handle_update(args, config):
 
     download_dir_resolved, download_dir_is_temp = resolve_download_target(args, config)
 
-    for update in selected_updates:
-        pub_name = update["publisher"]
-        ext_name = update["name"]
-        version = update["eligible"]
-        platform = update["eligible_platform"]
-        url = resolve_update_url(update, ctx.service_url)
-        filepath = os.path.join(
-            download_dir_resolved, vsix_filename(pub_name, ext_name, version, platform)
-        )
+    try:
+        for update in selected_updates:
+            pub_name = update["publisher"]
+            ext_name = update["name"]
+            version = update["eligible"]
+            platform = update["eligible_platform"]
+            url = resolve_update_url(update, ctx.service_url)
+            filepath = os.path.join(
+                download_dir_resolved,
+                vsix_filename(pub_name, ext_name, version, platform),
+            )
 
-        download_and_install(
-            ctx.code_binary,
-            url,
-            filepath,
-            update["id"],
-            version,
-            platform,
-            token=ctx.token,
-            service_url=ctx.service_url,
-            cleanup=download_dir_is_temp,
-        )
+            download_and_install(
+                ctx.code_binary,
+                url,
+                filepath,
+                update["id"],
+                version,
+                platform,
+                token=ctx.token,
+                service_url=ctx.service_url,
+                cleanup=download_dir_is_temp,
+            )
 
-    discard_download_dir(download_dir_resolved, download_dir_is_temp)
+    finally:
+        # same as install: `clean` is a backstop, not the plan.
+        discard_download_dir(download_dir_resolved, download_dir_is_temp)
 
 
 def select_removals(installed_exts):
