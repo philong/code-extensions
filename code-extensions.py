@@ -2073,6 +2073,12 @@ def _post_extension_query(payload, service_url, token=None):
 # omits `categories`, which is what `info` reports.
 GALLERY_QUERY_FLAGS = 0x1 | 0x4 | 0x10
 
+# Search payload flags: IncludeFiles (0x2), IncludeVersionProperties (0x10),
+# IncludeAssetUri (0x80), IncludeStatistics (0x100) and IncludeLatestVersionOnly
+# (0x200). A search only needs summary fields; each hit is re-queried below for
+# the full version list the eligibility filters consume.
+GALLERY_SEARCH_FLAGS = 0x2 | 0x10 | 0x80 | 0x100 | 0x200
+
 
 def query_marketplace_extensions(ext_ids, service_url=DEFAULT_SERVICE_URL, token=None):
     cleanup_stale_cache()
@@ -2154,7 +2160,7 @@ def query_marketplace_search(
             }
         ],
         "assetTypes": [],
-        "flags": 914,
+        "flags": GALLERY_SEARCH_FLAGS,
     }
 
     resp_data = _post_extension_query(payload, service_url, token=token)
