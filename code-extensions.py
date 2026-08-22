@@ -20,6 +20,7 @@ import contextlib
 import datetime
 import hashlib
 import http.client
+import importlib.util
 import json
 import os
 import platform
@@ -35,29 +36,94 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
-from collections import namedtuple
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import lru_cache
+from typing import IO, Any, NamedTuple, NotRequired, TextIO, TypedDict
+
+TomlScalar = str | int | float | bool
+TomlValue = TomlScalar | list[str] | dict[str, object]
+
+
+# The gallery sends far more than this; each schema names only the keys this
+# tool reads. A key is required here when a reader indexes it directly, which
+# is only ever a key that something upstream has already checked for.
+class ExtensionFile(TypedDict):
+    source: str
+    assetType: NotRequired[str]
+
+
+class ExtensionProperty(TypedDict, total=False):
+    key: str
+    value: str
+
+
+class ExtensionVersion(TypedDict):
+    version: str
+    lastUpdated: NotRequired[str]
+    targetPlatform: NotRequired[str | None]
+    files: NotRequired[list[ExtensionFile]]
+    properties: NotRequired[list[ExtensionProperty]]
+
+
+class ExtensionPublisher(TypedDict, total=False):
+    publisherName: str
+    displayName: str | None
+
+
+class ExtensionMetadata(TypedDict, total=False):
+    extensionId: str
+    extensionName: str
+    displayName: str
+    shortDescription: str
+    publisher: ExtensionPublisher
+    versions: list[ExtensionVersion]
+    categories: list[str]
+
+
+class UpdateInfo(TypedDict):
+    id: str
+    publisher: str
+    name: str
+    installed: str
+    latest: str
+    latest_release_date: str
+    latest_platform: str
+    latest_download_url: str | None
+    eligible: str | None
+    eligible_release_date: str
+    eligible_platform: str
+    eligible_download_url: str | None
+
+
+class SearchResultItem(TypedDict):
+    id: str
+    publisher: str
+    name: str
+    displayName: str
+    description: str
+    latest: str
+    eligible: str
+    is_held_back: bool
+
 
 if sys.version_info < (3, 11):
     # 3.11 is the minimum supported interpreter: it is the release that
     # added both tomllib and the datetime.UTC alias used below. Check it
     # before those uses so an older interpreter exits up front with an
     # actionable message instead of dying with a less useful error.
-    sys.exit(
+    sys.exit(  # pyright: ignore[reportUnreachable]
         f"code-extensions requires Python 3.11 or newer; "
         f"this interpreter is {platform.python_version()}."
     )
 
 import tomllib
 
-try:
-    import select
-    import termios
-    import tty
-
-    HAS_TTY = True
-except ImportError:
-    HAS_TTY = False
+# select/termios/tty are POSIX-only. Probe for them here instead of importing:
+# the two places that need them import them at the point of use, so a platform
+# without them reports "no usable terminal" rather than failing at startup.
+HAS_TTY = all(
+    importlib.util.find_spec(name) is not None for name in ("select", "termios", "tty")
+)
 
 # Upper bound on an expanded .vsix, so a hostile or misconfigured gallery cannot
 # fill the disk (the largest extensions on the Marketplace are ~200MB).
@@ -79,22 +145,31 @@ OPEN_VSX_HOST = "open-vsx.org"
 MARKETPLACE_HOSTS = ("visualstudio.com", "vsassets.io")
 
 
-def url_host(url):
+def url_host(url: str) -> str:
+    """Return the normalized hostname of a URL, or empty string on error."""
     try:
-        return (urllib.parse.urlparse(url).hostname or "").lower()
+        return (urllib.parse.urlsplit(url).hostname or "").lower()
     except ValueError:
         return ""
 
 
 class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Drop the Authorization header when a redirect crosses hosts.
+    """Strip Authorization headers whenever a redirect leaves the original host.
 
     urllib copies every header except Content-* onto the redirected request, so
     without this the access token would be handed to whatever CDN host the
     gallery redirects downloads to (*.vsassets.io, blob storage, GitHub, ...).
     """
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: http.client.HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
         new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new_req is None:
             return None
@@ -111,7 +186,7 @@ _url_opener = urllib.request.build_opener(_AuthStrippingRedirectHandler)
 class _ColorsMeta(type):
     """Resolve public color codes through the class's `_enabled` flag."""
 
-    def __getattribute__(cls, name):
+    def __getattribute__(cls, name: str) -> object:
         value = super().__getattribute__(name)
         if (
             not name.startswith("_")
@@ -127,22 +202,24 @@ class Colors(metaclass=_ColorsMeta):
     # by _enabled, so every reader agrees no matter when colors were
     # disabled - and disabling is reversible, which rewriting the attributes
     # was not.
-    _enabled = True
-    BLUE = "\033[94m"
-    CYAN = "\033[96m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    RED = "\033[91m"
-    ENDC = "\033[0m"
-    BOLD = "\033[1m"
+    _enabled: bool = True
+    BLUE: str = "\033[94m"
+    CYAN: str = "\033[96m"
+    GREEN: str = "\033[92m"
+    YELLOW: str = "\033[93m"
+    RED: str = "\033[91m"
+    ENDC: str = "\033[0m"
+    BOLD: str = "\033[1m"
 
 
-def _disable_colors():
-    Colors._enabled = False
+def _disable_colors() -> None:
+    Colors._enabled = False  # pyright: ignore[reportPrivateUsage]
 
 
-def _enable_windows_vt():
+def _enable_windows_vt() -> bool:
     """Enable ANSI escape processing on the Windows console. Returns success."""
+    if sys.platform != "win32":
+        return False
     try:
         import ctypes
 
@@ -157,8 +234,8 @@ def _enable_windows_vt():
                 handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
             )
         )
-    # No windll off Windows (AttributeError), and the console calls raise
-    # OSError when stdout is not attached to a real console.
+    # The console calls raise OSError when stdout is not attached to a real
+    # console, and AttributeError if this ever runs on a build without windll.
     except (ImportError, AttributeError, OSError):
         return False
 
@@ -166,23 +243,23 @@ def _enable_windows_vt():
 class _AnsiStrippingStream:
     """Write-through wrapper that removes escape sequences."""
 
-    def __init__(self, stream):
-        self._stream = stream
+    def __init__(self, stream: TextIO) -> None:
+        self._stream: TextIO = stream
 
-    def write(self, text):
+    def write(self, text: str) -> int:
         return self._stream.write(ANSI_ESCAPE.sub("", text))
 
-    def writelines(self, lines):
+    def writelines(self, lines: Iterable[str]) -> None:
         # Must not fall through to __getattr__, which would reach the wrapped
         # stream directly and let escape sequences past the filter.
         for line in lines:
             self.write(line)
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> object:
         return getattr(self._stream, name)
 
 
-def enable_colors():
+def enable_colors() -> None:
     if not sys.stdout.isatty():
         _disable_colors()
         return
@@ -196,7 +273,7 @@ def enable_colors():
         sys.stderr = _AnsiStrippingStream(sys.stderr)
 
 
-def get_local_target_platform():
+def get_local_target_platform() -> str:
     system = platform.system().lower()
     machine = platform.machine().lower()
 
@@ -217,16 +294,20 @@ def get_local_target_platform():
     return "universal"
 
 
-def _comparable_version_parts(parts):
+def _comparable_version_parts(
+    parts: Sequence[int | str],
+) -> tuple[tuple[int, int | str], ...]:
     return tuple((0, x) if isinstance(x, int) else (1, str(x)) for x in parts)
 
 
 @lru_cache(maxsize=4096)
-def parse_version(v_str):
+def parse_version(
+    v_str: str,
+) -> tuple[tuple[tuple[int, int | str], ...], bool, tuple[tuple[int, int | str], ...]]:
     parts = v_str.split("-")
     main_parts = parts[0].split(".")
 
-    parsed_ints = []
+    parsed_ints: list[int | str] = []
     for p in main_parts:
         try:
             parsed_ints.append(int(p))
@@ -242,10 +323,10 @@ def parse_version(v_str):
 
     is_release = len(parts) == 1
 
-    prerelease_parts = ()
+    prerelease_parts: tuple[int | str, ...] = ()
     if not is_release:
         raw_pre = parts[1].split(".")
-        pre_parsed = []
+        pre_parsed: list[int | str] = []
         for x in raw_pre:
             try:
                 pre_parsed.append(int(x))
@@ -260,7 +341,7 @@ def parse_version(v_str):
     )
 
 
-def parse_code_binary(code_binary):
+def parse_code_binary(code_binary: object) -> list[str]:
     if isinstance(code_binary, (list, tuple)):
         tokens = [str(x) for x in code_binary]
     elif isinstance(code_binary, str):
@@ -282,7 +363,7 @@ def parse_code_binary(code_binary):
     return [resolved_exec, *tokens[1:]]
 
 
-def _assert_safe_for_cmd_shell(args):
+def _assert_safe_for_cmd_shell(args: Sequence[str]) -> None:
     """Refuse tokens that could escape the quoting of a `cmd /c` command line.
 
     Launching a .cmd/.bat needs cmd.exe, and CPython hands it
@@ -304,7 +385,9 @@ def _assert_safe_for_cmd_shell(args):
         )
 
 
-def run_code_cmd(args, retries=3, delay=1.0):
+def run_code_cmd(
+    args: Sequence[str], retries: int = 3, delay: float = 1.0
+) -> subprocess.CompletedProcess[str]:
     # On Windows the `code` CLI is a batch script (code.cmd); CreateProcess
     # cannot launch .cmd/.bat directly, so route those through the shell, which
     # CPython wraps as `cmd /c "<quoted args>"`.
@@ -332,9 +415,14 @@ def run_code_cmd(args, retries=3, delay=1.0):
                 time.sleep(wait)
                 continue
             raise
+    # Only reachable if a caller asks for a negative number of retries, which
+    # would otherwise silently run the command zero times.
+    raise ValueError(f"retries must not be negative, got {retries}")
 
 
-def query_installed_extensions(code_binary="code"):
+def query_installed_extensions(
+    code_binary: str | Sequence[str] = "code",
+) -> tuple[dict[str, str], str | None]:
     """Return (mapping of extension id to version, error message or None).
 
     An empty mapping is ambiguous - no extensions installed, or no usable 'code'
@@ -350,7 +438,7 @@ def query_installed_extensions(code_binary="code"):
     except (OSError, subprocess.SubprocessError) as e:
         return {}, f"Error running '{' '.join(full_cmd)}': {e}"
 
-    extensions = {}
+    extensions: dict[str, str] = {}
     for line in output.strip().splitlines():
         line = line.strip()
         if not line or "@" not in line:
@@ -361,7 +449,9 @@ def query_installed_extensions(code_binary="code"):
     return extensions, None
 
 
-def get_installed_extensions(code_binary="code", ignore_errors=False):
+def get_installed_extensions(
+    code_binary: str | Sequence[str] = "code", ignore_errors: bool = False
+) -> dict[str, str]:
     extensions, error = query_installed_extensions(code_binary)
     if error and not ignore_errors:
         print(f"{Colors.RED}{error}{Colors.ENDC}", file=sys.stderr)
@@ -369,18 +459,64 @@ def get_installed_extensions(code_binary="code", ignore_errors=False):
     return extensions
 
 
-def is_prerelease(version_obj):
-    properties = version_obj.get("properties", [])
+class ExtensionIdentity(NamedTuple):
+    publisher: str
+    name: str
+    full_id: str
+    publisher_display: str
+
+
+def extension_identity(ext: object) -> ExtensionIdentity:
+    """Pull the identity out of a gallery entry, tolerating a broken payload.
+
+    Every command keys its own bookkeeping off `full_id`, so all of them read
+    the identity through here: a malformed entry yields empty strings instead of
+    raising, which the callers then skip, rather than one bad record in a batch
+    taking out the whole command.
+    """
+    if not isinstance(ext, dict):
+        return ExtensionIdentity("", "", ".", "")
+    pub = ext.get("publisher")
+    if not isinstance(pub, dict):
+        pub = {}
+    publisher = str(pub.get("publisherName") or "")
+    name = str(ext.get("extensionName") or "")
+    return ExtensionIdentity(
+        publisher,
+        name,
+        f"{publisher}.{name}".lower(),
+        str(pub.get("displayName") or publisher),
+    )
+
+
+def version_property(version_obj: object, key: str) -> str | None:
+    """Read one property off a gallery version, or None if it is not usable.
+
+    Both the version and its properties are gallery-supplied, so anything that
+    is not the documented list-of-{key,value} shape counts as "not set" rather
+    than an error - which is also what lets callers pass a version they have not
+    checked, or none at all.
+    """
+    if not isinstance(version_obj, dict):
+        return None
+    properties = version_obj.get("properties") or []
+    if not isinstance(properties, list):
+        return None
     for p in properties:
-        if (
-            p.get("key") == "Microsoft.VisualStudio.Code.PreRelease"
-            and p.get("value") == "true"
-        ):
-            return True
-    return False
+        if isinstance(p, dict) and p.get("key") == key:
+            value = p.get("value")
+            return value if isinstance(value, str) else None
+    return None
 
 
-def get_vscode_version(code_binary="code"):
+def is_prerelease(version_obj: object) -> bool:
+    return (
+        version_property(version_obj, "Microsoft.VisualStudio.Code.PreRelease")
+        == "true"
+    )
+
+
+def get_vscode_version(code_binary: str | Sequence[str] = "code") -> str | None:
     binary_cmd = parse_code_binary(code_binary)
     full_cmd = [*binary_cmd, "--version"]
     try:
@@ -392,7 +528,7 @@ def get_vscode_version(code_binary="code"):
     return lines[0].strip() if lines else None
 
 
-def semver_parts(v_str):
+def semver_parts(v_str: str) -> tuple[int, int, int]:
     cleaned = re.sub(r"^[^0-9]+", "", v_str)
     main_part = cleaned.split("-")[0]
     parts = main_part.split(".")
@@ -405,7 +541,7 @@ def semver_parts(v_str):
         return 0, 0, 0
 
 
-def expand_x_range(version_str):
+def expand_x_range(version_str: str) -> tuple[str, str | None] | None:
     """Expand a wildcard range into [lower, upper) bounds.
 
     '1.80.x' -> ('1.80.0', '1.81.0'), '1.x' -> ('1.0.0', '2.0.0'),
@@ -416,7 +552,7 @@ def expand_x_range(version_str):
     if not core:
         return None
     components = [c.strip() for c in core.split(".")]
-    fixed = []
+    fixed: list[str] = []
     for component in components:
         if component in ("x", "X", "*"):
             break
@@ -437,7 +573,9 @@ def expand_x_range(version_str):
 
 
 @lru_cache(maxsize=4096)
-def is_engine_compatible(vscode_version_str, engine_constraint):
+def is_engine_compatible(
+    vscode_version_str: str | None, engine_constraint: str | None
+) -> bool:
     if not vscode_version_str or not engine_constraint:
         return True
     # VS Code reports Insiders and other pre-release builds as e.g.
@@ -571,14 +709,14 @@ def is_engine_compatible(vscode_version_str, engine_constraint):
 
 
 def filter_versions(
-    versions,
-    target_platform,
-    vscode_version=None,
-    include_prerelease=False,
-    skip_versions=(),
-    required_version=None,
-    newer_than=None,
-):
+    versions: Sequence[ExtensionVersion],
+    target_platform: str,
+    vscode_version: str | None = None,
+    include_prerelease: bool = False,
+    skip_versions: Sequence[str] = (),
+    required_version: str | None = None,
+    newer_than: str | None = None,
+) -> list[ExtensionVersion]:
     """Select the gallery versions installable on this host, newest first.
 
     Shared by install, update, search and info so they cannot drift apart on
@@ -597,14 +735,17 @@ def filter_versions(
     The sort is stable, so several builds of one version (the per-platform
     variants) keep the order the gallery listed them in.
     """
+    # isinstance, not just a truthy 'version': this is the one gate every
+    # version object passes through, so entries the gallery sent in some other
+    # shape are dropped here instead of raising in each reader downstream.
     ordered = sorted(
-        (v for v in versions if v.get("version")),
+        (v for v in versions if isinstance(v, dict) and v.get("version")),
         key=lambda v: parse_version(v["version"]),
         reverse=True,
     )
     parsed_floor = parse_version(newer_than) if newer_than else None
 
-    selected = []
+    selected: list[ExtensionVersion] = []
     for ver_obj in ordered:
         version_str = ver_obj["version"]
         if parsed_floor is not None and parse_version(version_str) <= parsed_floor:
@@ -631,38 +772,37 @@ def filter_versions(
     return selected
 
 
-def get_engine_constraint(version_obj):
-    properties = version_obj.get("properties", [])
-    for p in properties:
-        if p.get("key") == "Microsoft.VisualStudio.Code.Engine":
-            return p.get("value")
-    return None
+def get_engine_constraint(version_obj: object) -> str | None:
+    return version_property(version_obj, "Microsoft.VisualStudio.Code.Engine")
 
 
-def parse_age_threshold(age_str):
+def parse_age_threshold(age_str: object) -> datetime.timedelta:
     if not age_str:
         return datetime.timedelta(0)
-    age_str = str(age_str).lower().strip()
-    if age_str in ("0", "0h", "0d", "0m"):
+    age_str_clean = str(age_str).lower().strip()
+    if age_str_clean in ("0", "0h", "0d", "0m"):
         return datetime.timedelta(0)
 
-    match = re.match(r"^(\d+)([hdm])$", age_str)
+    match = re.match(r"^(\d+)([hdm])$", age_str_clean)
     if not match:
         raise ValueError(
-            f"Invalid age format: '{age_str}'. Expected format like '24h', '1d', '30m'."
+            f"Invalid age format: '{age_str_clean}'. Expected format like '24h', '1d', '30m'."
         )
     value, unit = match.groups()
-    value = int(value)
+    val_int = int(value)
     if unit == "h":
-        return datetime.timedelta(hours=value)
+        return datetime.timedelta(hours=val_int)
     elif unit == "d":
-        return datetime.timedelta(days=value)
+        return datetime.timedelta(days=val_int)
     elif unit == "m":
-        return datetime.timedelta(minutes=value)
+        return datetime.timedelta(minutes=val_int)
     return datetime.timedelta(0)
 
 
-def released_long_enough(ver_obj, min_age):
+def released_long_enough(
+    ver_obj: ExtensionVersion,
+    min_age: datetime.timedelta | None,
+) -> bool:
     """Return True if the version passes the minimum-release-age gate.
 
     A version with no min_age, no lastUpdated, or an unparseable timestamp is
@@ -691,7 +831,10 @@ def released_long_enough(ver_obj, min_age):
 CACHE_FILE_PREFIX = "vscode_ext_cache_"
 
 
-def first_eligible_version(versions, min_age):
+def first_eligible_version(
+    versions: Sequence[ExtensionVersion],
+    min_age: datetime.timedelta | None,
+) -> ExtensionVersion | None:
     """Newest version that satisfies the minimum-release-age gate, if any."""
     for ver_obj in versions:
         if released_long_enough(ver_obj, min_age):
@@ -699,7 +842,7 @@ def first_eligible_version(versions, min_age):
     return None
 
 
-def get_cache_dir():
+def get_cache_dir() -> str | None:
     """Return the private cache directory, or None if it cannot be secured.
 
     Falling back to the shared temp directory would put cache files under
@@ -718,7 +861,7 @@ def get_cache_dir():
     return cache_dir
 
 
-def is_cache_file(filename):
+def is_cache_file(filename: str) -> bool:
     # .tmp covers a partial write left behind by a killed process; the reader
     # only ever opens the final name, so collecting them is safe.
     return filename.startswith(CACHE_FILE_PREFIX) and filename.endswith(
@@ -726,7 +869,7 @@ def is_cache_file(filename):
     )
 
 
-def is_cache_temp_file(filename):
+def is_cache_temp_file(filename: str) -> bool:
     """Whether the name is a cache entry mid-write rather than a finished one.
 
     A .tmp still belonging to a live process must not be removed: its os.replace
@@ -735,7 +878,7 @@ def is_cache_temp_file(filename):
     return is_cache_file(filename) and filename.endswith(".tmp")
 
 
-def write_cache_atomically(cache_file, payload):
+def write_cache_atomically(cache_file: str, payload: object) -> None:
     """Write a cache entry via a temporary file and a rename.
 
     Writing in place leaves a half-written entry behind if the process is
@@ -757,7 +900,7 @@ def write_cache_atomically(cache_file, payload):
                 os.remove(tmp_path)
 
 
-def cleanup_stale_cache():
+def cleanup_stale_cache() -> None:
     cache_dir = get_cache_dir()
     if not cache_dir:
         return
@@ -787,7 +930,7 @@ _TOML_ESCAPES = {
 }
 
 
-def unescape_toml_basic(text):
+def unescape_toml_basic(text: str) -> str:
     out = []
     i = 0
     while i < len(text):
@@ -825,7 +968,7 @@ def unescape_toml_basic(text):
     return "".join(out)
 
 
-def unquote_toml_value(text):
+def unquote_toml_value(text: str) -> str:
     """Strip one layer of TOML quoting, honouring escapes in basic strings.
 
     Basic ("...") strings process escapes; literal ('...') strings do not.
@@ -839,7 +982,7 @@ def unquote_toml_value(text):
     return text
 
 
-def split_comment(line):
+def split_comment(line: str) -> tuple[str, str]:
     """Split a line into its code and its trailing '#' comment.
 
     A '#' inside a quoted value is part of the value, not a comment.
@@ -865,7 +1008,7 @@ def split_comment(line):
     return line, ""
 
 
-def strip_comment(line):
+def strip_comment(line: str) -> str:
     return split_comment(line)[0].strip()
 
 
@@ -936,7 +1079,7 @@ EXT_OPTION_TYPES = {entry[0]: entry[1] for entry in EXT_CONFIG_SCHEMA}
 EXT_OPTION_KEYS = frozenset(EXT_OPTION_TYPES)
 
 
-def coerce_config_value(val, expected_type):
+def coerce_config_value(val: object, expected_type: type) -> TomlValue:
     if expected_type is bool:
         if isinstance(val, bool):
             return val
@@ -966,7 +1109,9 @@ def coerce_config_value(val, expected_type):
     raise ValueError(f"expected a string, got {val!r}")
 
 
-def validate_config_value(display_key, norm_key, val, expected_type):
+def validate_config_value(
+    display_key: str, norm_key: str, val: object, expected_type: type
+) -> TomlValue:
     """Coerce a value being written to the config, refusing to store junk.
 
     An unusable value used to be accepted here and only rejected on load, which
@@ -987,13 +1132,13 @@ def validate_config_value(display_key, norm_key, val, expected_type):
 
 
 def effective_ext_options(
-    ext_cfg,
-    include_prerelease,
-    min_release_age,
-    min_release_age_str=None,
-    cli_include_prerelease_override=False,
-    cli_min_release_age_override=False,
-):
+    ext_cfg: Mapping[str, object] | None,
+    include_prerelease: bool,
+    min_release_age: datetime.timedelta | None,
+    min_release_age_str: str | None = None,
+    cli_include_prerelease_override: bool = False,
+    cli_min_release_age_override: bool = False,
+) -> tuple[bool, datetime.timedelta, str]:
     """Merge a per-extension rule with the already-resolved global settings.
 
     Precedence is the same for every command: an explicitly passed CLI flag wins
@@ -1004,10 +1149,10 @@ def effective_ext_options(
     ext_cfg = ext_cfg or {}
     eff_include_prerelease = include_prerelease
     if not cli_include_prerelease_override and "include_prerelease" in ext_cfg:
-        eff_include_prerelease = ext_cfg["include_prerelease"]
+        eff_include_prerelease = bool(ext_cfg["include_prerelease"])
 
-    eff_min_age = min_release_age
-    eff_min_age_str = min_release_age_str
+    eff_min_age = min_release_age or datetime.timedelta(0)
+    eff_min_age_str = min_release_age_str or "0"
     if not cli_min_release_age_override and "min_release_age" in ext_cfg:
         with contextlib.suppress(ValueError):
             eff_min_age = parse_age_threshold(ext_cfg["min_release_age"])
@@ -1016,9 +1161,11 @@ def effective_ext_options(
     return eff_include_prerelease, eff_min_age, eff_min_age_str
 
 
-def resolve_min_release_age(args_val, config):
+def resolve_min_release_age(
+    args_val: object | None, config: Mapping[str, object]
+) -> tuple[datetime.timedelta, str]:
     """Return (timedelta, source string) for the min-release-age setting."""
-    age_str = resolve_option(args_val, config, "min_release_age", "24h")
+    age_str = str(resolve_option(args_val, config, "min_release_age", "24h"))
     try:
         return parse_age_threshold(age_str), age_str
     except ValueError as e:
@@ -1026,7 +1173,7 @@ def resolve_min_release_age(args_val, config):
         sys.exit(1)
 
 
-def parse_toml_text(text):
+def parse_toml_text(text: str) -> dict[str, object]:
     """Parse TOML text, raising a ValueError on invalid input.
 
     tomllib ships with Python 3.11, so no fallback is needed. Kept as a
@@ -1035,9 +1182,9 @@ def parse_toml_text(text):
     return tomllib.loads(text)
 
 
-def load_config():
+def load_config() -> dict[str, object]:
     config_path = get_default_config_path()
-    config = {"extensions": {}}
+    config: dict[str, object] = {"extensions": {}}
     if not os.path.exists(config_path):
         return config
 
@@ -1053,7 +1200,7 @@ def load_config():
         )
         return config
 
-    ext_sections = {}
+    ext_sections: dict[str, object] = {}
     if "extensions" in parsed and isinstance(parsed["extensions"], dict):
         ext_sections.update(parsed["extensions"])
     if "extension" in parsed and isinstance(parsed["extension"], dict):
@@ -1063,7 +1210,7 @@ def load_config():
         if not isinstance(ext_data, dict):
             continue
         ext_id_lower = str(ext_id).strip().lower()
-        norm_ext_cfg = {}
+        norm_ext_cfg: dict[str, object] = {}
 
         for key, val in ext_data.items():
             norm_key = key.replace("-", "_")
@@ -1076,7 +1223,9 @@ def load_config():
             except ValueError:
                 pass
 
-        config["extensions"][ext_id_lower] = norm_ext_cfg
+        extensions_dict = config["extensions"]
+        if isinstance(extensions_dict, dict):
+            extensions_dict[ext_id_lower] = norm_ext_cfg
 
     for key, val in parsed.items():
         if key in ("extensions", "extension"):
@@ -1099,7 +1248,15 @@ def load_config():
     return config
 
 
-def resolve_option(args_val, config, key, default):
+def resolve_option(
+    args_val: object, config: Mapping[str, object], key: str, default: object
+) -> object:
+    """Resolve one setting from the CLI flag, then the config file, then a default.
+
+    The result is deliberately typed `object`: the config file is user-written
+    TOML and can hold any value under any key, so callers coerce what they need
+    (`str()`, `bool()`) instead of trusting a type this cannot promise.
+    """
     if args_val is not None:
         return args_val
     val = config.get(key)
@@ -1108,14 +1265,19 @@ def resolve_option(args_val, config, key, default):
     return default
 
 
-def resolve_service_url(args, config):
+def resolve_service_url(args: object, config: Mapping[str, object]) -> str:
     open_vsx = resolve_option(
-        getattr(args, "open_vsx", None), config, "open_vsx", False
+        getattr(args, "open_vsx", None) if args else None, config, "open_vsx", False
     )
     if open_vsx:
         return OPEN_VSX_SERVICE_URL
-    url = resolve_option(
-        getattr(args, "service_url", None), config, "service_url", DEFAULT_SERVICE_URL
+    url: str = str(
+        resolve_option(
+            getattr(args, "service_url", None) if args else None,
+            config,
+            "service_url",
+            DEFAULT_SERVICE_URL,
+        )
     ).rstrip("/")
     if url.lower().startswith("http://"):
         print(
@@ -1125,7 +1287,7 @@ def resolve_service_url(args, config):
     return url
 
 
-def get_default_config_path():
+def get_default_config_path() -> str:
     # Deliberately NOT ./config.toml: the config can set `code_binary` (which is
     # executed) and `service_url` (where VSIX files are fetched from), so picking
     # one up from the working directory would let any checked-out repository run
@@ -1138,7 +1300,7 @@ def get_default_config_path():
     return os.path.join(user_config_dir, "config.toml")
 
 
-def toml_string(value):
+def toml_string(value: object) -> str:
     escaped = (
         str(value)
         .replace("\\", "\\\\")
@@ -1150,12 +1312,12 @@ def toml_string(value):
     return f'"{escaped}"'
 
 
-def toml_key(key):
-    key = str(key)
-    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else toml_string(key)
+def toml_key(key: object) -> str:
+    key_str = str(key)
+    return key_str if re.fullmatch(r"[A-Za-z0-9_-]+", key_str) else toml_string(key_str)
 
 
-def toml_value(value):
+def toml_value(value: object) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
@@ -1165,13 +1327,15 @@ def toml_value(value):
     return toml_string(value)
 
 
-def dump_toml(data):
-    lines = []
+def dump_toml(data: Mapping[str, object]) -> str:
+    lines: list[str] = []
     for k in sorted(k for k in data if not isinstance(data[k], dict)):
         lines.append(f"{toml_key(k)} = {toml_value(data[k])}")
 
     for k in sorted(k for k in data if isinstance(data[k], dict) and data[k]):
         subdict = data[k]
+        if not isinstance(subdict, dict):
+            continue
         scalar_keys = sorted(sk for sk in subdict if not isinstance(subdict[sk], dict))
         sub_tables = sorted(sk for sk in subdict if isinstance(subdict[sk], dict))
 
@@ -1186,7 +1350,7 @@ def dump_toml(data):
                 lines.append(f"  {toml_key(sk)} = {toml_value(subdict[sk])}")
 
         for sk in sub_tables:
-            if not subdict[sk]:
+            if not subdict[sk] or not isinstance(subdict[sk], dict):
                 continue
             if lines:
                 lines.append("")
@@ -1197,7 +1361,7 @@ def dump_toml(data):
     return "\n".join(lines).strip() + "\n"
 
 
-def restrict_to_owner(path, mode):
+def restrict_to_owner(path: str, mode: int) -> None:
     # POSIX modes are meaningless on Windows, where os.chmod only toggles the
     # read-only attribute; skip it there instead of risking a read-only config.
     if os.name == "nt":
@@ -1206,7 +1370,7 @@ def restrict_to_owner(path, mode):
         os.chmod(path, mode)
 
 
-def write_config_text(content, config_path):
+def write_config_text(content: str, config_path: str) -> None:
     dir_path = os.path.dirname(config_path)
     if dir_path:
         existed = os.path.isdir(dir_path)
@@ -1224,14 +1388,14 @@ def write_config_text(content, config_path):
         f.write(content)
 
 
-def save_config(config, config_path):
+def save_config(config: Mapping[str, object], config_path: str) -> None:
     write_config_text(dump_toml(config), config_path)
 
 
 SECRET_CONFIG_KEYS = frozenset({"open_vsx_token"})
 
 
-def redact_config_value(key, value):
+def redact_config_value(key: str, value: object) -> str:
     """Render a config value for display, masking anything secret.
 
     'config list' is the one command whose output tends to end up in a bug
@@ -1243,16 +1407,16 @@ def redact_config_value(key, value):
     return repr(value)
 
 
-def config_table_path(target_type, ext_id):
+def config_table_path(target_type: str, ext_id: str) -> tuple[str, str] | None:
     """The TOML table an edited key lives in: None for a global setting."""
     return None if target_type == "global" else ("extensions", ext_id.lower())
 
 
-def normalize_toml_key(key):
+def normalize_toml_key(key: object) -> str:
     return str(key).strip().replace("-", "_")
 
 
-def split_toml_table_header(line):
+def split_toml_table_header(line: str) -> tuple[str, ...] | None:
     """Split a '[table.sub]' header into its parts, or return None.
 
     Only the first dot separates the table from its subtable, matching how the
@@ -1293,7 +1457,7 @@ def split_toml_table_header(line):
     return (top, ".".join(names[1:]).strip().lower())
 
 
-def toml_line_key(line):
+def toml_line_key(line: str) -> str | None:
     """The key of a 'key = value' line, normalized, or None for any other line."""
     stripped = strip_comment(line)
     if not stripped or "=" not in stripped or stripped.startswith("["):
@@ -1301,7 +1465,7 @@ def toml_line_key(line):
     return normalize_toml_key(unquote_toml_value(stripped.split("=", 1)[0].strip()))
 
 
-def toml_value_is_complete(text):
+def toml_value_is_complete(text: str) -> bool:
     """Whether an array value opened on this text is already closed."""
     depth = 0
     in_quote = None
@@ -1326,7 +1490,7 @@ def toml_value_is_complete(text):
     return depth <= 0
 
 
-def drop_empty_toml_table(lines, table):
+def drop_empty_toml_table(lines: Sequence[str], table: tuple[str, ...]) -> list[str]:
     """Drop `table`'s header once an edit has left it without keys.
 
     Blank padding inside the emptied table goes with it; any comment there is
@@ -1352,7 +1516,13 @@ def drop_empty_toml_table(lines, table):
     return result
 
 
-def edit_toml_text(text, table, key, value, delete=False):
+def edit_toml_text(
+    text: str,
+    table: tuple[str, ...] | None,
+    key: str,
+    value: object,
+    delete: bool = False,
+) -> str:
     """Return `text` with one key set or removed, leaving every other byte alone.
 
     Rewriting the file from the parsed config would drop the user's comments,
@@ -1363,15 +1533,17 @@ def edit_toml_text(text, table, key, value, delete=False):
     new_line_body = f"{toml_key(key)} = {toml_value(value)}"
 
     lines = text.splitlines()
-    out = []
-    current = None
-    insert_after = None  # index in `out` of the last line of the target table
-    first_header = None  # index in `out` of the first table header
-    key_indent = None  # indentation the target table's existing keys use
-    table_key_indent = None  # indentation keys use elsewhere in the file
+    out: list[str] = []
+    current: tuple[str, ...] | None = None
+    insert_after: int | None = (
+        None  # index in `out` of the last line of the target table
+    )
+    first_header: int | None = None  # index in `out` of the first table header
+    key_indent: str | None = None  # indentation the target table's existing keys use
+    table_key_indent: str | None = None  # indentation keys use elsewhere in the file
     found = False
-    pending = None  # tail of a multi-line value being dropped
-    carry = None  # tail of a multi-line value being kept
+    pending: str | None = None  # tail of a multi-line value being dropped
+    carry: str | None = None  # tail of a multi-line value being kept
 
     for line in lines:
         if pending is not None:
@@ -1467,16 +1639,20 @@ def edit_toml_text(text, table, key, value, delete=False):
     return newline.join(line.rstrip("\r") for line in out).rstrip("\r\n") + newline
 
 
-def config_edit_took_effect(text, table, key, value, delete):
+def config_edit_took_effect(
+    text: str,
+    table: tuple[str, ...] | None,
+    key: str,
+    value: object,
+    delete: bool,
+) -> bool:
     """Whether re-reading the edited text really yields the requested change."""
     try:
         parsed = parse_toml_text(text)
     except ValueError:
         return False
-    if not isinstance(parsed, dict):
-        return False
 
-    sections = []
+    sections: list[Mapping[str, object]] = []
     if table is None:
         sections.append(parsed)
     else:
@@ -1500,7 +1676,14 @@ def config_edit_took_effect(text, table, key, value, delete):
     return not seen if delete else seen
 
 
-def update_config_file(config, config_path, table, key, value=None, delete=False):
+def update_config_file(
+    config: Mapping[str, object],
+    config_path: str,
+    table: tuple[str, ...] | None,
+    key: str,
+    value: object = None,
+    delete: bool = False,
+) -> None:
     """Write one config change, keeping the rest of the file as the user wrote it."""
     try:
         with open(config_path, encoding="utf-8") as f:
@@ -1546,7 +1729,7 @@ def update_config_file(config, config_path, table, key, value=None, delete=False
 EXTENSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$")
 
 
-def is_valid_extension_id(ext_id):
+def is_valid_extension_id(ext_id: object) -> bool:
     """Validate whether an extension identifier conforms to 'publisher.name' format."""
     # Deliberately not stripping: callers key the marketplace response map by the
     # exact string they validated, so accepting ' pub.name ' here while looking up
@@ -1556,14 +1739,14 @@ def is_valid_extension_id(ext_id):
     return bool(EXTENSION_ID_PATTERN.fullmatch(ext_id))
 
 
-def parse_config_key(key, validate=True):
+def parse_config_key(key: object, validate: bool = True) -> tuple[str, str, str | None]:
     # `validate` is off for get/unset so that entries an older release wrote with
     # a malformed id stay reachable; only `set` refuses to create new ones.
-    key = str(key).strip()
-    key = key.removeprefix("extensions.")
+    key_str = str(key).strip()
+    key_str = key_str.removeprefix("extensions.")
 
-    if "." in key:
-        parts = key.rsplit(".", 1)
+    if "." in key_str:
+        parts = key_str.rsplit(".", 1)
         ext_id, prop = parts[0].strip().lower(), parts[1].strip().lower()
         if not validate or is_valid_extension_id(ext_id):
             return ("extension", ext_id, prop)
@@ -1571,10 +1754,10 @@ def parse_config_key(key, validate=True):
         # extension rule. Reporting it as an unknown global would answer with
         # the global option list instead of the actual problem.
         return ("invalid", ext_id, prop)
-    return ("global", key.lower(), None)
+    return ("global", key_str.lower(), None)
 
 
-def handle_config(args, config):
+def handle_config(args: argparse.Namespace, config: dict[str, object]) -> None:
     config_path = get_default_config_path()
     action = args.action or "list"
 
@@ -1591,15 +1774,18 @@ def handle_config(args, config):
         if not globals_found:
             print("  (no global settings overridden)")
 
-        exts = config.get("extensions", {})
+        exts_val = config.get("extensions")
+        exts = exts_val if isinstance(exts_val, dict) else {}
         print(f"\n{Colors.BOLD}Active Extension Rules:{Colors.ENDC}")
         if not exts:
             print("  (no extension-specific rules configured)")
         else:
             for ext_id in sorted(exts.keys()):
                 print(f"  {Colors.BOLD}{Colors.CYAN}{ext_id}{Colors.ENDC}:")
-                for pk, pv in sorted(exts[ext_id].items()):
-                    print(f"    {pk} = {pv!r}")
+                sub_dict = exts[ext_id]
+                if isinstance(sub_dict, dict):
+                    for pk, pv in sorted(sub_dict.items()):
+                        print(f"    {pk} = {pv!r}")
 
         print(
             f"\n{Colors.BOLD}Available Global Settings{Colors.ENDC} (use 'code-extensions config set <key> <val>'):"
@@ -1635,8 +1821,11 @@ def handle_config(args, config):
                 )
                 sys.exit(1)
         else:
-            exts = config.get("extensions", {})
-            val = exts.get(ext_id.lower(), {}).get(prop.replace("-", "_"))
+            exts_val = config.get("extensions")
+            exts = exts_val if isinstance(exts_val, dict) else {}
+            prop_key = prop.replace("-", "_") if prop else ""
+            ext_target = exts.get(ext_id.lower())
+            val = ext_target.get(prop_key) if isinstance(ext_target, dict) else None
             if val is not None:
                 print(val)
             else:
@@ -1664,7 +1853,7 @@ def handle_config(args, config):
             sys.exit(1)
 
         raw_val = args.value.strip()
-        coerced_val = raw_val
+        coerced_val: TomlValue = raw_val
         if raw_val.lower() == "true":
             coerced_val = True
         elif raw_val.lower() == "false":
@@ -1683,22 +1872,26 @@ def handle_config(args, config):
             )
             config[norm_key] = stored_val
         else:
-            norm_prop = prop.replace("-", "_")
+            norm_prop = prop.replace("-", "_") if prop else ""
             if norm_prop not in EXT_OPTION_KEYS:
                 print(
                     f"{Colors.RED}Error: Unknown per-extension setting '{norm_prop}'. Valid keys: {', '.join(sorted(EXT_OPTION_KEYS))}.{Colors.ENDC}",
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            if "extensions" not in config or not isinstance(config["extensions"], dict):
-                config["extensions"] = {}
+            exts_val = config.get("extensions")
+            if not isinstance(exts_val, dict):
+                exts_val = {}
+                config["extensions"] = exts_val
             norm_ext_id = ext_id.lower()
-            if norm_ext_id not in config["extensions"]:
-                config["extensions"][norm_ext_id] = {}
+            if norm_ext_id not in exts_val or not isinstance(
+                exts_val[norm_ext_id], dict
+            ):
+                exts_val[norm_ext_id] = {}
             stored_val = validate_config_value(
                 args.key, norm_prop, coerced_val, EXT_OPTION_TYPES[norm_prop]
             )
-            config["extensions"][norm_ext_id][norm_prop] = stored_val
+            exts_val[norm_ext_id][norm_prop] = stored_val
             norm_key = norm_prop
 
         update_config_file(
@@ -1730,10 +1923,15 @@ def handle_config(args, config):
                 del config[norm_key]
                 changed = True
         else:
-            exts = config.get("extensions", {})
+            exts_val = config.get("extensions")
+            exts = exts_val if isinstance(exts_val, dict) else {}
             norm_ext_id = ext_id.lower()
-            norm_key = prop.replace("-", "_")
-            if norm_ext_id in exts and norm_key in exts[norm_ext_id]:
+            norm_key = prop.replace("-", "_") if prop else ""
+            if (
+                norm_ext_id in exts
+                and isinstance(exts[norm_ext_id], dict)
+                and norm_key in exts[norm_ext_id]
+            ):
                 del exts[norm_ext_id][norm_key]
                 if not exts[norm_ext_id]:
                     del exts[norm_ext_id]
@@ -1756,16 +1954,23 @@ def handle_config(args, config):
 
 
 def get_vsix_download_url(
-    ver_obj, pub_name, ext_name, version, platform, service_url=DEFAULT_SERVICE_URL
-):
-    if ver_obj and isinstance(ver_obj, dict):
-        for f in ver_obj.get("files") or []:
-            asset_type = f.get("assetType", "")
-            if asset_type in (
+    ver_obj: ExtensionVersion | None,
+    pub_name: str,
+    ext_name: str,
+    version: str,
+    platform: str | None,
+    service_url: str = DEFAULT_SERVICE_URL,
+) -> str:
+    files = (ver_obj.get("files") or []) if ver_obj else []
+    if isinstance(files, list):
+        for f in files:
+            if not isinstance(f, dict) or not f.get("source"):
+                continue
+            if f.get("assetType") in (
                 "Microsoft.VisualStudio.Services.VSIXPackage",
                 "Microsoft.VisualStudio.Code.VSIXPackage",
-            ) and f.get("source"):
-                url = f["source"]
+            ):
+                url = str(f["source"])
                 if (
                     platform
                     and platform != "universal"
@@ -1784,13 +1989,30 @@ def get_vsix_download_url(
     return url
 
 
-def resolve_update_url(update, service_url):
-    return update.get("eligible_download_url") or get_vsix_download_url(
-        {},
+def eligible_update_version(update: UpdateInfo) -> str:
+    """The version an update would install, refusing an unresolved one.
+
+    A held-back update carries no eligible version: -y and the non-tty branch
+    drop those, and select_updates promotes a deliberately selected one to
+    `latest`. Reaching this with None means one of those gates was skipped, so
+    raise rather than build a URL, a filename or a report line saying "None".
+    """
+    version = update["eligible"]
+    if version is None:
+        raise RuntimeError(f"unresolved eligible version for {update['id']}")
+    return version
+
+
+def resolve_update_url(update: UpdateInfo, service_url: str) -> str:
+    eligible_url = update["eligible_download_url"]
+    if eligible_url:
+        return eligible_url
+    return get_vsix_download_url(
+        None,
         update["publisher"],
         update["name"],
-        update["eligible"],
-        update["eligible_platform"],
+        eligible_update_version(update),
+        update["eligible_platform"] or None,
         service_url,
     )
 
@@ -1798,7 +2020,7 @@ def resolve_update_url(update, service_url):
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-def safe_filename_part(value, fallback="unknown"):
+def safe_filename_part(value: object, fallback: str = "unknown") -> str:
     """Reduce a gallery-supplied string to something safe inside a filename.
 
     Publisher, extension name, version and platform all come from the gallery
@@ -1809,7 +2031,9 @@ def safe_filename_part(value, fallback="unknown"):
     return cleaned or fallback
 
 
-def vsix_filename(pub_name, ext_name, version, platform):
+def vsix_filename(
+    pub_name: str, ext_name: str, version: str, platform: str | None
+) -> str:
     filename = (
         f"{safe_filename_part(pub_name, 'publisher')}."
         f"{safe_filename_part(ext_name, 'extension')}-"
@@ -1820,7 +2044,7 @@ def vsix_filename(pub_name, ext_name, version, platform):
     return filename + ".vsix"
 
 
-def is_open_vsx_url(url):
+def is_open_vsx_url(url: str | None) -> bool:
     """Whether a URL points at Open VSX, matched on host rather than substring.
 
     A substring test would accept hosts such as 'open-vsx.org.example.com' and
@@ -1832,7 +2056,7 @@ def is_open_vsx_url(url):
     return host == OPEN_VSX_HOST or host.endswith("." + OPEN_VSX_HOST)
 
 
-def is_marketplace_url(url):
+def is_marketplace_url(url: str | None) -> bool:
     """Whether a URL points at Microsoft's Marketplace or one of its CDN hosts."""
     if not url:
         return False
@@ -1842,7 +2066,9 @@ def is_marketplace_url(url):
     )
 
 
-def resolve_open_vsx_token(args, config):
+def resolve_open_vsx_token(
+    args: object, config: Mapping[str, object] | None
+) -> str | None:
     config = config or {}
     token = resolve_option(
         getattr(args, "open_vsx_token", None) if args else None,
@@ -1851,11 +2077,15 @@ def resolve_open_vsx_token(args, config):
         None,
     )
     if token:
-        return token
+        return str(token)
     return os.environ.get("OVSX_PAT")
 
 
-def resolve_token_for_service(service_url, args=None, config=None):
+def resolve_token_for_service(
+    service_url: str,
+    args: object = None,
+    config: Mapping[str, object] | None = None,
+) -> str | None:
     config = config or {}
     open_vsx = resolve_option(
         getattr(args, "open_vsx", None) if args else None,
@@ -1881,50 +2111,64 @@ def resolve_token_for_service(service_url, args=None, config=None):
 class ExecutionContext:
     """Resolved runtime options and environment for command execution."""
 
-    def __init__(self, args, config):
+    def __init__(self, args: object, config: Mapping[str, object] | None) -> None:
         config = config or {}
-        self._args = args
-        self._config = config
-        self.code_binary = parse_code_binary(
+        self._args: object = args
+        self._config: Mapping[str, object] = config
+        self.code_binary: list[str] = parse_code_binary(
             resolve_option(
-                getattr(args, "code_binary", None), config, "code_binary", "code"
+                getattr(args, "code_binary", None) if args else None,
+                config,
+                "code_binary",
+                "code",
             )
         )
-        self.include_prerelease = resolve_option(
-            getattr(args, "include_prerelease", None),
-            config,
-            "include_prerelease",
-            False,
+        self.include_prerelease: bool = bool(
+            resolve_option(
+                getattr(args, "include_prerelease", None) if args else None,
+                config,
+                "include_prerelease",
+                False,
+            )
         )
-        self.no_code_version_check = resolve_option(
-            getattr(args, "no_code_version_check", None),
-            config,
-            "no_code_version_check",
-            False,
+        self.no_code_version_check: bool = bool(
+            resolve_option(
+                getattr(args, "no_code_version_check", None) if args else None,
+                config,
+                "no_code_version_check",
+                False,
+            )
         )
-        self.yes = resolve_option(getattr(args, "yes", None), config, "yes", False)
-        self.target_platform = get_local_target_platform()
-        self.extensions_config = config.get("extensions", {})
-        self._vscode_version = None
-        self._vscode_version_fetched = False
-        self._service_url = None
-        self._token = None
-        self._token_resolved = False
-        self._min_release_age = None
-        self._min_release_age_str = None
-        self._min_release_age_resolved = False
+        self.yes: bool = bool(
+            resolve_option(
+                getattr(args, "yes", None) if args else None, config, "yes", False
+            )
+        )
+        self.target_platform: str = get_local_target_platform()
+        exts_val = config.get("extensions")
+        self.extensions_config: dict[str, object] = (
+            exts_val if isinstance(exts_val, dict) else {}
+        )
+        self._vscode_version: str | None = None
+        self._vscode_version_fetched: bool = False
+        self._service_url: str | None = None
+        self._token: str | None = None
+        self._token_resolved: bool = False
+        self._min_release_age: datetime.timedelta = datetime.timedelta(0)
+        self._min_release_age_str: str = "0"
+        self._min_release_age_resolved: bool = False
 
     # Resolved on demand: resolve_service_url warns about insecure HTTP and
     # resolve_min_release_age exits on an unparseable value, neither of which a
     # command that never consults the setting (`list`, `remove`) should trigger.
     @property
-    def service_url(self):
+    def service_url(self) -> str:
         if self._service_url is None:
             self._service_url = resolve_service_url(self._args, self._config)
         return self._service_url
 
     @property
-    def token(self):
+    def token(self) -> str | None:
         if not self._token_resolved:
             self._token = resolve_token_for_service(
                 self.service_url, self._args, self._config
@@ -1932,25 +2176,26 @@ class ExecutionContext:
             self._token_resolved = True
         return self._token
 
-    def _resolve_min_release_age(self):
+    def _resolve_min_release_age(self) -> None:
         if not self._min_release_age_resolved:
             self._min_release_age, self._min_release_age_str = resolve_min_release_age(
-                getattr(self._args, "min_release_age", None), self._config
+                getattr(self._args, "min_release_age", None) if self._args else None,
+                self._config,
             )
             self._min_release_age_resolved = True
 
     @property
-    def min_release_age(self):
+    def min_release_age(self) -> datetime.timedelta:
         self._resolve_min_release_age()
         return self._min_release_age
 
     @property
-    def min_release_age_str(self):
+    def min_release_age_str(self) -> str:
         self._resolve_min_release_age()
         return self._min_release_age_str
 
     @property
-    def vscode_version(self):
+    def vscode_version(self) -> str | None:
         if not self._vscode_version_fetched:
             self._vscode_version = (
                 None
@@ -1967,7 +2212,9 @@ class ExecutionContext:
 MAX_RETRY_AFTER_SECONDS = 60.0
 
 
-def _post_extension_query(payload, service_url, token=None):
+def _post_extension_query(
+    payload: Mapping[str, object], service_url: str, token: str | None = None
+) -> dict[str, object] | None:
     """POST an extensionquery payload, with a 1h on-disk cache and retries.
 
     Returns the parsed JSON response, or None if the request ultimately failed.
@@ -1997,7 +2244,9 @@ def _post_extension_query(payload, service_url, token=None):
             try:
                 if time.time() - os.path.getmtime(cache_file) < 3600:
                     with open(cache_file, encoding="utf-8") as f:
-                        return json.load(f)
+                        cached = json.load(f)
+                    if isinstance(cached, dict):
+                        return cached
             except (OSError, ValueError):
                 pass
 
@@ -2021,13 +2270,17 @@ def _post_extension_query(payload, service_url, token=None):
 
     max_retries = 3
     backoff = 2.0
-    err = None
+    err: Exception | None = None
     for attempt in range(max_retries + 1):
         retry_reason = None
         retry_after = None
         try:
             with _url_opener.open(req, timeout=30) as response:
                 resp_data = json.loads(response.read().decode("utf-8"))
+            # A gallery that answers with a bare list or string is as useless to
+            # every caller as a failed request, so report it the same way.
+            if not isinstance(resp_data, dict):
+                return None
             if cache_file:
                 write_cache_atomically(cache_file, resp_data)
             return resp_data
@@ -2104,13 +2357,17 @@ GALLERY_QUERY_FLAGS = 0x1 | 0x4 | 0x10
 GALLERY_SEARCH_FLAGS = 0x2 | 0x10 | 0x80 | 0x100 | 0x200
 
 
-def query_marketplace_extensions(ext_ids, service_url=DEFAULT_SERVICE_URL, token=None):
+def query_marketplace_extensions(
+    ext_ids: Sequence[str],
+    service_url: str = DEFAULT_SERVICE_URL,
+    token: str | None = None,
+) -> dict[str, ExtensionMetadata]:
     cleanup_stale_cache()
     if not ext_ids:
         return {}
 
     batch_size = 50
-    extension_map = {}
+    extension_map: dict[str, ExtensionMetadata] = {}
 
     for i in range(0, len(ext_ids), batch_size):
         batch = ext_ids[i : i + batch_size]
@@ -2137,32 +2394,36 @@ def query_marketplace_extensions(ext_ids, service_url=DEFAULT_SERVICE_URL, token
             continue
 
         results = resp_data.get("results", [])
-        if not results:
+        if not results or not isinstance(results, list):
             continue
 
-        extensions = results[0].get("extensions", [])
+        extensions = (
+            results[0].get("extensions", []) if isinstance(results[0], dict) else []
+        )
+        if not isinstance(extensions, list):
+            continue
         for ext in extensions:
-            pub_name = ext.get("publisher", {}).get("publisherName", "")
-            ext_name = ext.get("extensionName", "")
-            full_id = f"{pub_name}.{ext_name}".lower()
-            extension_map[full_id] = ext
+            ident = extension_identity(ext)
+            if not ident.publisher or not ident.name:
+                continue
+            extension_map[ident.full_id] = ext
 
     return extension_map
 
 
 def query_marketplace_search(
-    query_text,
-    max_results=15,
-    target_platform=None,
-    vscode_version=None,
-    include_prerelease=False,
-    min_release_age=None,
-    extensions_config=None,
-    cli_include_prerelease_override=False,
-    cli_min_release_age_override=False,
-    service_url=DEFAULT_SERVICE_URL,
-    token=None,
-):
+    query_text: str,
+    max_results: int = 15,
+    target_platform: str | None = None,
+    vscode_version: str | None = None,
+    include_prerelease: bool = False,
+    min_release_age: datetime.timedelta | None = None,
+    extensions_config: Mapping[str, object] | None = None,
+    cli_include_prerelease_override: bool = False,
+    cli_min_release_age_override: bool = False,
+    service_url: str = DEFAULT_SERVICE_URL,
+    token: str | None = None,
+) -> list[SearchResultItem]:
     cleanup_stale_cache()
     if not query_text:
         return []
@@ -2192,18 +2453,15 @@ def query_marketplace_search(
         return []
 
     results = resp_data.get("results", [])
-    if not results:
+    if not results or not isinstance(results, list) or not isinstance(results[0], dict):
         return []
 
     extensions = results[0].get("extensions", [])
-    if not extensions:
+    if not extensions or not isinstance(extensions, list):
         return []
 
-    ext_ids = [
-        f"{ext.get('publisher', {}).get('publisherName', '')}.{ext.get('extensionName', '')}".lower()
-        for ext in extensions
-        if ext.get("publisher", {}).get("publisherName") and ext.get("extensionName")
-    ]
+    identities = [extension_identity(ext) for ext in extensions]
+    ext_ids = [i.full_id for i in identities if i.publisher and i.name]
     # Re-query each hit by ID instead of trusting the search payload: the
     # detail path is cached, batched, and identical to what install/update
     # consume, so eligibility filtering sees exactly the data those commands
@@ -2212,18 +2470,25 @@ def query_marketplace_search(
         ext_ids, service_url=service_url, token=token
     )
 
-    search_results = []
-    for ext in extensions:
-        pub_name = ext.get("publisher", {}).get("publisherName", "")
-        ext_name = ext.get("extensionName", "")
-        full_id = f"{pub_name}.{ext_name}".lower()
-        display_name = ext.get("displayName") or ext_name
-        description = ext.get("shortDescription") or ""
+    search_results: list[SearchResultItem] = []
+    for ext, ident in zip(extensions, identities, strict=True):
+        if not ident.publisher or not ident.name:
+            continue
+        full_id = ident.full_id
+        display_name = str(ext.get("displayName") or ident.name)
+        description = str(ext.get("shortDescription") or "")
 
-        full_ext = ext_details_map.get(full_id, ext)
+        # The by-ID details when the second query returned them, else whatever
+        # the search payload itself carried.
+        detailed = ext_details_map.get(full_id)
+        full_versions = (detailed if detailed is not None else ext).get("versions", [])
 
-        ext_cfg = extensions_config.get(full_id, {}) if extensions_config else {}
-        skipped_versions = ext_cfg.get("skip_versions", [])
+        ext_cfg_val = extensions_config.get(full_id, {}) if extensions_config else {}
+        ext_cfg: Mapping[str, object] = (
+            ext_cfg_val if isinstance(ext_cfg_val, dict) else {}
+        )
+        skipped_val = ext_cfg.get("skip_versions", [])
+        skipped_versions = skipped_val if isinstance(skipped_val, (list, tuple)) else []
         eff_include_prerelease, eff_min_age, _ = effective_ext_options(
             ext_cfg,
             include_prerelease,
@@ -2233,7 +2498,7 @@ def query_marketplace_search(
         )
 
         compatible_versions = filter_versions(
-            full_ext.get("versions", []),
+            full_versions,
             target_platform,
             vscode_version=vscode_version,
             include_prerelease=eff_include_prerelease,
@@ -2258,9 +2523,15 @@ def query_marketplace_search(
                 eligible_version = "held back"
                 is_held_back = True
         else:
-            all_versions = full_ext.get("versions", [])
-            if all_versions:
-                raw_latest = all_versions[0].get("version", "unknown")
+            all_versions = full_versions
+            # isinstance(list) first: a gallery that sent an object here is
+            # truthy, and indexing it with 0 would raise before the shape check.
+            if (
+                isinstance(all_versions, list)
+                and all_versions
+                and isinstance(all_versions[0], dict)
+            ):
+                raw_latest = str(all_versions[0].get("version", "unknown"))
                 if not eff_include_prerelease and is_prerelease(all_versions[0]):
                     eligible_version = "pre-release"
                     latest_version = raw_latest
@@ -2269,8 +2540,8 @@ def query_marketplace_search(
         search_results.append(
             {
                 "id": full_id,
-                "publisher": pub_name,
-                "name": ext_name,
+                "publisher": ident.publisher,
+                "name": ident.name,
                 "displayName": display_name,
                 "description": description,
                 "latest": latest_version,
@@ -2282,7 +2553,9 @@ def query_marketplace_search(
     return search_results
 
 
-def resolve_download_target(args, config):
+def resolve_download_target(
+    args: object, config: Mapping[str, object] | None
+) -> tuple[str, bool]:
     """Return (directory, is_private_temp) for .vsix downloads.
 
     Without an explicit --download-dir the files go into a fresh 0700 directory
@@ -2290,33 +2563,37 @@ def resolve_download_target(args, config):
     predictable, so a local attacker could otherwise pre-plant a symlink or swap
     the package between download and install.
     """
+    cfg = config or {}
     download_dir = resolve_option(
-        getattr(args, "download_dir", None), config, "download_dir", None
+        getattr(args, "download_dir", None) if args else None,
+        cfg,
+        "download_dir",
+        None,
     )
     # A blank --download-dir would silently mean the working directory, which
     # then keeps the .vsix files nobody asked it to keep.
     if download_dir is not None and str(download_dir).strip():
-        return os.path.expanduser(download_dir), False
+        return os.path.expanduser(str(download_dir)), False
     return tempfile.mkdtemp(prefix="code-extensions-"), True
 
 
-def discard_download_dir(directory, is_private_temp):
+def discard_download_dir(directory: str, is_private_temp: bool) -> None:
     if is_private_temp:
         shutil.rmtree(directory, ignore_errors=True)
 
 
 def download_and_install(
-    code_binary,
-    url,
-    filepath,
-    display_id,
-    version,
-    platform_name,
-    token=None,
-    service_url=None,
-    force=False,
-    cleanup=False,
-):
+    code_binary: str | Sequence[str],
+    url: str,
+    filepath: str,
+    display_id: str,
+    version: str,
+    platform_name: str,
+    token: str | None = None,
+    service_url: str | None = None,
+    force: bool = False,
+    cleanup: bool = False,
+) -> bool:
     """Download a .vsix from url and install it with the code CLI.
 
     Shared by `install` and `update` so the two cannot drift. Returns True
@@ -2326,7 +2603,7 @@ def download_and_install(
     """
     # Accept a raw string as well as a parsed list, like the other code-CLI
     # helpers, so callers cannot pass "code" and unpack it into characters.
-    code_binary = parse_code_binary(code_binary)
+    parsed_code_binary = parse_code_binary(code_binary)
     print(
         f"Downloading {Colors.CYAN}{display_id}{Colors.ENDC} v{Colors.GREEN}{version}{Colors.ENDC} ({platform_name})..."
     )
@@ -2341,7 +2618,7 @@ def download_and_install(
     )
     installed = False
     try:
-        cmd = [*code_binary, "--install-extension", filepath]
+        cmd = [*parsed_code_binary, "--install-extension", filepath]
         if force:
             cmd.append("--force")
         run_code_cmd(cmd, retries=0)
@@ -2362,7 +2639,7 @@ def download_and_install(
     return installed
 
 
-def open_for_download(filepath):
+def open_for_download(filepath: str) -> int:
     """Open a download target for writing, refusing to follow a symlink."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -2370,7 +2647,12 @@ def open_for_download(filepath):
     return os.open(filepath, flags, 0o600)
 
 
-def download_vsix(url, filepath, token=None, service_url=None):
+def download_vsix(
+    url: str,
+    filepath: str,
+    token: str | None = None,
+    service_url: str | None = None,
+) -> None:
     parent = os.path.dirname(filepath)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -2406,10 +2688,11 @@ def download_vsix(url, filepath, token=None, service_url=None):
 
     with _url_opener.open(req, timeout=30) as response:
         content_encoding = response.headers.get("Content-Encoding", "").lower()
-        total_size = response.headers.get("Content-Length")
-        if total_size:
+        total_size_hdr = response.headers.get("Content-Length")
+        total_size: int | None = None
+        if total_size_hdr:
             try:
-                total_size = int(total_size)
+                total_size = int(total_size_hdr)
             except ValueError:
                 total_size = None
 
@@ -2430,7 +2713,7 @@ def download_vsix(url, filepath, token=None, service_url=None):
         try:
             with os.fdopen(fd, "wb") as f:
 
-                def emit(data):
+                def emit(data: bytes) -> None:
                     nonlocal bytes_written
                     if not data:
                         return
@@ -2463,7 +2746,9 @@ def download_vsix(url, filepath, token=None, service_url=None):
             sys.stdout.flush()
 
 
-def report_download_progress(show_progress, bytes_read, total_size):
+def report_download_progress(
+    show_progress: bool, bytes_read: int, total_size: int | None
+) -> None:
     if not show_progress:
         return
     read_mb = bytes_read / (1024 * 1024)
@@ -2486,9 +2771,13 @@ def report_download_progress(show_progress, bytes_read, total_size):
 CSI_ARROW_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left"}
 
 
-def get_key():
+def get_key() -> str | None:
     if not HAS_TTY:
         return None
+    import select
+    import termios
+    import tty
+
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     try:
@@ -2545,7 +2834,7 @@ def get_key():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-def display_width(text):
+def display_width(text: object) -> int:
     clean_text = ANSI_ESCAPE.sub("", str(text))
     w = 0
     for ch in clean_text:
@@ -2556,16 +2845,16 @@ def display_width(text):
     return w
 
 
-def truncate(text, width):
-    text = str(text)
+def truncate(text: object, width: int) -> str:
+    text_str = str(text)
     if width <= 0:
         return ""
-    if display_width(text) <= width:
-        return text
+    if display_width(text_str) <= width:
+        return text_str
 
     current_w = 0
-    chars = []
-    for ch in text:
+    chars: list[str] = []
+    for ch in text_str:
         ch_w = 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
         if current_w + ch_w > width:
             while chars and (current_w + 1 > width):
@@ -2580,7 +2869,7 @@ def truncate(text, width):
     return "".join(chars)
 
 
-def fit_column(text, width):
+def fit_column(text: object, width: int) -> str:
     t = truncate(text, width)
     dw = display_width(t)
     if dw < width:
@@ -2588,7 +2877,7 @@ def fit_column(text, width):
     return t
 
 
-def format_action_bar(items):
+def format_action_bar(items: Sequence[tuple[str, str, str]]) -> str:
     formatted = []
     for keys_str, action_name, color_code in items:
         formatted.append(
@@ -2597,7 +2886,7 @@ def format_action_bar(items):
     return f"{Colors.BOLD}Actions:{Colors.ENDC} " + "   ".join(formatted)
 
 
-def prompt_yes_no(question, default=False):
+def prompt_yes_no(question: str, default: bool = False) -> bool:
     suffix = " [Y/n] " if default else " [y/N] "
     try:
         reply = input(f"{Colors.YELLOW}{question}{suffix}{Colors.ENDC}").strip().lower()
@@ -2609,7 +2898,7 @@ def prompt_yes_no(question, default=False):
         return False
 
 
-def handle_install(args, config):
+def handle_install(args: argparse.Namespace, config: Mapping[str, object]) -> None:
     ctx = ExecutionContext(args, config)
 
     target_specs = list(args.extensions or [])
@@ -2642,8 +2931,8 @@ def handle_install(args, config):
         )
         sys.exit(1)
 
-    parsed_targets = []
-    failures = []
+    parsed_targets: list[tuple[str, str | None]] = []
+    failures: list[str] = []
     for spec in target_specs:
         spec = spec.strip()
         if "@" in spec:
@@ -2690,11 +2979,13 @@ def handle_install(args, config):
                 failures.append(ext_id)
                 continue
 
-            pub_name = ext_obj.get("publisher", {}).get("publisherName", "")
-            ext_name = ext_obj.get("extensionName", "")
-            full_id = f"{pub_name}.{ext_name}".lower()
+            ident = extension_identity(ext_obj)
+            full_id = ident.full_id
 
-            ext_cfg = ctx.extensions_config.get(full_id, {})
+            ext_cfg_val = ctx.extensions_config.get(full_id, {})
+            ext_cfg: Mapping[str, object] = (
+                ext_cfg_val if isinstance(ext_cfg_val, dict) else {}
+            )
             eff_include_prerelease, eff_min_age, eff_min_age_str = (
                 effective_ext_options(
                     ext_cfg,
@@ -2714,7 +3005,12 @@ def handle_install(args, config):
             # An explicitly requested version overrides the config's opinion about
             # pre-releases and skipped versions, the same way it overrides the
             # min-release-age gate below.
-            skipped_versions = [] if req_ver else ext_cfg.get("skip_versions", [])
+            skipped_val = ext_cfg.get("skip_versions", [])
+            skipped_versions = (
+                []
+                if req_ver
+                else (skipped_val if isinstance(skipped_val, (list, tuple)) else [])
+            )
 
             compatible_versions = filter_versions(
                 ext_obj.get("versions", []),
@@ -2739,8 +3035,6 @@ def handle_install(args, config):
 
             latest_ver_obj = compatible_versions[0]
             eligible_ver_obj = first_eligible_version(compatible_versions, eff_min_age)
-
-            selected_ver_obj = None
 
             if req_ver:
                 target_ver_obj = compatible_versions[0]
@@ -2815,13 +3109,15 @@ def handle_install(args, config):
             target_plat = selected_ver_obj.get("targetPlatform") or "universal"
             url = get_vsix_download_url(
                 selected_ver_obj,
-                pub_name,
-                ext_name,
+                ident.publisher,
+                ident.name,
                 target_version,
                 target_plat,
                 ctx.service_url,
             )
-            filename = vsix_filename(pub_name, ext_name, target_version, target_plat)
+            filename = vsix_filename(
+                ident.publisher, ident.name, target_version, target_plat
+            )
             filepath = os.path.join(download_dir_resolved, filename)
 
             # Downgrading to an older version needs --force, just like a
@@ -2858,39 +3154,45 @@ def handle_install(args, config):
 
 
 def check_updates(
-    installed_exts,
-    target_platform,
-    vscode_version=None,
-    include_prerelease=False,
-    min_release_age=None,
-    extensions_config=None,
-    cli_include_prerelease_override=False,
-    cli_min_release_age_override=False,
-    service_url=DEFAULT_SERVICE_URL,
-    token=None,
-):
+    installed_exts: Mapping[str, str],
+    target_platform: str,
+    vscode_version: str | None = None,
+    include_prerelease: bool = False,
+    min_release_age: datetime.timedelta | None = None,
+    extensions_config: Mapping[str, object] | None = None,
+    cli_include_prerelease_override: bool = False,
+    cli_min_release_age_override: bool = False,
+    service_url: str = DEFAULT_SERVICE_URL,
+    token: str | None = None,
+) -> list[UpdateInfo]:
     ext_ids = list(installed_exts.keys())
     if extensions_config:
         ext_ids = [
             eid
             for eid in ext_ids
-            if not extensions_config.get(eid.lower(), {}).get("ignore", False)
+            if not (
+                isinstance(entry_cfg := extensions_config.get(eid.lower()), dict)
+                and entry_cfg.get("ignore", False)
+            )
         ]
 
     marketplace_data = query_marketplace_extensions(
         ext_ids, service_url=service_url, token=token
     )
-    updates = []
+    updates: list[UpdateInfo] = []
 
     for full_id, ext in marketplace_data.items():
-        pub_name = ext.get("publisher", {}).get("publisherName", "")
-        ext_name = ext.get("extensionName", "")
+        ident = extension_identity(ext)
         installed_ver = installed_exts.get(full_id)
         if not installed_ver:
             continue
 
-        ext_cfg = extensions_config.get(full_id, {}) if extensions_config else {}
-        skipped_versions = ext_cfg.get("skip_versions", [])
+        ext_cfg_val = extensions_config.get(full_id, {}) if extensions_config else {}
+        ext_cfg: Mapping[str, object] = (
+            ext_cfg_val if isinstance(ext_cfg_val, dict) else {}
+        )
+        skipped_val = ext_cfg.get("skip_versions", [])
+        skipped_versions = skipped_val if isinstance(skipped_val, (list, tuple)) else []
         eff_include_prerelease, eff_min_age, _ = effective_ext_options(
             ext_cfg,
             include_prerelease,
@@ -2922,7 +3224,7 @@ def check_updates(
                 last_updated[:10] if len(last_updated) >= 10 else last_updated
             )
 
-            eligible_version = None
+            eligible_version: str | None = None
             eligible_release_date = ""
             eligible_platform = "universal"
 
@@ -2938,37 +3240,37 @@ def check_updates(
                         eligible_ver_obj.get("targetPlatform") or "universal"
                     )
 
+            latest_platform = latest_ver_obj.get("targetPlatform")
             latest_download_url = get_vsix_download_url(
                 latest_ver_obj,
-                pub_name,
-                ext_name,
+                ident.publisher,
+                ident.name,
                 latest_version,
-                latest_ver_obj.get("targetPlatform"),
+                latest_platform,
                 service_url,
             )
             eligible_download_url = (
                 get_vsix_download_url(
                     eligible_ver_obj,
-                    pub_name,
-                    ext_name,
+                    ident.publisher,
+                    ident.name,
                     eligible_version,
                     eligible_platform,
                     service_url,
                 )
-                if eligible_ver_obj
+                if (eligible_ver_obj and eligible_version)
                 else None
             )
 
             updates.append(
                 {
                     "id": full_id,
-                    "publisher": pub_name,
-                    "name": ext_name,
+                    "publisher": ident.publisher,
+                    "name": ident.name,
                     "installed": installed_ver,
                     "latest": latest_version,
                     "latest_release_date": latest_release_date,
-                    "latest_platform": latest_ver_obj.get("targetPlatform")
-                    or "universal",
+                    "latest_platform": latest_platform or "universal",
                     "latest_download_url": latest_download_url,
                     "eligible": eligible_version,
                     "eligible_release_date": eligible_release_date,
@@ -2981,7 +3283,7 @@ def check_updates(
     return updates
 
 
-def print_updates_table(updates):
+def print_updates_table(updates: Sequence[UpdateInfo]) -> None:
     widths = (45, 12, 12, 12, 15, 12)
     print(
         f"{Colors.BOLD}{fit_column('Extension ID', 45)} {fit_column('Installed', 12)} {fit_column('Eligible', 12)} {fit_column('Latest', 12)} {fit_column('Release Date', 15)} {fit_column('Platform', 12)}{Colors.ENDC}"
@@ -3004,18 +3306,18 @@ def print_updates_table(updates):
 
 
 def run_list_picker(
-    count,
-    layout,
-    header,
-    row,
-    actions,
-    unit_label,
-    selected=None,
-    cursor_idx=0,
-    top=0,
-    toggle_all=None,
-    extra_keys=(),
-):
+    count: int,
+    layout: Callable[[int], tuple[dict[str, int], int]],
+    header: Callable[[dict[str, int]], str],
+    row: Callable[[int, dict[str, int], bool, bool], str],
+    actions: Sequence[tuple[str, str, str]],
+    unit_label: str,
+    selected: list[bool] | None = None,
+    cursor_idx: int = 0,
+    top: int = 0,
+    toggle_all: Callable[[], list[bool]] | None = None,
+    extra_keys: Sequence[str] = (),
+) -> tuple[str, list[bool], int, int]:
     """Drive a scrollable checkbox list until the user commits or leaves.
 
     Shared by the update, removal and search screens, which differ only in their
@@ -3082,7 +3384,7 @@ def run_list_picker(
             sys.stdout.flush()
 
             key = get_key()
-            if key in extra_keys:
+            if key is not None and key in extra_keys:
                 return key, selected, cursor_idx, top
             # None means stdin gave EOF (terminal went away); treat it as cancel
             # rather than looping on a dead descriptor.
@@ -3106,7 +3408,9 @@ def run_list_picker(
         sys.stdout.flush()
 
 
-def select_updates(updates, action_label="Install"):
+def select_updates(
+    updates: list[UpdateInfo], action_label: str = "Install"
+) -> list[UpdateInfo]:
     if not HAS_TTY or not sys.stdin.isatty() or not sys.stdout.isatty():
         return updates
 
@@ -3114,17 +3418,17 @@ def select_updates(updates, action_label="Install"):
     W_VER, W_DATE, W_PLAT = 12, 12, 12
     OVERHEAD = 6 + 1 + (W_VER + 1) * 3 + (W_DATE + 1) + W_PLAT + 1
 
-    def layout(cols):
+    def layout(cols: int) -> tuple[dict[str, int], int]:
         id_w = max(12, cols - OVERHEAD)
         return {"id": id_w}, OVERHEAD + id_w
 
-    def header(widths):
+    def header(widths: dict[str, int]) -> str:
         return (
             f"{Colors.BOLD}{'':6}{fit_column('Extension ID', widths['id'])} {fit_column('Installed', W_VER)} "
             f"{fit_column('Eligible', W_VER)} {fit_column('Latest', W_VER)} {fit_column('Release', W_DATE)} {fit_column('Platform', W_PLAT)}{Colors.ENDC}"
         )
 
-    def row(i, widths, is_cursor, is_selected):
+    def row(i: int, widths: dict[str, int], is_cursor: bool, is_selected: bool) -> str:
         update = updates[i]
         prefix = ">" if is_cursor else " "
         if update["eligible"]:
@@ -3147,6 +3451,7 @@ def select_updates(updates, action_label="Install"):
         )
 
     eligible_mask = [bool(u["eligible"]) for u in updates]
+    selected: list[bool] = []
     try:
         action, selected, _cursor, _top = run_list_picker(
             n,
@@ -3171,7 +3476,7 @@ def select_updates(updates, action_label="Install"):
         print("Selection cancelled.")
         sys.exit(0)
 
-    chosen = []
+    chosen: list[UpdateInfo] = []
     for i in range(n):
         if selected[i]:
             update = updates[i]
@@ -3184,7 +3489,11 @@ def select_updates(updates, action_label="Install"):
     return chosen
 
 
-def resolve_installed_targets(specs, installed_exts, exact_name=False):
+def resolve_installed_targets(
+    specs: Sequence[str],
+    installed_exts: Mapping[str, str],
+    exact_name: bool = False,
+) -> dict[str, str]:
     """Resolve user-supplied specs to a subset of installed extensions.
 
     Accepts full IDs (``publisher.name``) or partial names (matched as a
@@ -3195,7 +3504,7 @@ def resolve_installed_targets(specs, installed_exts, exact_name=False):
     extension. Returns a dict of the matched installed extensions; unresolved
     or ambiguous specs are reported and skipped.
     """
-    resolved = {}
+    resolved: dict[str, str] = {}
     for spec in specs:
         s = spec.strip().lower()
         if "@" in s:
@@ -3239,7 +3548,7 @@ def resolve_installed_targets(specs, installed_exts, exact_name=False):
     return resolved
 
 
-def handle_update(args, config):
+def handle_update(args: argparse.Namespace, config: Mapping[str, object]) -> None:
     ctx = ExecutionContext(args, config)
     dry_run = bool(getattr(args, "dry_run", None))
 
@@ -3323,7 +3632,7 @@ def handle_update(args, config):
             f"{Colors.YELLOW}{Colors.BOLD}[Dry-run] Would update {len(selected_updates)} extension(s):{Colors.ENDC}"
         )
         for update in selected_updates:
-            version = update["eligible"]
+            version = eligible_update_version(update)
             platform = update["eligible_platform"]
             print(
                 f"  {Colors.CYAN}{update['id']}{Colors.ENDC}: {Colors.YELLOW}{update['installed']}{Colors.ENDC} -> {Colors.GREEN}{version}{Colors.ENDC} ({platform})"
@@ -3341,7 +3650,7 @@ def handle_update(args, config):
         for update in selected_updates:
             pub_name = update["publisher"]
             ext_name = update["name"]
-            version = update["eligible"]
+            version = eligible_update_version(update)
             platform = update["eligible_platform"]
             url = resolve_update_url(update, ctx.service_url)
             filepath = os.path.join(
@@ -3375,7 +3684,7 @@ def handle_update(args, config):
         sys.exit(1)
 
 
-def select_removals(installed_exts):
+def select_removals(installed_exts: Mapping[str, str]) -> list[str]:
     if not HAS_TTY or not sys.stdin.isatty() or not sys.stdout.isatty():
         return []
 
@@ -3387,17 +3696,17 @@ def select_removals(installed_exts):
     W_VER = 15
     OVERHEAD = 6 + 1 + W_VER + 1
 
-    def layout(cols):
+    def layout(cols: int) -> tuple[dict[str, int], int]:
         id_w = max(12, cols - OVERHEAD)
         return {"id": id_w}, OVERHEAD + id_w
 
-    def header(widths):
+    def header(widths: dict[str, int]) -> str:
         return (
             f"{Colors.BOLD}{'':6}{fit_column('Extension ID', widths['id'])} "
             f"{fit_column('Version', W_VER)}{Colors.ENDC}"
         )
 
-    def row(i, widths, is_cursor, is_selected):
+    def row(i: int, widths: dict[str, int], is_cursor: bool, is_selected: bool) -> str:
         ext_id, ver = ext_list[i]
         prefix = ">" if is_cursor else " "
         mark = f"{Colors.RED}x{Colors.ENDC}" if is_selected else " "
@@ -3406,6 +3715,7 @@ def select_removals(installed_exts):
             f"{Colors.YELLOW}{fit_column(ver, W_VER)}{Colors.ENDC}"
         )
 
+    selected: list[bool] = []
     try:
         action, selected, _cursor, _top = run_list_picker(
             n,
@@ -3431,7 +3741,7 @@ def select_removals(installed_exts):
     return [ext_list[i][0] for i in range(n) if selected[i]]
 
 
-def handle_remove(args, config):
+def handle_remove(args: argparse.Namespace, config: Mapping[str, object]) -> None:
     ctx = ExecutionContext(args, config)
 
     installed_exts = get_installed_extensions(ctx.code_binary)
@@ -3492,7 +3802,7 @@ def handle_remove(args, config):
             print(f"  {Colors.RED}✗ Removal failed: {e}{Colors.ENDC}", file=sys.stderr)
 
 
-def handle_list(args, config):
+def handle_list(args: argparse.Namespace, config: Mapping[str, object]) -> None:
     ctx = ExecutionContext(args, config)
     installed_exts = get_installed_extensions(ctx.code_binary)
 
@@ -3563,7 +3873,11 @@ def handle_list(args, config):
     print(f"\nTotal: {len(ext_items)} extension(s)")
 
 
-def show_search_item_info(item, config, args):
+def show_search_item_info(
+    item: SearchResultItem,
+    config: Mapping[str, object],
+    args: argparse.Namespace,
+) -> str:
     info_args = argparse.Namespace(
         extension=item["id"],
         code_binary=getattr(args, "code_binary", None),
@@ -3601,7 +3915,9 @@ def show_search_item_info(item, config, args):
             return "back"
 
 
-def install_search_items(ext_ids, config, args):
+def install_search_items(
+    ext_ids: Sequence[str], config: Mapping[str, object], args: argparse.Namespace
+) -> None:
     print(
         f"\n{Colors.GREEN}{Colors.BOLD}Installing selected extension(s):{Colors.ENDC} {', '.join(ext_ids)}\n"
     )
@@ -3622,7 +3938,12 @@ def install_search_items(ext_ids, config, args):
     handle_install(install_args, config)
 
 
-def interactive_search_flow(search_results, config, args, installed_exts=None):
+def interactive_search_flow(
+    search_results: list[SearchResultItem],
+    config: Mapping[str, object],
+    args: argparse.Namespace,
+    installed_exts: Mapping[str, str] | None = None,
+) -> None:
     if not HAS_TTY or not sys.stdin.isatty() or not sys.stdout.isatty():
         return
 
@@ -3635,30 +3956,33 @@ def interactive_search_flow(search_results, config, args, installed_exts=None):
             resolve_option(args.code_binary, config, "code_binary", "code")
         )
         installed_exts = get_installed_extensions(code_binary, ignore_errors=True)
+    # Bound to its own name so the row renderer below closes over the resolved
+    # mapping rather than the still-optional parameter.
+    installed_ids = installed_exts
 
     W_VER = 12
     W_NAME = 25
     OVERHEAD = 6 + 1 + (W_NAME + 1) + (W_VER + 1) + 1
     max_id_len = max((display_width(res["id"]) for res in search_results), default=35)
 
-    def layout(cols):
+    def layout(cols: int) -> tuple[dict[str, int], int]:
         avail = max(20, cols - OVERHEAD)
         id_w = max(12, min(max_id_len, max(35, avail // 3)))
         desc_w = max(10, cols - OVERHEAD - id_w)
         return {"id": id_w, "desc": desc_w}, OVERHEAD + id_w + desc_w
 
-    def header(widths):
+    def header(widths: dict[str, int]) -> str:
         return (
             f"{Colors.BOLD}{'':6}{fit_column('Extension ID', widths['id'])} {fit_column('Display Name', W_NAME)} "
             f"{fit_column('Eligible', W_VER)} {fit_column('Description', widths['desc'])}{Colors.ENDC}"
         )
 
-    def row(i, widths, is_cursor, is_selected):
+    def row(i: int, widths: dict[str, int], is_cursor: bool, is_selected: bool) -> str:
         res = search_results[i]
         prefix = ">" if is_cursor else " "
         mark = f"{Colors.GREEN}x{Colors.ENDC}" if is_selected else " "
         ver_color = Colors.YELLOW if res["is_held_back"] else Colors.GREEN
-        is_installed = res["id"].lower() in installed_exts
+        is_installed = res["id"].lower() in installed_ids
         id_color = Colors.GREEN if is_installed else Colors.CYAN
         return (
             f"{prefix} [{mark}] {id_color}{fit_column(res['id'], widths['id'])}{Colors.ENDC} "
@@ -3714,7 +4038,7 @@ def interactive_search_flow(search_results, config, args, installed_exts=None):
         return
 
 
-def handle_search(args, config):
+def handle_search(args: argparse.Namespace, config: Mapping[str, object]) -> None:
     ctx = ExecutionContext(args, config)
 
     if not args.quiet:
@@ -3780,7 +4104,7 @@ def handle_search(args, config):
     print(f"\nFound {len(results)} matching extension(s).")
 
 
-def handle_info(args, config):
+def handle_info(args: argparse.Namespace, config: Mapping[str, object]) -> None:
     ctx = ExecutionContext(args, config)
 
     ext_id = args.extension.strip().lower()
@@ -3822,17 +4146,17 @@ def handle_info(args, config):
         )
         sys.exit(1)
 
-    pub_name = ext_obj.get("publisher", {}).get("publisherName", "")
-    pub_disp = ext_obj.get("publisher", {}).get("displayName") or pub_name
-    ext_name = ext_obj.get("extensionName", "")
-    full_id = f"{pub_name}.{ext_name}".lower()
-    display_name = ext_obj.get("displayName") or ext_name
-    description = ext_obj.get("shortDescription") or "No description provided."
+    ident = extension_identity(ext_obj)
+    full_id = ident.full_id
+    display_name = str(ext_obj.get("displayName") or ident.name)
+    description = str(ext_obj.get("shortDescription") or "No description provided.")
 
     versions = ext_obj.get("versions", [])
 
-    ext_cfg = ctx.extensions_config.get(full_id, {})
-    skipped_versions = ext_cfg.get("skip_versions", [])
+    ext_cfg_val = ctx.extensions_config.get(full_id, {})
+    ext_cfg: Mapping[str, object] = ext_cfg_val if isinstance(ext_cfg_val, dict) else {}
+    skipped_val = ext_cfg.get("skip_versions", [])
+    skipped_versions = skipped_val if isinstance(skipped_val, (list, tuple)) else []
     eff_include_prerelease, eff_min_age, _ = effective_ext_options(
         ext_cfg,
         ctx.include_prerelease,
@@ -3866,11 +4190,13 @@ def handle_info(args, config):
         else:
             eligible_ver = "held back"
             is_held_back = True
-    elif versions:
+    elif isinstance(versions, list) and versions and isinstance(versions[0], dict):
         # Nothing compatible with this host; still report the newest published
-        # version so the user sees what exists, but flag it as ineligible.
+        # version so the user sees what exists, but flag it as ineligible. This
+        # is the one read of `versions` that bypasses filter_versions, so it
+        # repeats that function's shape check rather than trusting the payload.
         latest_ver_obj = versions[0]
-        latest_ver = latest_ver_obj.get("version", "unknown")
+        latest_ver = str(latest_ver_obj.get("version", "unknown"))
         eligible_ver = "incompatible"
         is_held_back = True
 
@@ -3878,7 +4204,11 @@ def handle_info(args, config):
     release_date = last_updated[:10] if len(last_updated) >= 10 else last_updated
 
     categories = ext_obj.get("categories", [])
-    cat_str = ", ".join(categories) if categories else "None"
+    cat_str = (
+        ", ".join(str(c) for c in categories)
+        if isinstance(categories, (list, tuple)) and categories
+        else "None"
+    )
 
     # Almost everything reported here is gallery metadata, so a missing or
     # broken 'code' binary costs the installed-version line, not the command.
@@ -3891,18 +4221,18 @@ def handle_info(args, config):
     else:
         installed_status = f"{Colors.YELLOW}Not installed{Colors.ENDC}"
 
-    props = latest_ver_obj.get("properties", []) if latest_ver_obj else []
-    repo_url = None
-    homepage_url = None
-    pricing = "Free"
-    for p in props:
-        k, v = p.get("key"), p.get("value")
-        if k == "Microsoft.VisualStudio.Services.Links.Source":
-            repo_url = v
-        elif k == "Microsoft.VisualStudio.Services.Links.Getstarted":
-            homepage_url = v
-        elif k == "Microsoft.VisualStudio.Services.Content.Pricing":
-            pricing = v
+    repo_url = version_property(
+        latest_ver_obj, "Microsoft.VisualStudio.Services.Links.Source"
+    )
+    homepage_url = version_property(
+        latest_ver_obj, "Microsoft.VisualStudio.Services.Links.Getstarted"
+    )
+    pricing = (
+        version_property(
+            latest_ver_obj, "Microsoft.VisualStudio.Services.Content.Pricing"
+        )
+        or "Free"
+    )
 
     print(
         f"\n{Colors.BOLD}{Colors.CYAN}{display_name}{Colors.ENDC} ({Colors.BOLD}{full_id}{Colors.ENDC})"
@@ -3911,7 +4241,9 @@ def handle_info(args, config):
     # columns, so an underline sized by len() falls short of the name.
     # +3 for the ' (' and ')' that wrap the id on the line above.
     print("=" * (display_width(display_name) + display_width(full_id) + 3))
-    print(f"  {Colors.BOLD}Publisher:{Colors.ENDC}   {pub_disp} ({pub_name})")
+    print(
+        f"  {Colors.BOLD}Publisher:{Colors.ENDC}   {ident.publisher_display} ({ident.publisher})"
+    )
     print(f"  {Colors.BOLD}Latest Ver:{Colors.ENDC}  v{latest_ver} ({release_date})")
     if is_held_back:
         if eligible_ver == "incompatible":
@@ -3941,7 +4273,7 @@ def handle_info(args, config):
     print(f"    {description}\n")
 
 
-def dir_size(path):
+def dir_size(path: str) -> int:
     total = 0
     for root, _dirs, files in os.walk(path):
         for name in files:
@@ -3950,7 +4282,7 @@ def dir_size(path):
     return total
 
 
-def handle_clean(args, config):
+def handle_clean(_args: argparse.Namespace, _config: Mapping[str, object]) -> None:
     cache_dir = get_cache_dir()
     temp_dir = tempfile.gettempdir()
 
@@ -4014,7 +4346,12 @@ def handle_clean(args, config):
 # a name added here reaches the parser and all four scripts at once instead of
 # silently going missing from one of them.
 
-CliChoice = namedtuple("CliChoice", "name aliases summary")
+
+class CliChoice(NamedTuple):
+    name: str
+    aliases: tuple[str, ...]
+    summary: str
+
 
 SUBCOMMANDS = (
     CliChoice("install", (), "Install VS Code extension(s)"),
@@ -4042,17 +4379,30 @@ SUBCOMMAND_ALIASES = {c.name: list(c.aliases) for c in SUBCOMMANDS}
 CONFIG_ACTION_CHOICES = [n for c in CONFIG_ACTIONS for n in (c.name, *c.aliases)]
 
 
-def subcommand_names(*names):
+def subcommand_names(*names: str) -> list[str]:
     """Canonical subcommand names plus their aliases, in registration order."""
     return [n for name in names for n in (name, *SUBCOMMAND_ALIASES[name])]
 
 
 # Options, with the argparse help text and the shorter summary the completion
 # scripts show. `value` is None for switches, else (label, zsh completer).
-CliOption = namedtuple("CliOption", "flags help summary value kwargs")
+class CliOption(NamedTuple):
+    flags: tuple[str, ...]
+    help: str
+    summary: str
+    value: tuple[str, str] | None
+    # add_argument's own keyword union (action, nargs, type, choices, ...); it
+    # has no public type, so the table stores it as-is and hands it straight on.
+    kwargs: dict[str, Any]
 
 
-def _switch(flags, help_text, summary, default=None, **kwargs):
+def _switch(
+    flags: tuple[str, ...],
+    help_text: str,
+    summary: str,
+    default: object = None,
+    **kwargs: object,
+) -> CliOption:
     return CliOption(
         flags,
         help_text,
@@ -4062,7 +4412,14 @@ def _switch(flags, help_text, summary, default=None, **kwargs):
     )
 
 
-def _valued(flags, help_text, summary, value, default=None, **kwargs):
+def _valued(
+    flags: tuple[str, ...],
+    help_text: str,
+    summary: str,
+    value: tuple[str, str],
+    default: object = None,
+    **kwargs: object,
+) -> CliOption:
     return CliOption(flags, help_text, summary, value, {"default": default, **kwargs})
 
 
@@ -4205,13 +4562,15 @@ SUBCOMMAND_OPTIONS = {
 }
 
 
-def add_options(parser, options):
+def add_options(
+    parser: argparse.ArgumentParser, options: Sequence[CliOption]
+) -> argparse.ArgumentParser:
     for opt in options:
         parser.add_argument(*opt.flags, help=opt.help, **opt.kwargs)
     return parser
 
 
-def _fish_option(opt, predicate=None):
+def _fish_option(opt: CliOption, predicate: str | None = None) -> str:
     parts = ["complete -c code-extensions"]
     if predicate:
         parts.append(f'-n "{predicate}"')
@@ -4227,9 +4586,9 @@ def _fish_option(opt, predicate=None):
     return " ".join(parts)
 
 
-def _fish_subcommand_options():
+def _fish_subcommand_options() -> str:
     """One completion line per option, listing every subcommand that takes it."""
-    grouped = {}
+    grouped: dict[tuple[tuple[str, ...], str], tuple[CliOption, list[str]]] = {}
     for name in CANONICAL_SUBCOMMANDS:
         for opt in SUBCOMMAND_OPTIONS[name]:
             grouped.setdefault((opt.flags, opt.summary), (opt, []))[1].append(name)
@@ -4242,11 +4601,11 @@ def _fish_subcommand_options():
     )
 
 
-def _bash_flags(options):
+def _bash_flags(options: Sequence[CliOption]) -> str:
     return " ".join(flag for opt in options for flag in opt.flags)
 
 
-def _zsh_option(opt):
+def _zsh_option(opt: CliOption) -> str:
     value = f":{opt.value[0]}:{opt.value[1]}" if opt.value else ""
     if len(opt.flags) == 1:
         return f"'{opt.flags[0]}[{opt.summary}]{value}'"
@@ -4254,7 +4613,7 @@ def _zsh_option(opt):
     return f"'({short} {long})'{{{short},{long}}}'[{opt.summary}]{value}'"
 
 
-def _zsh_options(options, indent):
+def _zsh_options(options: Sequence[CliOption], indent: int) -> str:
     pad = " " * indent
     return " \\\n".join(pad + _zsh_option(opt) for opt in options)
 
@@ -4266,7 +4625,12 @@ _ALIAS_MARKER_RE = re.compile(r"@@ALIASES:([a-z,]+)@@")
 _FLAGS_MARKER_RE = re.compile(r"@@FLAGS:([a-z]+)@@")
 
 
-def _render_completion(template, join_names, markers, format_flags=None):
+def _render_completion(
+    template: str,
+    join_names: Callable[[Sequence[str]], str],
+    markers: Mapping[str, str],
+    format_flags: Callable[[str], str] | None = None,
+) -> str:
     script = _ALIAS_MARKER_RE.sub(
         lambda m: join_names(subcommand_names(*m.group(1).split(","))), template
     )
@@ -4539,7 +4903,7 @@ Register-ArgumentCompleter -Native -CommandName 'code-extensions' -ScriptBlock {
 """
 
 
-def _ps_array(names):
+def _ps_array(names: Sequence[str]) -> str:
     return "@(" + ", ".join(f"'{n}'" for n in names) + ")"
 
 
@@ -4561,7 +4925,7 @@ SHELL_COMPLETION_SCRIPTS = {
 }
 
 
-def handle_completion(args, config):
+def handle_completion(args: argparse.Namespace, _config: Mapping[str, object]) -> None:
     shell = args.shell.lower().strip()
     script = SHELL_COMPLETION_SCRIPTS.get(shell)
     if script is None:
@@ -4590,7 +4954,7 @@ for _name, _aliases in SUBCOMMAND_ALIASES.items():
         HANDLERS[_alias] = HANDLERS[_name]
 
 
-def main():
+def main() -> None:
     enable_colors()
     config = load_config()
 
@@ -4767,8 +5131,11 @@ if __name__ == "__main__":
         # stderr, because the same error also comes from a tcgetattr that fails
         # on a descriptor isatty() nonetheless called a terminal, and vanishing
         # with no output at all leaves nothing to debug.
-        if HAS_TTY and isinstance(e, termios.error):
-            with contextlib.suppress(OSError):
-                print(f"Terminal error: {e}", file=sys.stderr)
-            sys.exit(130)
+        if HAS_TTY:
+            import termios
+
+            if isinstance(e, termios.error):
+                with contextlib.suppress(OSError):
+                    print(f"Terminal error: {e}", file=sys.stderr)
+                sys.exit(130)
         raise

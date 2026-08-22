@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+# pyright: reportUninitializedInstanceVariable=false, reportUnusedParameter=false
 
 import argparse
 import contextlib
 import datetime
 import email
+import email.message
 import http.client
 import importlib.util
 import inspect
@@ -17,13 +19,17 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 import urllib.request
 import zlib
+from collections.abc import Mapping, Sequence
+from typing import Any, ClassVar, Literal, Self
 from unittest.mock import MagicMock, call, patch
 
 # Dynamically import code-extensions.py module (since filename contains a hyphen)
 CODE_EXTENSIONS_PATH = os.path.join(os.path.dirname(__file__), "code-extensions.py")
 SPEC = importlib.util.spec_from_file_location("code_extensions", CODE_EXTENSIONS_PATH)
+assert SPEC is not None and SPEC.loader is not None
 ce = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ce)
 
@@ -32,17 +38,17 @@ SPEC.loader.exec_module(ce)
 # Engine Compatibility & Semver Tests
 # =====================================================================
 class TestSemverAndEngineCompatibility(unittest.TestCase):
-    def test_parse_version_standard(self):
+    def test_parse_version_standard(self) -> None:
         v = ce.parse_version("1.2.3")
         self.assertTrue(v[1])  # is_release
         self.assertEqual(v[0], ((0, 1), (0, 2), (0, 3)))
 
-    def test_parse_version_prerelease(self):
+    def test_parse_version_prerelease(self) -> None:
         v = ce.parse_version("1.2.3-beta.1")
         self.assertFalse(v[1])  # is_release
         self.assertEqual(v[2], ((1, "beta"), (0, 1)))
 
-    def test_is_engine_compatible_cases(self):
+    def test_is_engine_compatible_cases(self) -> None:
         test_cases = [
             ("1.85.0", "^1.80.0", True),
             ("1.79.0", "^1.80.0", False),
@@ -124,13 +130,13 @@ class TestSemverAndEngineCompatibility(unittest.TestCase):
                     f"Failed for vs_ver={vs_ver}, constraint={constraint}",
                 )
 
-    def test_expand_x_range(self):
+    def test_expand_x_range(self) -> None:
         self.assertEqual(ce.expand_x_range("1.80.x"), ("1.80.0", "1.81.0"))
         self.assertEqual(ce.expand_x_range("1.x"), ("1.0.0", "2.0.0"))
         self.assertEqual(ce.expand_x_range("x"), ("0.0.0", None))
         self.assertIsNone(ce.expand_x_range("1.80.0"))
 
-    def test_filter_versions(self):
+    def test_filter_versions(self) -> None:
         versions = [
             {"version": "2.0.0", "targetPlatform": "linux-x64"},
             {"version": "1.9.0", "targetPlatform": "universal"},
@@ -165,7 +171,7 @@ class TestSemverAndEngineCompatibility(unittest.TestCase):
         )
         self.assertEqual([v["version"] for v in selected_newer], ["2.0.0"])
 
-    def test_filter_versions_ignores_input_order(self):
+    def test_filter_versions_ignores_input_order(self) -> None:
         """The early stop must not depend on the order the gallery used."""
         versions = [{"version": v} for v in ("2.0.0", "1.9.0", "1.8.0", "1.7.0")]
         expected = ["2.0.0", "1.9.0"]
@@ -179,7 +185,7 @@ class TestSemverAndEngineCompatibility(unittest.TestCase):
             )
             self.assertEqual([v["version"] for v in selected], expected)
 
-    def test_filter_versions_skip_and_pinned_versions(self):
+    def test_filter_versions_skip_and_pinned_versions(self) -> None:
         versions = [{"version": v} for v in ("2.0.0", "1.9.0", "1.8.0")]
 
         skipped = ce.filter_versions(
@@ -192,7 +198,7 @@ class TestSemverAndEngineCompatibility(unittest.TestCase):
         )
         self.assertEqual([v["version"] for v in pinned], ["1.9.0"])
 
-    def test_filter_versions_keeps_platform_variant_order(self):
+    def test_filter_versions_keeps_platform_variant_order(self) -> None:
         """Equal versions must stay in gallery order so [0] picks the same build."""
         versions = [
             {"version": "1.0.0", "targetPlatform": "linux-x64"},
@@ -203,17 +209,23 @@ class TestSemverAndEngineCompatibility(unittest.TestCase):
             [v["targetPlatform"] for v in selected], ["linux-x64", "universal"]
         )
 
+    def test_filter_versions_drops_entries_that_are_not_objects(self) -> None:
+        """The one gate every version passes through, so readers can index."""
+        versions: list[Any] = ["nonsense", None, {"version": "1.0.0"}]
+        selected = ce.filter_versions(versions, target_platform="universal")
+        self.assertEqual([v["version"] for v in selected], ["1.0.0"])
+
 
 # =====================================================================
 # TOML Parser & Config Engine
 # =====================================================================
 class TestTOMLParserAndConfig(unittest.TestCase):
-    def test_strip_comment_with_hash_in_quotes(self):
+    def test_strip_comment_with_hash_in_quotes(self) -> None:
         line = 'key = "value # with hash" # real comment'
         stripped = ce.strip_comment(line)
         self.assertEqual(stripped, 'key = "value # with hash"')
 
-    def test_strip_comment_with_escaped_quote(self):
+    def test_strip_comment_with_escaped_quote(self) -> None:
         """An escaped quote must not close the string and expose a later '#'."""
         self.assertEqual(ce.strip_comment(r'token = "a\"b#c"'), r'token = "a\"b#c"')
         self.assertEqual(
@@ -222,25 +234,25 @@ class TestTOMLParserAndConfig(unittest.TestCase):
         # A literal string does not process escapes, so it ends at the quote.
         self.assertEqual(ce.strip_comment(r"lit = 'a\' # b"), r"lit = 'a\'")
 
-    def test_unquote_toml_value(self):
+    def test_unquote_toml_value(self) -> None:
         self.assertEqual(ce.unquote_toml_value('"hello"'), "hello")
         self.assertEqual(ce.unquote_toml_value("'hello'"), "hello")
         self.assertEqual(ce.unquote_toml_value(r'"hello\nworld"'), "hello\nworld")
         # Literal strings keep backslashes verbatim.
         self.assertEqual(ce.unquote_toml_value(r"'a\nb'"), r"a\nb")
 
-    def test_unescape_toml_basic(self):
+    def test_unescape_toml_basic(self) -> None:
         escaped = r"Hello\nWorld\t\"Test\""
         self.assertEqual(ce.unescape_toml_basic(escaped), 'Hello\nWorld\t"Test"')
         self.assertEqual(ce.unescape_toml_basic(r"\u0041\u00e9"), "Aé")
         self.assertEqual(ce.unescape_toml_basic(r"\U0001F600"), "\U0001f600")
 
-    def test_unescape_toml_basic_keeps_bad_escapes_literal(self):
+    def test_unescape_toml_basic_keeps_bad_escapes_literal(self) -> None:
         for text in (r"\u12", r"\U000", r"\uZZZZ", r"\ud800", r"\q", "\\"):
             with self.subTest(text=text):
                 self.assertEqual(ce.unescape_toml_basic(text), text)
 
-    def test_config_value_round_trip(self):
+    def test_config_value_round_trip(self) -> None:
         """dump_toml output must read back identically with a real parser."""
         cases = [
             {"open_vsx_token": 'a"b#c'},
@@ -256,22 +268,22 @@ class TestTOMLParserAndConfig(unittest.TestCase):
             with self.subTest(cfg=cfg):
                 self.assertEqual(ce.parse_toml_text(ce.dump_toml(cfg)), cfg)
 
-    def test_parse_toml_text_rejects_invalid_toml(self):
+    def test_parse_toml_text_rejects_invalid_toml(self) -> None:
         with self.assertRaises(ValueError):
             ce.parse_toml_text("open_vsx = ")
 
-    def test_coerce_config_value(self):
+    def test_coerce_config_value(self) -> None:
         self.assertTrue(ce.coerce_config_value("true", bool))
         self.assertFalse(ce.coerce_config_value("FALSE", bool))
         self.assertEqual(ce.coerce_config_value(42, str), "42")
         self.assertEqual(ce.coerce_config_value("hello", str), "hello")
 
-    def test_coerce_config_value_rejects_an_empty_string(self):
+    def test_coerce_config_value_rejects_an_empty_string(self) -> None:
         for val in ("", "   "):
             with self.subTest(val=val), self.assertRaises(ValueError):
                 ce.coerce_config_value(val, str)
 
-    def test_resolve_download_target_ignores_a_blank_directory(self):
+    def test_resolve_download_target_ignores_a_blank_directory(self) -> None:
         args = argparse.Namespace(download_dir="")
         directory, is_temp = ce.resolve_download_target(args, {"download_dir": ""})
         self.addCleanup(ce.discard_download_dir, directory, is_temp)
@@ -281,7 +293,7 @@ class TestTOMLParserAndConfig(unittest.TestCase):
         self.assertTrue(is_temp)
         self.assertNotEqual(os.path.realpath(directory), os.path.realpath(os.getcwd()))
 
-    def test_load_and_save_config(self):
+    def test_load_and_save_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = os.path.join(tmp_dir, "config.toml")
             initial_cfg = {
@@ -306,7 +318,7 @@ class TestTOMLParserAndConfig(unittest.TestCase):
                 # by anyone else.
                 self.assertEqual(os.stat(config_path).st_mode & 0o777, 0o600)
 
-    def test_get_default_config_path_ignores_the_working_directory(self):
+    def test_get_default_config_path_ignores_the_working_directory(self) -> None:
         """A config.toml in the CWD must not be picked up: it names the binary
         to execute and the gallery to download from."""
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -325,7 +337,7 @@ class TestTOMLParserAndConfig(unittest.TestCase):
                 os.path.realpath(os.path.join(tmp_dir, "config.toml")),
             )
 
-    def test_get_default_config_path_honors_explicit_override(self):
+    def test_get_default_config_path_honors_explicit_override(self) -> None:
         with patch.dict(os.environ, {"CODE_EXTENSIONS_CONFIG": "/tmp/mine.toml"}):
             self.assertEqual(ce.get_default_config_path(), "/tmp/mine.toml")
 
@@ -348,7 +360,7 @@ unknown-key = "keep me"
 
 
 class TestEditTomlText(unittest.TestCase):
-    def test_setting_a_key_keeps_comments_spelling_and_unknown_keys(self):
+    def test_setting_a_key_keeps_comments_spelling_and_unknown_keys(self) -> None:
         edited = ce.edit_toml_text(HAND_WRITTEN_CONFIG, None, "min_release_age", "3d")
 
         self.assertIn('min-release-age = "3d"   # keep a buffer', edited)
@@ -356,7 +368,7 @@ class TestEditTomlText(unittest.TestCase):
         self.assertIn('unknown-key = "keep me"', edited)
         self.assertIn("# Python is special", edited)
 
-    def test_a_new_global_key_lands_above_the_first_table(self):
+    def test_a_new_global_key_lands_above_the_first_table(self) -> None:
         edited = ce.edit_toml_text(HAND_WRITTEN_CONFIG, None, "open_vsx", True)
         lines = edited.splitlines()
 
@@ -366,7 +378,7 @@ class TestEditTomlText(unittest.TestCase):
         )
         self.assertEqual(ce.parse_toml_text(edited)["open_vsx"], True)
 
-    def test_a_new_extension_key_lands_after_a_multi_line_value(self):
+    def test_a_new_extension_key_lands_after_a_multi_line_value(self) -> None:
         edited = ce.edit_toml_text(
             HAND_WRITTEN_CONFIG,
             ("extensions", "ms-python.python"),
@@ -378,7 +390,7 @@ class TestEditTomlText(unittest.TestCase):
         self.assertEqual(parsed["min_release_age"], "5d")
         self.assertEqual(parsed["skip-versions"], ["1.0.0"])
 
-    def test_replacing_a_multi_line_value_drops_its_continuation(self):
+    def test_replacing_a_multi_line_value_drops_its_continuation(self) -> None:
         edited = ce.edit_toml_text(
             HAND_WRITTEN_CONFIG,
             ("extensions", "ms-python.python"),
@@ -394,7 +406,7 @@ class TestEditTomlText(unittest.TestCase):
             ["2.0.0", "2.1.0"],
         )
 
-    def test_a_missing_table_is_appended(self):
+    def test_a_missing_table_is_appended(self) -> None:
         edited = ce.edit_toml_text(
             HAND_WRITTEN_CONFIG, ("extensions", "golang.go"), "ignore", True
         )
@@ -402,7 +414,7 @@ class TestEditTomlText(unittest.TestCase):
         self.assertTrue(ce.parse_toml_text(edited)["extensions"]["golang.go"]["ignore"])
         self.assertIn("# My config, hand written.", edited)
 
-    def test_an_appended_table_matches_the_file_s_indentation(self):
+    def test_an_appended_table_matches_the_file_s_indentation(self) -> None:
         edited = ce.edit_toml_text(
             HAND_WRITTEN_CONFIG, ("extensions", "golang.go"), "ignore", True
         )
@@ -412,11 +424,11 @@ class TestEditTomlText(unittest.TestCase):
         edited = ce.edit_toml_text(flat, ("extensions", "golang.go"), "ignore", True)
         self.assertIn('[extensions."golang.go"]\nignore = true', edited)
 
-    def test_editing_an_empty_file_writes_a_usable_config(self):
+    def test_editing_an_empty_file_writes_a_usable_config(self) -> None:
         edited = ce.edit_toml_text("", None, "min_release_age", "2d")
         self.assertEqual(ce.parse_toml_text(edited)["min_release_age"], "2d")
 
-    def test_deleting_the_last_key_removes_its_table(self):
+    def test_deleting_the_last_key_removes_its_table(self) -> None:
         edited = ce.edit_toml_text(
             HAND_WRITTEN_CONFIG,
             ("extensions", "ms-python.python"),
@@ -431,7 +443,7 @@ class TestEditTomlText(unittest.TestCase):
         self.assertNotIn("extensions", ce.parse_toml_text(edited))
         self.assertIn('unknown-key = "keep me"', edited)
 
-    def test_the_legacy_table_spelling_is_edited_in_place(self):
+    def test_the_legacy_table_spelling_is_edited_in_place(self) -> None:
         text = '[extension."ms-python.python"]\nignore = true\n'
         edited = ce.edit_toml_text(
             text, ("extensions", "ms-python.python"), "ignore", False
@@ -439,17 +451,17 @@ class TestEditTomlText(unittest.TestCase):
 
         self.assertEqual(edited, '[extension."ms-python.python"]\nignore = false\n')
 
-    def test_deleting_a_key_that_is_not_there_changes_nothing(self):
+    def test_deleting_a_key_that_is_not_there_changes_nothing(self) -> None:
         edited = ce.edit_toml_text(HAND_WRITTEN_CONFIG, None, "open_vsx", None, True)
         self.assertEqual(edited, HAND_WRITTEN_CONFIG)
 
-    def test_crlf_line_endings_survive(self):
+    def test_crlf_line_endings_survive(self) -> None:
         text = 'min-release-age = "12h"\r\nopen_vsx = true\r\n'
         edited = ce.edit_toml_text(text, None, "min_release_age", "3d")
 
         self.assertEqual(edited, 'min-release-age = "3d"\r\nopen_vsx = true\r\n')
 
-    def test_update_aborts_when_the_file_cannot_be_parsed(self):
+    def test_update_aborts_when_the_file_cannot_be_parsed(self) -> None:
         # If the file cannot be parsed, the in-memory config is just the
         # empty fallback. The fallback rewrite must not run: it would
         # clobber the user's existing settings.
@@ -472,7 +484,7 @@ class TestEditTomlText(unittest.TestCase):
             with open(config_path) as f:
                 self.assertEqual(f.read(), original)
 
-    def test_update_rewrites_a_parsable_file_when_in_place_fails(self):
+    def test_update_rewrites_a_parsable_file_when_in_place_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = os.path.join(tmp_dir, "config.toml")
             with open(config_path, "w") as f:
@@ -492,7 +504,7 @@ class TestEditTomlText(unittest.TestCase):
             with open(config_path) as f:
                 self.assertEqual(ce.parse_toml_text(f.read())["min_release_age"], "3d")
 
-    def test_config_edit_took_effect_rejects_an_unapplied_edit(self):
+    def test_config_edit_took_effect_rejects_an_unapplied_edit(self) -> None:
         self.assertTrue(
             ce.config_edit_took_effect(
                 'min-release-age = "3d"\n', None, "min_release_age", "3d", False
@@ -514,7 +526,7 @@ class TestEditTomlText(unittest.TestCase):
 # Release Age Gating Tests
 # =====================================================================
 class TestReleaseAgeGating(unittest.TestCase):
-    def test_parse_age_threshold_valid(self):
+    def test_parse_age_threshold_valid(self) -> None:
         cases = [
             ("24h", datetime.timedelta(hours=24)),
             ("2d", datetime.timedelta(days=2)),
@@ -526,11 +538,11 @@ class TestReleaseAgeGating(unittest.TestCase):
             with self.subTest(age_str=age_str):
                 self.assertEqual(ce.parse_age_threshold(age_str), expected_td)
 
-    def test_parse_age_threshold_invalid(self):
+    def test_parse_age_threshold_invalid(self) -> None:
         with self.assertRaises(ValueError):
             ce.parse_age_threshold("invalid_age")
 
-    def test_released_long_enough(self):
+    def test_released_long_enough(self) -> None:
         now = datetime.datetime.now(datetime.timezone.utc)
         recent_ts = (now - datetime.timedelta(hours=5)).isoformat()
         old_ts = (now - datetime.timedelta(hours=48)).isoformat()
@@ -541,7 +553,7 @@ class TestReleaseAgeGating(unittest.TestCase):
         self.assertFalse(ce.released_long_enough({"lastUpdated": recent_ts}, min_age))
         self.assertTrue(ce.released_long_enough({}, min_age))  # missing timestamp
 
-    def test_first_eligible_version(self):
+    def test_first_eligible_version(self) -> None:
         now = datetime.datetime.now(datetime.timezone.utc)
         v1_ts = (now - datetime.timedelta(hours=5)).isoformat()  # Too recent
         v2_ts = (now - datetime.timedelta(hours=30)).isoformat()  # Pass
@@ -561,9 +573,9 @@ class TestReleaseAgeGating(unittest.TestCase):
 # Per-Extension Option Precedence Tests
 # =====================================================================
 class TestEffectiveExtOptions(unittest.TestCase):
-    GLOBAL_AGE = datetime.timedelta(hours=24)
+    GLOBAL_AGE: ClassVar[datetime.timedelta] = datetime.timedelta(hours=24)
 
-    def test_a_per_extension_rule_beats_the_global_setting(self):
+    def test_a_per_extension_rule_beats_the_global_setting(self) -> None:
         prerelease, age, age_str = ce.effective_ext_options(
             {"include_prerelease": True, "min_release_age": "7d"},
             False,
@@ -574,7 +586,7 @@ class TestEffectiveExtOptions(unittest.TestCase):
         self.assertEqual(age, datetime.timedelta(days=7))
         self.assertEqual(age_str, "7d")
 
-    def test_an_explicit_cli_flag_beats_a_per_extension_rule(self):
+    def test_an_explicit_cli_flag_beats_a_per_extension_rule(self) -> None:
         ext_cfg = {"include_prerelease": False, "min_release_age": "7d"}
 
         prerelease, age, age_str = ce.effective_ext_options(
@@ -589,24 +601,31 @@ class TestEffectiveExtOptions(unittest.TestCase):
         self.assertEqual(age, datetime.timedelta(0))
         self.assertEqual(age_str, "0")
 
-    def test_an_unparsable_per_extension_age_leaves_the_global_one(self):
+    def test_an_unparsable_per_extension_age_leaves_the_global_one(self) -> None:
         _, age, age_str = ce.effective_ext_options(
             {"min_release_age": "whenever"}, False, self.GLOBAL_AGE, "24h"
         )
         self.assertEqual(age, self.GLOBAL_AGE)
         self.assertEqual(age_str, "24h")
 
-    def test_no_per_extension_rule_keeps_the_global_settings(self):
+    def test_no_per_extension_rule_keeps_the_global_settings(self) -> None:
         prerelease, age, _ = ce.effective_ext_options(None, True, self.GLOBAL_AGE)
         self.assertTrue(prerelease)
         self.assertEqual(age, self.GLOBAL_AGE)
+
+    def test_an_unset_global_age_resolves_to_a_concrete_zero(self) -> None:
+        """Callers report the age they applied, so it must never read as None."""
+        prerelease, age, age_str = ce.effective_ext_options(None, False, None)
+        self.assertFalse(prerelease)
+        self.assertEqual(age, datetime.timedelta(0))
+        self.assertEqual(age_str, "0")
 
     @patch.object(ce, "cleanup_stale_cache")
     @patch.object(ce, "query_marketplace_extensions")
     @patch.object(ce, "_post_extension_query")
     def test_search_honors_an_explicit_age_over_a_per_extension_rule(
-        self, mock_post, mock_details, mock_cleanup
-    ):
+        self, mock_post: MagicMock, mock_details: MagicMock, mock_cleanup: MagicMock
+    ) -> None:
         now = datetime.datetime.now(datetime.timezone.utc)
         ext_data = make_mock_gallery_extension(
             "ms-python",
@@ -629,7 +648,7 @@ class TestEffectiveExtOptions(unittest.TestCase):
         mock_details.return_value = {"ms-python.python": ext_data}
         extensions_config = {"ms-python.python": {"min_release_age": "30d"}}
 
-        def search(**kwargs):
+        def search(**kwargs: Any) -> Any:
             return ce.query_marketplace_search(
                 "python",
                 target_platform="universal",
@@ -647,7 +666,9 @@ class TestEffectiveExtOptions(unittest.TestCase):
         )
 
     @patch.object(ce, "query_marketplace_extensions")
-    def test_check_updates_honors_an_explicit_prerelease_flag(self, mock_query):
+    def test_check_updates_honors_an_explicit_prerelease_flag(
+        self, mock_query: MagicMock
+    ) -> None:
         now = datetime.datetime.now(datetime.timezone.utc)
         prerelease_props = [
             {"key": "Microsoft.VisualStudio.Code.Engine", "value": "^1.80.0"},
@@ -669,7 +690,7 @@ class TestEffectiveExtOptions(unittest.TestCase):
         installed = {"ms-python.python": "2024.1.0"}
         extensions_config = {"ms-python.python": {"include_prerelease": False}}
 
-        def check(**kwargs):
+        def check(**kwargs: Any) -> Any:
             return ce.check_updates(
                 installed,
                 "universal",
@@ -689,10 +710,122 @@ class TestEffectiveExtOptions(unittest.TestCase):
 
 
 # =====================================================================
+# Malformed Gallery Payload Tests
+# =====================================================================
+class TestGalleryPayloadHardening(unittest.TestCase):
+    """The gallery response is untrusted JSON: one bad record must not take out
+    the command that asked for a batch."""
+
+    def test_extension_identity_tolerates_a_broken_entry(self) -> None:
+        for entry in ("not-an-object", None, {}, {"publisher": "flat"}):
+            with self.subTest(entry=entry):
+                ident = ce.extension_identity(entry)
+                self.assertEqual(ident.publisher, "")
+                self.assertEqual(ident.name, "")
+
+        ident = ce.extension_identity(
+            {
+                "publisher": {"publisherName": "MS-Python", "displayName": "Microsoft"},
+                "extensionName": "Python",
+            }
+        )
+        self.assertEqual(ident.publisher, "MS-Python")
+        self.assertEqual(ident.name, "Python")
+        self.assertEqual(ident.full_id, "ms-python.python")
+        self.assertEqual(ident.publisher_display, "Microsoft")
+
+    def test_version_property_tolerates_a_broken_properties_list(self) -> None:
+        self.assertIsNone(ce.version_property(None, "some.key"))
+        self.assertIsNone(ce.version_property("nonsense", "some.key"))
+        self.assertIsNone(ce.version_property({"properties": "nonsense"}, "some.key"))
+        self.assertIsNone(
+            ce.version_property({"properties": ["nonsense", {"key": "k"}]}, "k")
+        )
+        self.assertEqual(
+            ce.version_property({"properties": [{"key": "k", "value": "v"}]}, "k"), "v"
+        )
+        self.assertFalse(ce.is_prerelease("nonsense"))
+        self.assertIsNone(ce.get_engine_constraint(None))
+
+    @patch.object(ce, "get_cache_dir", return_value=None)
+    @patch.object(ce.time, "sleep")
+    def test_post_extension_query_rejects_a_non_object_response(
+        self, mock_sleep: MagicMock, mock_cache: MagicMock
+    ) -> None:
+        resp = MagicMock()
+        resp.read.return_value = b'["not", "an", "object"]'
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = None
+
+        with patch.object(ce._url_opener, "open", return_value=resp):
+            result = ce._post_extension_query(
+                {"dummy": True}, "https://example.com/gallery"
+            )
+        self.assertIsNone(result)
+        # Valid JSON of the wrong shape is a final answer, not a flake.
+        self.assertEqual(mock_sleep.call_count, 0)
+
+    @patch.object(ce, "cleanup_stale_cache")
+    @patch.object(ce, "_post_extension_query")
+    def test_query_marketplace_extensions_skips_unusable_entries(
+        self, mock_post: MagicMock, mock_cleanup: MagicMock
+    ) -> None:
+        good = make_mock_gallery_extension("ms-python", "python")
+        mock_post.return_value = {
+            "results": [
+                {
+                    "extensions": [
+                        "not-an-object",
+                        {"publisher": "flat", "extensionName": "python"},
+                        {"publisher": {"publisherName": "ms-python"}},
+                        good,
+                    ]
+                }
+            ]
+        }
+        result = ce.query_marketplace_extensions(["ms-python.python"])
+        self.assertEqual(list(result), ["ms-python.python"])
+
+    @patch.object(ce, "cleanup_stale_cache")
+    @patch.object(ce, "query_marketplace_extensions")
+    @patch.object(ce, "_post_extension_query")
+    def test_search_skips_unusable_entries(
+        self, mock_post: MagicMock, mock_details: MagicMock, mock_cleanup: MagicMock
+    ) -> None:
+        good = make_mock_gallery_extension("ms-python", "python")
+        mock_post.return_value = {"results": [{"extensions": ["not-an-object", good]}]}
+        mock_details.return_value = {"ms-python.python": good}
+
+        results = ce.query_marketplace_search(
+            "python", target_platform="universal", vscode_version="1.85.0"
+        )
+        self.assertEqual([r["id"] for r in results], ["ms-python.python"])
+
+    @patch.object(ce, "cleanup_stale_cache")
+    @patch.object(ce, "query_marketplace_extensions")
+    @patch.object(ce, "_post_extension_query")
+    def test_search_survives_versions_sent_as_an_object(
+        self, mock_post: MagicMock, mock_details: MagicMock, mock_cleanup: MagicMock
+    ) -> None:
+        # An object here is truthy, so indexing it with 0 raises KeyError unless
+        # the shape is checked before the subscript.
+        broken = make_mock_gallery_extension("ms-python", "python")
+        broken["versions"] = {"latest": "2024.1.0"}
+        mock_post.return_value = {"results": [{"extensions": [broken]}]}
+        mock_details.return_value = {}
+
+        results = ce.query_marketplace_search(
+            "python", target_platform="universal", vscode_version="1.85.0"
+        )
+        self.assertEqual([r["id"] for r in results], ["ms-python.python"])
+        self.assertEqual(results[0]["latest"], "unknown")
+
+
+# =====================================================================
 # Security & Host Validation Tests
 # =====================================================================
 class TestSecurityAndHostValidation(unittest.TestCase):
-    def test_is_open_vsx_url(self):
+    def test_is_open_vsx_url(self) -> None:
         cases = [
             ("https://open-vsx.org/vscode/gallery", True),
             ("https://sub.open-vsx.org/gallery", True),
@@ -704,7 +837,7 @@ class TestSecurityAndHostValidation(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertEqual(ce.is_open_vsx_url(url), expected)
 
-    def test_is_marketplace_url(self):
+    def test_is_marketplace_url(self) -> None:
         cases = [
             ("https://marketplace.visualstudio.com/_apis/public/gallery", True),
             ("https://ms-python.gallerycdn.vsassets.io/file.vsix", True),
@@ -717,7 +850,7 @@ class TestSecurityAndHostValidation(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertEqual(ce.is_marketplace_url(url), expected)
 
-    def test_resolve_token_for_service_withholds_from_the_marketplace(self):
+    def test_resolve_token_for_service_withholds_from_the_marketplace(self) -> None:
         args = argparse.Namespace(open_vsx_token="secret_pat", open_vsx=None)
         config = {"open_vsx_token": "secret_pat"}
 
@@ -752,7 +885,7 @@ class TestSecurityAndHostValidation(unittest.TestCase):
             "secret_pat",
         )
 
-    def test_resolve_token_for_service_without_a_token_configured(self):
+    def test_resolve_token_for_service_without_a_token_configured(self) -> None:
         args = argparse.Namespace(open_vsx=None)
         with patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(
@@ -762,7 +895,7 @@ class TestSecurityAndHostValidation(unittest.TestCase):
                 ce.resolve_token_for_service(ce.OPEN_VSX_SERVICE_URL, args, {})
             )
 
-    def test_auth_stripping_redirect_handler_cross_host(self):
+    def test_auth_stripping_redirect_handler_cross_host(self) -> None:
         handler = ce._AuthStrippingRedirectHandler()
 
         orig_req = urllib.request.Request(
@@ -783,7 +916,7 @@ class TestSecurityAndHostValidation(unittest.TestCase):
         self.assertNotIn("Authorization", result.headers)
         self.assertNotIn("Authorization", result.unredirected_hdrs)
 
-    def test_auth_stripping_redirect_handler_same_host(self):
+    def test_auth_stripping_redirect_handler_same_host(self) -> None:
         handler = ce._AuthStrippingRedirectHandler()
 
         orig_req = urllib.request.Request(
@@ -805,19 +938,19 @@ class TestSecurityAndHostValidation(unittest.TestCase):
 
         self.assertEqual(result.headers.get("Authorization"), "Bearer secret_token")
 
-    def test_safe_filename_part(self):
+    def test_safe_filename_part(self) -> None:
         self.assertEqual(ce.safe_filename_part("ms-python.python"), "ms-python.python")
         self.assertEqual(ce.safe_filename_part("../../../etc/passwd"), "etc_passwd")
         self.assertEqual(ce.safe_filename_part(".."), "unknown")
         self.assertEqual(ce.safe_filename_part("", "publisher"), "publisher")
 
-    def test_vsix_filename_is_a_single_path_component(self):
+    def test_vsix_filename_is_a_single_path_component(self) -> None:
         name = ce.vsix_filename("../../etc", "pa/ss", "1.0.0", "linux-x64")
         self.assertNotIn("/", name)
         self.assertNotIn("\\", name)
         self.assertTrue(name.endswith(".vsix"))
 
-    def test_ansi_stripping_stream_filters_every_write_path(self):
+    def test_ansi_stripping_stream_filters_every_write_path(self) -> None:
         sink = io.StringIO()
         stream = ce._AnsiStrippingStream(sink)
         stream.write("\033[91mred\033[0m\n")
@@ -832,7 +965,7 @@ class TestSecurityAndHostValidation(unittest.TestCase):
 # Atomic Cache & File Security Tests
 # =====================================================================
 class TestAtomicCacheAndFileSecurity(unittest.TestCase):
-    def test_write_cache_atomically(self):
+    def test_write_cache_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             cache_file = os.path.join(tmp_dir, "test_cache.json")
             payload = {"data": "test_value"}
@@ -845,7 +978,7 @@ class TestAtomicCacheAndFileSecurity(unittest.TestCase):
             # No half-written temporary file may survive a successful write.
             self.assertEqual(os.listdir(tmp_dir), ["test_cache.json"])
 
-    def test_write_cache_atomically_leaves_nothing_behind_on_failure(self):
+    def test_write_cache_atomically_leaves_nothing_behind_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             cache_file = os.path.join(tmp_dir, "test_cache.json")
             ce.write_cache_atomically(cache_file, {"good": 1})
@@ -858,7 +991,7 @@ class TestAtomicCacheAndFileSecurity(unittest.TestCase):
             with open(cache_file) as f:
                 self.assertEqual(json.load(f), {"good": 1})
 
-    def test_write_cache_atomically_ignores_unwritable_directory(self):
+    def test_write_cache_atomically_ignores_unwritable_directory(self) -> None:
         if os.name == "nt":
             self.skipTest("POSIX permissions only")
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -869,12 +1002,12 @@ class TestAtomicCacheAndFileSecurity(unittest.TestCase):
             finally:
                 os.chmod(tmp_dir, 0o700)
 
-    def test_is_cache_file(self):
+    def test_is_cache_file(self) -> None:
         self.assertTrue(ce.is_cache_file("vscode_ext_cache_12345.json"))
         self.assertTrue(ce.is_cache_file("vscode_ext_cache_12345.tmp"))
         self.assertFalse(ce.is_cache_file("other_file.json"))
 
-    def test_clean_spares_a_temp_file_a_concurrent_run_may_own(self):
+    def test_clean_spares_a_temp_file_a_concurrent_run_may_own(self) -> None:
         with (
             tempfile.TemporaryDirectory() as cache_dir,
             tempfile.TemporaryDirectory() as temp_dir,
@@ -906,20 +1039,52 @@ class TestAtomicCacheAndFileSecurity(unittest.TestCase):
 # CLI Command & Binary Logic Tests
 # =====================================================================
 class TestCLIAndBinaryParsing(unittest.TestCase):
-    def test_parse_code_binary_string(self):
+    def test_parse_code_binary_string(self) -> None:
         res = ce.parse_code_binary("code")
         self.assertEqual(len(res), 1)
         self.assertTrue(os.path.basename(res[0]).startswith("code"))
 
-    def test_parse_code_binary_list(self):
+    def test_parse_code_binary_list(self) -> None:
         cmd = ce.parse_code_binary(["code-insiders", "--user-data-dir", "/tmp/dir"])
         self.assertEqual(cmd[1:], ["--user-data-dir", "/tmp/dir"])
 
-    def test_run_list_picker_handles_an_empty_list(self):
+    def test_parse_code_binary_falls_back_for_anything_else(self) -> None:
+        """The config file can hold any TOML value under 'code_binary'."""
+        self.assertTrue(ce.parse_code_binary(None)[0].endswith("code"))
+        self.assertTrue(ce.parse_code_binary([])[0].endswith("code"))
+        self.assertEqual(ce.parse_code_binary(42), ["42"])
+
+    def test_run_code_cmd_rejects_a_negative_retry_count(self) -> None:
+        """Otherwise the loop body never runs and the command silently no-ops."""
+        with self.assertRaises(ValueError):
+            ce.run_code_cmd(["code", "--version"], retries=-1)
+
+    def test_eligible_update_version_refuses_a_held_back_update(self) -> None:
+        update = make_mock_update()
+        self.assertEqual(ce.eligible_update_version(update), "2024.2.0")
+        update["eligible"] = None
+        with self.assertRaises(RuntimeError):
+            ce.eligible_update_version(update)
+
+    def test_resolve_update_url_prefers_the_url_the_gallery_gave(self) -> None:
+        update = make_mock_update()
+        self.assertEqual(
+            ce.resolve_update_url(update, ce.DEFAULT_SERVICE_URL),
+            update["eligible_download_url"],
+        )
+        update["eligible_download_url"] = None
+        self.assertIn(
+            "/publishers/ms-python/vsextensions/python/2024.2.0/vspackage",
+            ce.resolve_update_url(update, "https://example.com/gallery"),
+        )
+
+    def test_run_list_picker_handles_an_empty_list(self) -> None:
         """The window height clamps to one row, so an empty list would index [0]
         and the cursor arithmetic would divide by zero."""
 
-        def boom(*args, **kwargs):  # pragma: no cover - must not be reached
+        def boom(
+            *args: object, **kwargs: object
+        ) -> Any:  # pragma: no cover - must not be reached
             raise AssertionError("nothing should be rendered for an empty list")
 
         action, selected, cursor, top = ce.run_list_picker(
@@ -932,7 +1097,7 @@ class TestCLIAndBinaryParsing(unittest.TestCase):
         )
         self.assertEqual((action, selected, cursor, top), ("quit", [], 0, 0))
 
-    def test_run_list_picker_hands_back_the_scroll_offset(self):
+    def test_run_list_picker_hands_back_the_scroll_offset(self) -> None:
         """The caller resumes with it, so leaving the list must not reset the
         window to wherever the cursor happens to sit."""
         with (
@@ -942,11 +1107,23 @@ class TestCLIAndBinaryParsing(unittest.TestCase):
             ),
             contextlib.redirect_stdout(io.StringIO()),
         ):
+
+            def layout(cols: int) -> tuple[dict[str, int], int]:
+                return {}, 40
+
+            def header(widths: dict[str, int]) -> str:
+                return "header"
+
+            def row(
+                i: int, widths: dict[str, int], is_cursor: bool, is_selected: bool
+            ) -> str:
+                return f"row {i}"
+
             action, _selected, cursor, top = ce.run_list_picker(
                 100,
-                layout=lambda cols: ({}, 40),
-                header=lambda widths: "header",
-                row=lambda i, widths, is_cursor, is_selected: f"row {i}",
+                layout=layout,
+                header=header,
+                row=row,
                 actions=[],
                 unit_label="thing",
                 cursor_idx=50,
@@ -956,7 +1133,9 @@ class TestCLIAndBinaryParsing(unittest.TestCase):
 
     @patch("subprocess.run")
     @patch.object(ce.time, "sleep")
-    def test_run_code_cmd_backs_off_exponentially(self, mock_sleep, mock_run):
+    def test_run_code_cmd_backs_off_exponentially(
+        self, mock_sleep: MagicMock, mock_run: MagicMock
+    ) -> None:
         """Retries are kept (the code CLI can flake), but wait longer each time."""
         mock_run.side_effect = [
             subprocess.CalledProcessError(1, "code"),
@@ -971,7 +1150,9 @@ class TestCLIAndBinaryParsing(unittest.TestCase):
 
     @patch("subprocess.run")
     @patch.object(ce.time, "sleep")
-    def test_run_code_cmd_raises_after_exhausting_retries(self, mock_sleep, mock_run):
+    def test_run_code_cmd_raises_after_exhausting_retries(
+        self, mock_sleep: MagicMock, mock_run: MagicMock
+    ) -> None:
         mock_run.side_effect = subprocess.CalledProcessError(1, "code")
         with (
             contextlib.redirect_stderr(io.StringIO()),
@@ -980,20 +1161,20 @@ class TestCLIAndBinaryParsing(unittest.TestCase):
             ce.run_code_cmd(["code", "--version"], retries=2, delay=1.0)
         self.assertEqual(mock_sleep.call_args_list, [call(1.0), call(2.0)])
 
-    def test_assert_safe_for_cmd_shell_accepts_plain_paths(self):
+    def test_assert_safe_for_cmd_shell_accepts_plain_paths(self) -> None:
         # Parentheses are inert inside the quoting cmd sees and appear in
         # ordinary install dirs like 'Program Files (x86)'.
         ce._assert_safe_for_cmd_shell(
             ["C:\\Program Files (x86)\\Microsoft VS Code\\bin\\code.cmd", "-"]
         )
 
-    def test_assert_safe_for_cmd_shell_rejects_quotes_and_percent(self):
+    def test_assert_safe_for_cmd_shell_rejects_quotes_and_percent(self) -> None:
         for bad in (["code.cmd", 'a"b'], ["code.cmd", "%PATH%"]):
             with self.assertRaises(OSError):
                 ce._assert_safe_for_cmd_shell(bad)
 
     @patch("subprocess.run")
-    def test_get_installed_extensions(self, mock_run):
+    def test_get_installed_extensions(self, mock_run: MagicMock) -> None:
         mock_run.return_value = MagicMock(
             stdout="ms-python.python@2023.1.0\ncharliermarsh.ruff@0.0.1\n",
             returncode=0,
@@ -1010,15 +1191,15 @@ class TestCLIAndBinaryParsing(unittest.TestCase):
 
 # Helper to construct mock gallery extension data
 def make_mock_gallery_extension(
-    pub_name="ms-python",
-    ext_name="python",
-    version="2024.2.0",
-    last_updated=None,
-    properties=None,
-    categories=None,
-    target_platform="universal",
-    versions_list=None,
-):
+    pub_name: str = "ms-python",
+    ext_name: str = "python",
+    version: str = "2024.2.0",
+    last_updated: str | None = None,
+    properties: list[dict[str, str]] | None = None,
+    categories: list[str] | None = None,
+    target_platform: str = "universal",
+    versions_list: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     if last_updated is None:
         last_updated = (
             datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
@@ -1065,12 +1246,12 @@ def make_mock_gallery_extension(
 
 # Helper to construct a check_updates() entry
 def make_mock_update(
-    pub_name="ms-python",
-    ext_name="python",
-    installed="2024.1.0",
-    latest="2024.2.0",
-    eligible="2024.2.0",
-):
+    pub_name: str = "ms-python",
+    ext_name: str = "python",
+    installed: str = "2024.1.0",
+    latest: str = "2024.2.0",
+    eligible: str = "2024.2.0",
+) -> dict[str, Any]:
     url = f"https://example.com/{ext_name}.vsix"
     return {
         "id": f"{pub_name}.{ext_name}",
@@ -1092,7 +1273,7 @@ def make_mock_update(
 # Network Retry & Extension ID Validation Tests
 # =====================================================================
 class TestNetworkRetryAndIDValidation(unittest.TestCase):
-    def test_is_valid_extension_id(self):
+    def test_is_valid_extension_id(self) -> None:
         valid_ids = [
             "ms-python.python",
             "charliermarsh.ruff",
@@ -1130,8 +1311,8 @@ class TestNetworkRetryAndIDValidation(unittest.TestCase):
     @patch.object(ce, "get_cache_dir", return_value=None)
     @patch.object(ce.time, "sleep")
     def test_post_extension_query_retries_on_json_decode_error(
-        self, mock_sleep, mock_cache
-    ):
+        self, mock_sleep: MagicMock, mock_cache: MagicMock
+    ) -> None:
         resp_bad = MagicMock()
         resp_bad.read.return_value = b"<!DOCTYPE html><html>Gateway Error</html>"
         resp_bad.__enter__.return_value = resp_bad
@@ -1155,8 +1336,8 @@ class TestNetworkRetryAndIDValidation(unittest.TestCase):
     @patch.object(ce, "get_cache_dir", return_value=None)
     @patch.object(ce.time, "sleep")
     def test_post_extension_query_retries_on_incomplete_read(
-        self, mock_sleep, mock_cache
-    ):
+        self, mock_sleep: MagicMock, mock_cache: MagicMock
+    ) -> None:
         resp_good = MagicMock()
         resp_good.read.return_value = b'{"results": []}'
         resp_good.__enter__.return_value = resp_good
@@ -1179,8 +1360,8 @@ class TestNetworkRetryAndIDValidation(unittest.TestCase):
     @patch.object(ce, "get_cache_dir", return_value=None)
     @patch.object(ce.time, "sleep")
     def test_post_extension_query_retries_a_refused_connection(
-        self, mock_sleep, mock_cache
-    ):
+        self, mock_sleep: MagicMock, mock_cache: MagicMock
+    ) -> None:
         # urllib wraps a connect-phase OSError into URLError, so this never
         # reaches the ConnectionError clause; the URLError arm has to recognize
         # the wrapped cause or a refused connection fails on the first attempt.
@@ -1207,8 +1388,8 @@ class TestNetworkRetryAndIDValidation(unittest.TestCase):
     @patch.object(ce, "get_cache_dir", return_value=None)
     @patch.object(ce.time, "sleep")
     def test_post_extension_query_exhausts_retries_on_persistent_bad_json(
-        self, mock_sleep, mock_cache
-    ):
+        self, mock_sleep: MagicMock, mock_cache: MagicMock
+    ) -> None:
         resp_bad = MagicMock()
         resp_bad.read.return_value = b"garbage"
         resp_bad.__enter__.return_value = resp_bad
@@ -1231,36 +1412,40 @@ class TestNetworkRetryAndIDValidation(unittest.TestCase):
 class FakeDownloadResponse:
     """Minimal stand-in for the object _url_opener.open() hands back."""
 
-    def __init__(self, body, headers=None):
-        self._body = body
-        self._pos = 0
-        self.headers = email.message_from_string("")
+    def __init__(self, body: bytes, headers: Mapping[str, str] | None = None) -> None:
+        self._body: bytes = body
+        self._pos: int = 0
+        self.headers: email.message.Message = email.message_from_string("")
         for key, value in (headers or {}).items():
             self.headers[key] = value
 
-    def read(self, size):
+    def read(self, size: int) -> bytes:
         chunk = self._body[self._pos : self._pos + size]
         self._pos += len(chunk)
         return chunk
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc_info):
+    def __exit__(self, *exc_info: object) -> Literal[False]:
         return False
 
 
 class TestDownloadVsix(unittest.TestCase):
-    def setUp(self):
-        self.tmpdir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmpdir.cleanup)
-        self.filepath = os.path.join(self.tmpdir.name, "ext.vsix")
+    filepath: str
 
-    def download(self, response, url, **kwargs):
+    def setUp(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.filepath = os.path.join(tmpdir.name, "ext.vsix")
+
+    def download(self, response: FakeDownloadResponse, url: str, **kwargs: Any) -> Any:
         """Run download_vsix against a canned response, returning the Request."""
         captured = {}
 
-        def fake_open(req, timeout=None):
+        def fake_open(
+            req: urllib.request.Request, timeout: float | None = None
+        ) -> FakeDownloadResponse:
             captured["req"] = req
             return response
 
@@ -1273,7 +1458,7 @@ class TestDownloadVsix(unittest.TestCase):
             ce.download_vsix(url, self.filepath, **kwargs)
         return captured["req"]
 
-    def test_download_writes_the_package(self):
+    def test_download_writes_the_package(self) -> None:
         req = self.download(
             FakeDownloadResponse(b"PK\x03\x04payload"),
             "https://open-vsx.org/api/pub/ext/file.vsix",
@@ -1282,7 +1467,7 @@ class TestDownloadVsix(unittest.TestCase):
         with open(self.filepath, "rb") as f:
             self.assertEqual(f.read(), b"PK\x03\x04payload")
 
-    def test_download_sends_the_token_to_open_vsx(self):
+    def test_download_sends_the_token_to_open_vsx(self) -> None:
         req = self.download(
             FakeDownloadResponse(b"payload"),
             "https://open-vsx.org/api/pub/ext/file.vsix",
@@ -1290,7 +1475,7 @@ class TestDownloadVsix(unittest.TestCase):
         )
         self.assertEqual(req.headers.get("Authorization"), "Bearer secret_pat")
 
-    def test_download_sends_the_token_to_the_configured_service(self):
+    def test_download_sends_the_token_to_the_configured_service(self) -> None:
         req = self.download(
             FakeDownloadResponse(b"payload"),
             "https://vsx.internal.example.com/files/ext.vsix",
@@ -1299,7 +1484,7 @@ class TestDownloadVsix(unittest.TestCase):
         )
         self.assertEqual(req.headers.get("Authorization"), "Bearer secret_pat")
 
-    def test_download_withholds_the_token_from_any_other_host(self):
+    def test_download_withholds_the_token_from_any_other_host(self) -> None:
         # The download URL comes out of the gallery response, so a host that is
         # neither the configured service nor Open VSX is served anonymously -
         # Microsoft's CDN, a redirector, or a host a compromised response named.
@@ -1325,7 +1510,7 @@ class TestDownloadVsix(unittest.TestCase):
                 )
                 self.assertNotIn("Authorization", req.headers)
 
-    def test_download_refuses_an_oversized_package(self):
+    def test_download_refuses_an_oversized_package(self) -> None:
         with (
             patch.object(ce, "MAX_VSIX_BYTES", 8),
             self.assertRaises(ce.DOWNLOAD_ERRORS),
@@ -1337,7 +1522,7 @@ class TestDownloadVsix(unittest.TestCase):
         # A truncated package must never be left behind for --install-extension.
         self.assertFalse(os.path.exists(self.filepath))
 
-    def test_download_refuses_a_corrupt_compressed_package(self):
+    def test_download_refuses_a_corrupt_compressed_package(self) -> None:
         with self.assertRaises(ce.DOWNLOAD_ERRORS):
             self.download(
                 FakeDownloadResponse(
@@ -1347,7 +1532,7 @@ class TestDownloadVsix(unittest.TestCase):
             )
         self.assertFalse(os.path.exists(self.filepath))
 
-    def test_download_decompresses_a_gzip_encoded_package(self):
+    def test_download_decompresses_a_gzip_encoded_package(self) -> None:
         compressor = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
         body = compressor.compress(b"PK\x03\x04payload") + compressor.flush()
 
@@ -1358,7 +1543,7 @@ class TestDownloadVsix(unittest.TestCase):
         with open(self.filepath, "rb") as f:
             self.assertEqual(f.read(), b"PK\x03\x04payload")
 
-    def test_progress_clamps_an_understated_content_length(self):
+    def test_progress_clamps_an_understated_content_length(self) -> None:
         """A lying Content-Length must not draw >100% or an over-wide bar."""
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -1374,7 +1559,9 @@ class TestDownloadVsix(unittest.TestCase):
 # CLI Integration Tests: handle_install
 # =====================================================================
 class TestHandleInstallIntegration(unittest.TestCase):
-    def setUp(self):
+    config: dict[str, Any]
+
+    def setUp(self) -> None:
         self.config = {"extensions": {}}
 
     @patch.object(ce, "run_code_cmd")
@@ -1383,8 +1570,13 @@ class TestHandleInstallIntegration(unittest.TestCase):
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_install_success(
-        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
-    ):
+        self,
+        mock_query: MagicMock,
+        mock_vsver: MagicMock,
+        mock_installed: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         mock_query.return_value = {
             "ms-python.python": make_mock_gallery_extension(
                 "ms-python", "python", "2024.2.0"
@@ -1417,8 +1609,13 @@ class TestHandleInstallIntegration(unittest.TestCase):
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_install_pinned_version(
-        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
-    ):
+        self,
+        mock_query: MagicMock,
+        mock_vsver: MagicMock,
+        mock_installed: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         ext_data = make_mock_gallery_extension(
             "ms-python",
             "python",
@@ -1485,8 +1682,13 @@ class TestHandleInstallIntegration(unittest.TestCase):
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_install_from_file(
-        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
-    ):
+        self,
+        mock_query: MagicMock,
+        mock_vsver: MagicMock,
+        mock_installed: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         mock_query.return_value = {
             "ms-python.python": make_mock_gallery_extension(
                 "ms-python", "python", "2024.2.0"
@@ -1532,8 +1734,13 @@ class TestHandleInstallIntegration(unittest.TestCase):
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_install_already_installed_skips(
-        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
-    ):
+        self,
+        mock_query: MagicMock,
+        mock_vsver: MagicMock,
+        mock_installed: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         mock_query.return_value = {
             "ms-python.python": make_mock_gallery_extension(
                 "ms-python", "python", "2024.2.0"
@@ -1570,8 +1777,13 @@ class TestHandleInstallIntegration(unittest.TestCase):
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_install_force_reinstalls(
-        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
-    ):
+        self,
+        mock_query: MagicMock,
+        mock_vsver: MagicMock,
+        mock_installed: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         mock_query.return_value = {
             "ms-python.python": make_mock_gallery_extension(
                 "ms-python", "python", "2024.2.0"
@@ -1604,8 +1816,13 @@ class TestHandleInstallIntegration(unittest.TestCase):
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_install_held_back_by_release_age_installs_older(
-        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
-    ):
+        self,
+        mock_query: MagicMock,
+        mock_vsver: MagicMock,
+        mock_installed: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         now = datetime.datetime.now(datetime.timezone.utc)
         ext_data = make_mock_gallery_extension(
             "ms-python",
@@ -1678,8 +1895,13 @@ class TestHandleInstallIntegration(unittest.TestCase):
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_install_reports_an_oversized_package(
-        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
-    ):
+        self,
+        mock_query: MagicMock,
+        mock_vsver: MagicMock,
+        mock_installed: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         mock_query.return_value = {
             "ms-python.python": make_mock_gallery_extension(
                 "ms-python", "python", "2024.2.0"
@@ -1718,8 +1940,13 @@ class TestHandleInstallIntegration(unittest.TestCase):
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_install_partial_failure_exits_nonzero(
-        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
-    ):
+        self,
+        mock_query: MagicMock,
+        mock_vsver: MagicMock,
+        mock_installed: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         mock_query.return_value = {
             "ms-python.python": make_mock_gallery_extension(
                 "ms-python", "python", "2024.2.0"
@@ -1757,8 +1984,8 @@ class TestHandleInstallIntegration(unittest.TestCase):
     @patch.object(ce, "get_installed_extensions", return_value={})
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     def test_handle_install_invalid_id_rejected(
-        self, mock_vsver, mock_installed, mock_download
-    ):
+        self, mock_vsver: MagicMock, mock_installed: MagicMock, mock_download: MagicMock
+    ) -> None:
         args = argparse.Namespace(
             code_binary="code",
             service_url=None,
@@ -1791,8 +2018,13 @@ class TestHandleInstallIntegration(unittest.TestCase):
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_install_tolerates_a_space_before_the_version_pin(
-        self, mock_query, mock_vsver, mock_installed, mock_download, mock_run
-    ):
+        self,
+        mock_query: MagicMock,
+        mock_vsver: MagicMock,
+        mock_installed: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         # 'pub.name @1.2.3' leaves a trailing space on the id after the rsplit.
         # The gallery response is keyed by the canonical id, so the padded form
         # has to be normalized before the query or the lookup misses and a real
@@ -1832,11 +2064,13 @@ class TestHandleInstallIntegration(unittest.TestCase):
 # CLI Integration Tests: handle_update
 # =====================================================================
 class TestHandleUpdateIntegration(unittest.TestCase):
-    def setUp(self):
+    config: dict[str, Any]
+
+    def setUp(self) -> None:
         self.config = {"extensions": {}}
 
-    def update_args(self, **overrides):
-        defaults = {
+    def update_args(self, **overrides: Any) -> argparse.Namespace:
+        defaults: dict[str, Any] = {
             "code_binary": "code",
             "service_url": None,
             "open_vsx": False,
@@ -1860,8 +2094,8 @@ class TestHandleUpdateIntegration(unittest.TestCase):
         return_value={"ms-python.python": "2024.2.0"},
     )
     def test_handle_update_all_up_to_date(
-        self, mock_installed, mock_updates, mock_vsver
-    ):
+        self, mock_installed: MagicMock, mock_updates: MagicMock, mock_vsver: MagicMock
+    ) -> None:
         args = argparse.Namespace(
             code_binary="code",
             service_url=None,
@@ -1890,8 +2124,13 @@ class TestHandleUpdateIntegration(unittest.TestCase):
     )
     @patch.object(ce, "check_updates")
     def test_handle_update_yes_installs_eligible(
-        self, mock_check, mock_installed, mock_vsver, mock_download, mock_run
-    ):
+        self,
+        mock_check: MagicMock,
+        mock_installed: MagicMock,
+        mock_vsver: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         mock_check.return_value = [
             {
                 "id": "ms-python.python",
@@ -1938,8 +2177,13 @@ class TestHandleUpdateIntegration(unittest.TestCase):
     )
     @patch.object(ce, "check_updates")
     def test_handle_update_failed_install_exits_nonzero(
-        self, mock_check, mock_installed, mock_vsver, mock_download, mock_run
-    ):
+        self,
+        mock_check: MagicMock,
+        mock_installed: MagicMock,
+        mock_vsver: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         mock_check.return_value = [make_mock_update()]
         args = self.update_args()
 
@@ -1966,8 +2210,13 @@ class TestHandleUpdateIntegration(unittest.TestCase):
     )
     @patch.object(ce, "check_updates")
     def test_handle_update_without_a_terminal_reports_but_installs_nothing(
-        self, mock_check, mock_installed, mock_vsver, mock_download, mock_run
-    ):
+        self,
+        mock_check: MagicMock,
+        mock_installed: MagicMock,
+        mock_vsver: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         mock_check.return_value = [make_mock_update()]
         args = self.update_args(yes=None)
 
@@ -1992,8 +2241,13 @@ class TestHandleUpdateIntegration(unittest.TestCase):
     )
     @patch.object(ce, "check_updates")
     def test_handle_update_dry_run_still_reports_without_a_terminal(
-        self, mock_check, mock_installed, mock_vsver, mock_download, mock_run
-    ):
+        self,
+        mock_check: MagicMock,
+        mock_installed: MagicMock,
+        mock_vsver: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         mock_check.return_value = [make_mock_update()]
         args = self.update_args(yes=None, dry_run=True)
 
@@ -2014,8 +2268,13 @@ class TestHandleUpdateIntegration(unittest.TestCase):
     )
     @patch.object(ce, "check_updates")
     def test_handle_update_dry_run(
-        self, mock_check, mock_installed, mock_vsver, mock_download, mock_run
-    ):
+        self,
+        mock_check: MagicMock,
+        mock_installed: MagicMock,
+        mock_vsver: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         mock_check.return_value = [
             {
                 "id": "ms-python.python",
@@ -2065,8 +2324,13 @@ class TestHandleUpdateIntegration(unittest.TestCase):
     )
     @patch.object(ce, "check_updates")
     def test_handle_update_targeted_extension(
-        self, mock_check, mock_installed, mock_vsver, mock_download, mock_run
-    ):
+        self,
+        mock_check: MagicMock,
+        mock_installed: MagicMock,
+        mock_vsver: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
         mock_check.return_value = []
         args = argparse.Namespace(
             code_binary="code",
@@ -2098,7 +2362,9 @@ class TestHandleRemoveIntegration(unittest.TestCase):
         "get_installed_extensions",
         return_value={"ms-python.python": "2024.2.0"},
     )
-    def test_handle_remove_explicit_with_yes(self, mock_installed, mock_run):
+    def test_handle_remove_explicit_with_yes(
+        self, mock_installed: MagicMock, mock_run: MagicMock
+    ) -> None:
         args = argparse.Namespace(
             code_binary="code",
             yes=True,
@@ -2119,7 +2385,9 @@ class TestHandleRemoveIntegration(unittest.TestCase):
         "get_installed_extensions",
         return_value={"ms-python.python": "2024.2.0"},
     )
-    def test_handle_remove_nonexistent(self, mock_installed, mock_run):
+    def test_handle_remove_nonexistent(
+        self, mock_installed: MagicMock, mock_run: MagicMock
+    ) -> None:
         args = argparse.Namespace(
             code_binary="code",
             yes=True,
@@ -2140,7 +2408,9 @@ class TestHandleRemoveIntegration(unittest.TestCase):
         "get_installed_extensions",
         return_value={"ms-python.python": "2024.2.0"},
     )
-    def test_handle_remove_resolves_partial_names(self, mock_installed, mock_run):
+    def test_handle_remove_resolves_partial_names(
+        self, mock_installed: MagicMock, mock_run: MagicMock
+    ) -> None:
         """Like update and info, remove accepts a partial name."""
         args = argparse.Namespace(
             code_binary="code",
@@ -2162,7 +2432,9 @@ class TestHandleRemoveIntegration(unittest.TestCase):
         "get_installed_extensions",
         return_value={"ms-python.python": "2024.2.0"},
     )
-    def test_handle_remove_dedupes_repeated_targets(self, mock_installed, mock_run):
+    def test_handle_remove_dedupes_repeated_targets(
+        self, mock_installed: MagicMock, mock_run: MagicMock
+    ) -> None:
         """A full ID and a partial name resolving to it remove the extension once."""
         args = argparse.Namespace(
             code_binary="code",
@@ -2191,7 +2463,7 @@ class TestHandleListIntegration(unittest.TestCase):
             "charliermarsh.ruff": "0.1.0",
         },
     )
-    def test_handle_list_standard(self, mock_installed):
+    def test_handle_list_standard(self, mock_installed: MagicMock) -> None:
         args = argparse.Namespace(
             code_binary="code",
             query=None,
@@ -2214,7 +2486,7 @@ class TestHandleListIntegration(unittest.TestCase):
             "charliermarsh.ruff": "0.1.0",
         },
     )
-    def test_handle_list_quiet(self, mock_installed):
+    def test_handle_list_quiet(self, mock_installed: MagicMock) -> None:
         args = argparse.Namespace(
             code_binary="code",
             query=None,
@@ -2235,7 +2507,7 @@ class TestHandleListIntegration(unittest.TestCase):
             "charliermarsh.ruff": "0.1.0",
         },
     )
-    def test_handle_list_query_filter(self, mock_installed):
+    def test_handle_list_query_filter(self, mock_installed: MagicMock) -> None:
         args = argparse.Namespace(
             code_binary="code",
             query="ruff",
@@ -2257,7 +2529,9 @@ class TestHandleListIntegration(unittest.TestCase):
             "charliermarsh.ruff": "0.1.0",
         },
     )
-    def test_handle_list_outdated(self, mock_installed, mock_updates, mock_vsver):
+    def test_handle_list_outdated(
+        self, mock_installed: MagicMock, mock_updates: MagicMock, mock_vsver: MagicMock
+    ) -> None:
         mock_updates.return_value = [
             {
                 "id": "ms-python.python",
@@ -2292,7 +2566,9 @@ class TestHandleSearchIntegration(unittest.TestCase):
     @patch.object(ce, "get_installed_extensions", return_value={})
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_search")
-    def test_handle_search_quiet(self, mock_search, mock_vsver, mock_installed):
+    def test_handle_search_quiet(
+        self, mock_search: MagicMock, mock_vsver: MagicMock, mock_installed: MagicMock
+    ) -> None:
         mock_search.return_value = [
             {
                 "id": "ms-python.python",
@@ -2325,8 +2601,8 @@ class TestHandleSearchIntegration(unittest.TestCase):
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_search")
     def test_handle_search_table_output_non_tty(
-        self, mock_search, mock_vsver, mock_installed
-    ):
+        self, mock_search: MagicMock, mock_vsver: MagicMock, mock_installed: MagicMock
+    ) -> None:
         mock_search.return_value = [
             {
                 "id": "ms-python.python",
@@ -2371,7 +2647,9 @@ class TestHandleInfoIntegration(unittest.TestCase):
         return_value=({"ms-python.python": "2024.1.0"}, None),
     )
     @patch.object(ce, "query_marketplace_extensions")
-    def test_handle_info_found(self, mock_query, mock_installed, mock_vsver):
+    def test_handle_info_found(
+        self, mock_query: MagicMock, mock_installed: MagicMock, mock_vsver: MagicMock
+    ) -> None:
         mock_query.return_value = {
             "ms-python.python": make_mock_gallery_extension(
                 "ms-python", "python", "2024.2.0"
@@ -2398,6 +2676,35 @@ class TestHandleInfoIntegration(unittest.TestCase):
         self.assertIn("Repository:", output)
 
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_installed_extensions", return_value=({}, None))
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_info_survives_a_versions_list_that_is_not_one(
+        self, mock_query: MagicMock, mock_installed: MagicMock, mock_vsver: MagicMock
+    ) -> None:
+        # filter_versions drops every entry it cannot read, and the fallback that
+        # reports the newest published version must apply the same check rather
+        # than indexing whatever the gallery sent.
+        broken = make_mock_gallery_extension("ms-python", "python")
+        broken["versions"] = "garbage"
+        mock_query.return_value = {"ms-python.python": broken}
+        args = argparse.Namespace(
+            extension="ms-python.python",
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            min_release_age="24h",
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_info(args, {})
+
+        output = out.getvalue()
+        self.assertIn("Latest Ver:", output)
+        self.assertIn("unknown", output)
+
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(
         ce,
         "query_installed_extensions",
@@ -2405,8 +2712,8 @@ class TestHandleInfoIntegration(unittest.TestCase):
     )
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_info_survives_a_missing_code_binary(
-        self, mock_query, mock_installed, mock_vsver
-    ):
+        self, mock_query: MagicMock, mock_installed: MagicMock, mock_vsver: MagicMock
+    ) -> None:
         mock_query.return_value = {
             "ms-python.python": make_mock_gallery_extension(
                 "ms-python", "python", "2024.2.0"
@@ -2437,8 +2744,12 @@ class TestHandleInfoIntegration(unittest.TestCase):
     @patch.object(ce, "query_marketplace_search")
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_info_partial_name_fallback(
-        self, mock_exts, mock_search, mock_installed, mock_vsver
-    ):
+        self,
+        mock_exts: MagicMock,
+        mock_search: MagicMock,
+        mock_installed: MagicMock,
+        mock_vsver: MagicMock,
+    ) -> None:
         mock_search.return_value = [{"id": "ms-python.python"}]
         mock_exts.return_value = {
             "ms-python.python": make_mock_gallery_extension(
@@ -2467,8 +2778,12 @@ class TestHandleInfoIntegration(unittest.TestCase):
     @patch.object(ce, "query_marketplace_search")
     @patch.object(ce, "query_marketplace_extensions")
     def test_handle_info_searches_rather_than_querying_a_malformed_id(
-        self, mock_exts, mock_search, mock_installed, mock_vsver
-    ):
+        self,
+        mock_exts: MagicMock,
+        mock_search: MagicMock,
+        mock_installed: MagicMock,
+        mock_vsver: MagicMock,
+    ) -> None:
         # A dot alone used to route straight to a by-id query, which can only
         # answer 'not found' for something that is not a well-formed id.
         mock_search.return_value = [{"id": "ms-python.python"}]
@@ -2499,7 +2814,7 @@ class TestHandleInfoIntegration(unittest.TestCase):
 # CLI Integration Tests: handle_clean
 # =====================================================================
 class TestHandleCleanIntegration(unittest.TestCase):
-    def test_handle_clean_purges_cache_and_old_temp_dirs(self):
+    def test_handle_clean_purges_cache_and_old_temp_dirs(self) -> None:
         with (
             tempfile.TemporaryDirectory() as cache_dir,
             tempfile.TemporaryDirectory() as temp_dir,
@@ -2535,7 +2850,7 @@ class TestHandleCleanIntegration(unittest.TestCase):
 # CLI Integration Tests: handle_config
 # =====================================================================
 class TestHandleConfigIntegration(unittest.TestCase):
-    def test_handle_config_lifecycle(self):
+    def test_handle_config_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = os.path.join(tmp_dir, "config.toml")
             with (
@@ -2584,7 +2899,7 @@ class TestHandleConfigIntegration(unittest.TestCase):
                 after_unset = ce.load_config()
                 self.assertNotIn("min_release_age", after_unset)
 
-    def test_handle_config_list_hides_the_token(self):
+    def test_handle_config_list_hides_the_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = os.path.join(tmp_dir, "config.toml")
             with open(config_path, "w", encoding="utf-8") as f:
@@ -2607,7 +2922,9 @@ class TestHandleConfigIntegration(unittest.TestCase):
         # Asking for it by name still prints it.
         self.assertEqual(get_out.getvalue().strip(), "super-secret")
 
-    def test_handle_config_still_reaches_a_legacy_malformed_extension_entry(self):
+    def test_handle_config_still_reaches_a_legacy_malformed_extension_entry(
+        self,
+    ) -> None:
         # Releases before id validation accepted 'foo.ignore' and wrote an
         # [extensions.foo] section. 'set' now refuses to create one, but 'get'
         # and 'unset' must keep reaching the existing section, or it could only
@@ -2647,7 +2964,7 @@ class TestHandleConfigIntegration(unittest.TestCase):
                     ce.handle_config(unset_args, ce.load_config())
                 self.assertNotIn("foo", ce.load_config().get("extensions", {}))
 
-    def test_parse_config_key_validates_only_when_asked(self):
+    def test_parse_config_key_validates_only_when_asked(self) -> None:
         # A dotted key is always an extension rule, so a malformed one comes
         # back as 'invalid' rather than being retried as a global setting.
         self.assertEqual(
@@ -2677,7 +2994,7 @@ class TestHandleConfigIntegration(unittest.TestCase):
 # CLI Integration Tests: handle_completion
 # =====================================================================
 class TestHandleCompletionIntegration(unittest.TestCase):
-    def test_handle_completion_all_shells(self):
+    def test_handle_completion_all_shells(self) -> None:
         shells = ["bash", "zsh", "fish", "powershell"]
         for sh in shells:
             with self.subTest(shell=sh):
@@ -2700,27 +3017,27 @@ _RESOLVE_INSTALLED = {
 
 
 class TestResolveInstalledTargets(unittest.TestCase):
-    def _resolve(self, specs, **kwargs):
+    def _resolve(self, specs: Sequence[str], **kwargs: Any) -> Any:
         with (
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
             return ce.resolve_installed_targets(specs, _RESOLVE_INSTALLED, **kwargs)
 
-    def test_full_id_resolves_either_way(self):
+    def test_full_id_resolves_either_way(self) -> None:
         spec = ["foo-bar.python-tools"]
         self.assertEqual(self._resolve(spec), {"foo-bar.python-tools": "1.0.0"})
         self.assertEqual(
             self._resolve(spec, exact_name=True), {"foo-bar.python-tools": "1.0.0"}
         )
 
-    def test_substring_match_only_in_loose_mode(self):
+    def test_substring_match_only_in_loose_mode(self) -> None:
         # 'tools' appears inside the ID but is not an extension name, so the
         # strict mode 'remove' uses must not match it.
         self.assertEqual(self._resolve(["tools"]), {"foo-bar.python-tools": "1.0.0"})
         self.assertEqual(self._resolve(["tools"], exact_name=True), {})
 
-    def test_exact_extension_name_resolves_in_strict_mode(self):
+    def test_exact_extension_name_resolves_in_strict_mode(self) -> None:
         self.assertEqual(
             list(self._resolve(["python"], exact_name=True)), ["ms-python.python"]
         )
@@ -2729,7 +3046,7 @@ class TestResolveInstalledTargets(unittest.TestCase):
             {"foo-bar.python-tools": "1.0.0"},
         )
 
-    def test_loose_mode_prefers_the_exact_name(self):
+    def test_loose_mode_prefers_the_exact_name(self) -> None:
         # Both IDs contain 'python'; the one named exactly 'python' wins.
         self.assertEqual(self._resolve(["python"]), {"ms-python.python": "2024.0.0"})
 
@@ -2746,7 +3063,7 @@ _BAD_CONFIG = {
 class TestExecutionContextLazyOptions(unittest.TestCase):
     """Settings a command never consults must not be resolved for it."""
 
-    def test_construction_touches_neither_setting(self):
+    def test_construction_touches_neither_setting(self) -> None:
         # load_config does not check that min_release_age parses, so an invalid
         # hand-edited value must only fail the commands that actually use it.
         args = argparse.Namespace(code_binary="code")
@@ -2758,7 +3075,7 @@ class TestExecutionContextLazyOptions(unittest.TestCase):
         mock_age.assert_not_called()
         mock_url.assert_not_called()
 
-    def test_min_release_age_is_resolved_once_on_demand(self):
+    def test_min_release_age_is_resolved_once_on_demand(self) -> None:
         args = argparse.Namespace(code_binary="code", min_release_age=None)
         ctx = ce.ExecutionContext(args, {"min_release_age": "2h"})
         with patch.object(
@@ -2771,7 +3088,7 @@ class TestExecutionContextLazyOptions(unittest.TestCase):
             self.assertEqual(ctx.min_release_age, datetime.timedelta(hours=2))
         self.assertEqual(mock_age.call_count, 1)
 
-    def test_insecure_url_warning_waits_for_the_first_use(self):
+    def test_insecure_url_warning_waits_for_the_first_use(self) -> None:
         args = argparse.Namespace(code_binary="code", open_vsx=None, service_url=None)
         ctx = ce.ExecutionContext(args, _BAD_CONFIG)
         with contextlib.redirect_stderr(io.StringIO()) as err:
@@ -2783,7 +3100,9 @@ class TestExecutionContextLazyOptions(unittest.TestCase):
         "get_installed_extensions",
         return_value={"ms-python.python": "2024.2.0"},
     )
-    def test_list_survives_an_unparseable_min_release_age(self, mock_installed):
+    def test_list_survives_an_unparseable_min_release_age(
+        self, mock_installed: MagicMock
+    ) -> None:
         args = argparse.Namespace(
             code_binary="code",
             query=None,
@@ -2803,7 +3122,7 @@ class TestExecutionContextLazyOptions(unittest.TestCase):
 # =====================================================================
 # CLI Surface / Completion Sync Tests
 # =====================================================================
-def _cli_help(argv):
+def _cli_help(argv: Sequence[str]) -> str:
     """Capture a --help run of the real parser, the way a user sees it."""
     with (
         patch.object(sys, "argv", ["code-extensions", *argv, "--help"]),
@@ -2817,7 +3136,7 @@ def _cli_help(argv):
     return out.getvalue()
 
 
-def _help_flags(argv):
+def _help_flags(argv: Sequence[str]) -> set[str]:
     """Option strings argparse itself advertises for a subcommand."""
     options = _cli_help(argv).partition("options:")[2]
     return {
@@ -2828,14 +3147,14 @@ def _help_flags(argv):
     }
 
 
-def _table_flags(name, globals_included=True):
+def _table_flags(name: str, globals_included: bool = True) -> set[str]:
     options = list(ce.SUBCOMMAND_OPTIONS[name])
     if globals_included:
         options += [*ce.GLOBAL_OPTIONS, ce.HELP_OPTION]
     return {flag for opt in options for flag in opt.flags}
 
 
-def _bash_branch_flags(script, name):
+def _bash_branch_flags(script: str, name: str) -> set[str]:
     """Flags the bash script offers inside the case branch for `name`."""
     pattern = "|".join(ce.subcommand_names(name))
     branch = script.partition(f"\n        {pattern})\n")[2].partition(";;")[0]
@@ -2843,9 +3162,9 @@ def _bash_branch_flags(script, name):
     return set(re.findall(r"-{1,2}[a-zA-Z][\w-]*", offered.group(1) if offered else ""))
 
 
-def _fish_flags(script, name):
+def _fish_flags(script: str, name: str) -> set[str]:
     """Flags fish offers for `name`, whether globally or behind a predicate."""
-    flags = set()
+    flags: set[str] = set()
     for line in script.splitlines():
         if not line.startswith("complete "):
             continue
@@ -2859,7 +3178,7 @@ def _fish_flags(script, name):
     return flags
 
 
-def _zsh_branch_flags(script, name):
+def _zsh_branch_flags(script: str, name: str) -> set[str]:
     pattern = "|".join(ce.subcommand_names(name))
     branch = script.partition(f"\n                {pattern})\n")[2].partition(";;")[0]
     # Only the quoted _arguments specs are option specs; the surrounding shell
@@ -2874,28 +3193,28 @@ def _zsh_branch_flags(script, name):
 class TestCliSurfaceTables(unittest.TestCase):
     """The tables the parser and the completion scripts are generated from."""
 
-    def test_every_subcommand_has_an_option_entry(self):
+    def test_every_subcommand_has_an_option_entry(self) -> None:
         self.assertEqual(
             sorted(ce.SUBCOMMAND_OPTIONS), sorted(ce.CANONICAL_SUBCOMMANDS)
         )
 
-    def test_completion_scripts_cover_exactly_the_supported_shells(self):
+    def test_completion_scripts_cover_exactly_the_supported_shells(self) -> None:
         self.assertEqual(
             sorted(ce.SHELL_COMPLETION_SCRIPTS), sorted(ce.COMPLETION_SHELLS)
         )
 
-    def test_no_unfilled_marker_reaches_a_generated_script(self):
+    def test_no_unfilled_marker_reaches_a_generated_script(self) -> None:
         for shell, script in ce.SHELL_COMPLETION_SCRIPTS.items():
             with self.subTest(shell=shell):
                 self.assertNotIn("@@", script)
 
-    def test_every_subcommand_and_alias_dispatches(self):
+    def test_every_subcommand_and_alias_dispatches(self) -> None:
         expected = ce.subcommand_names(*ce.CANONICAL_SUBCOMMANDS)
         for name in expected:
             with self.subTest(command=name):
                 self.assertEqual(_cli_help([name]).count("usage:"), 1)
 
-    def test_parser_flags_match_the_option_table(self):
+    def test_parser_flags_match_the_option_table(self) -> None:
         # Ties the table to what argparse really accepts, so a subcommand that
         # stops taking an option cannot keep advertising it in completions.
         for name in ce.CANONICAL_SUBCOMMANDS:
@@ -2906,21 +3225,22 @@ class TestCliSurfaceTables(unittest.TestCase):
 class TestDocumentedCliSurface(unittest.TestCase):
     """README and dispatch table have to keep up with the tables too."""
 
-    README = os.path.join(os.path.dirname(__file__), "README.md")
+    README: ClassVar[str] = os.path.join(os.path.dirname(__file__), "README.md")
+    readme: ClassVar[str]
 
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         with open(cls.README, encoding="utf-8") as f:
             cls.readme = f.read()
 
-    def test_every_name_and_alias_has_a_handler(self):
+    def test_every_name_and_alias_has_a_handler(self) -> None:
         # A subcommand registered without a handler would only fail when a user
         # actually runs it, after argparse has accepted the command line.
         self.assertEqual(
             sorted(ce.HANDLERS), sorted(ce.subcommand_names(*ce.CANONICAL_SUBCOMMANDS))
         )
 
-    def test_every_config_action_is_implemented(self):
+    def test_every_config_action_is_implemented(self) -> None:
         # handle_config dispatches on the action string, so an action offered by
         # the parser and the completions but never handled would silently no-op.
         source = inspect.getsource(ce.handle_config)
@@ -2929,13 +3249,13 @@ class TestDocumentedCliSurface(unittest.TestCase):
                 with self.subTest(action=name):
                     self.assertIn(f'"{name}"', source)
 
-    def test_readme_lists_every_command_and_alias(self):
+    def test_readme_lists_every_command_and_alias(self) -> None:
         commands = self.readme.partition("### Commands")[2].partition("### Global")[0]
         for name in ce.subcommand_names(*ce.CANONICAL_SUBCOMMANDS):
             with self.subTest(command=name):
                 self.assertIn(f"`{name}`", commands)
 
-    def test_readme_documents_every_option(self):
+    def test_readme_documents_every_option(self) -> None:
         sections = {
             m.group(1): m.group(2)
             for m in re.finditer(
@@ -2956,19 +3276,19 @@ class TestDocumentedCliSurface(unittest.TestCase):
 class TestCompletionScriptsMatchTheParser(unittest.TestCase):
     """Each shell must offer exactly the flags its subcommand accepts."""
 
-    def test_bash_branches_match(self):
+    def test_bash_branches_match(self) -> None:
         script = ce.SHELL_COMPLETION_SCRIPTS["bash"]
         for name in ("install", "update", "remove", "list", "search", "info"):
             with self.subTest(command=name):
                 self.assertEqual(_bash_branch_flags(script, name), _table_flags(name))
 
-    def test_fish_lines_match(self):
+    def test_fish_lines_match(self) -> None:
         script = ce.SHELL_COMPLETION_SCRIPTS["fish"]
         for name in ce.CANONICAL_SUBCOMMANDS:
             with self.subTest(command=name):
                 self.assertEqual(_fish_flags(script, name), _table_flags(name))
 
-    def test_zsh_branches_match(self):
+    def test_zsh_branches_match(self) -> None:
         script = ce.SHELL_COMPLETION_SCRIPTS["zsh"]
         # zsh handles the global options once, before dispatching on the
         # subcommand, so a branch only carries the subcommand's own options.
@@ -2979,7 +3299,7 @@ class TestCompletionScriptsMatchTheParser(unittest.TestCase):
                     _table_flags(name, globals_included=False),
                 )
 
-    def test_zsh_offers_the_global_options_up_front(self):
+    def test_zsh_offers_the_global_options_up_front(self) -> None:
         script = ce.SHELL_COMPLETION_SCRIPTS["zsh"]
         top_level = script.partition("_arguments -C")[2].partition("case $state")[0]
         self.assertEqual(
@@ -2995,7 +3315,7 @@ class TestCompletionScriptsMatchTheParser(unittest.TestCase):
             },
         )
 
-    def test_subcommands_and_choices_reach_every_script(self):
+    def test_subcommands_and_choices_reach_every_script(self) -> None:
         for shell, script in ce.SHELL_COMPLETION_SCRIPTS.items():
             for name in ce.CANONICAL_SUBCOMMANDS:
                 with self.subTest(shell=shell, command=name):
@@ -3014,7 +3334,7 @@ class TestCompletionScriptsMatchTheParser(unittest.TestCase):
 class TestColorsEnableFlag(unittest.TestCase):
     """Codes resolve through _enabled at read time, not by rewriting attrs."""
 
-    def test_disable_resolves_every_code_to_empty(self):
+    def test_disable_resolves_every_code_to_empty(self) -> None:
         self.assertNotEqual(ce.Colors.RED, "")
         ce._disable_colors()
         self.addCleanup(setattr, ce.Colors, "_enabled", True)
@@ -3022,7 +3342,7 @@ class TestColorsEnableFlag(unittest.TestCase):
         self.assertEqual(ce.Colors.GREEN, "")
         self.assertEqual(ce.Colors.ENDC, "")
 
-    def test_disable_is_reversible(self):
+    def test_disable_is_reversible(self) -> None:
         # The old attribute-mutation approach could not be undone; the flag
         # can, and the stored codes are never touched.
         original = ce.Colors.RED
@@ -3032,7 +3352,7 @@ class TestColorsEnableFlag(unittest.TestCase):
         ce.Colors._enabled = True
         self.assertEqual(ce.Colors.RED, original)
 
-    def test_underscore_attrs_are_not_filtered(self):
+    def test_underscore_attrs_are_not_filtered(self) -> None:
         ce._disable_colors()
         self.addCleanup(setattr, ce.Colors, "_enabled", True)
         self.assertIs(ce.Colors._enabled, False)

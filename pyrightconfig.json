@@ -1,0 +1,33 @@
+{
+  // basedpyright turns every check on by default. What follows is the set this
+  // codebase deliberately does not satisfy, and why; everything else is an
+  // error worth fixing.
+  "typeCheckingMode": "all",
+  // The floor the script enforces at startup.
+  "pythonVersion": "3.11",
+
+  // The gallery answers with untrusted JSON and the config file is
+  // user-written TOML: json.loads and tomllib.loads hand back Any, and
+  // argparse.Namespace attributes are Any by construction. The readers narrow
+  // with isinstance at each use instead of pretending otherwise, which leaves
+  // Any and Unknown all over the boundary.
+  "reportAny": "none",
+  "reportExplicitAny": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownLambdaType": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownParameterType": "none",
+  "reportUnknownVariableType": "none",
+  // Same reason from the other side: the TypedDicts describe the shape the
+  // gallery documents, not one it is held to, so the isinstance guards that
+  // look redundant to the checker are the runtime's only protection.
+  "reportUnnecessaryIsInstance": "none",
+
+  // print(), sys.stdout.write() and parser.add_argument() are called for their
+  // effect throughout; assigning each result to `_` would only add noise.
+  "reportUnusedCallResult": "none",
+  // Ruff's formatter is what splits the long messages across lines.
+  "reportImplicitStringConcatenation": "none",
+  // typing.override arrived in 3.12; this script still runs on 3.11.
+  "reportImplicitOverride": "none"
+}
