@@ -2996,6 +2996,182 @@ class TestHandleConfigIntegration(unittest.TestCase):
             ce.parse_config_key("min_release_age"), ("global", "min_release_age", None)
         )
 
+    def test_handle_config_edit_creates_missing_file_and_launches_editor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, "subdir", "config.toml")
+            args = argparse.Namespace(action="edit", key=None, value=None)
+            with (
+                patch.object(ce, "get_default_config_path", return_value=config_path),
+                patch.dict(os.environ, {"EDITOR": "test-editor"}, clear=True),
+                patch.object(
+                    ce.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(
+                        args=["test-editor", config_path], returncode=0
+                    ),
+                ) as mock_run,
+            ):
+                ce.handle_config(args, {})
+                self.assertTrue(os.path.exists(config_path))
+                mock_run.assert_called_once_with(
+                    ["test-editor", config_path], check=False, shell=False
+                )
+
+    def test_handle_config_edit_with_multiword_editor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, "config.toml")
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write('min_release_age = "24h"\n')
+            args = argparse.Namespace(action="edit", key=None, value=None)
+            with (
+                patch.object(ce, "get_default_config_path", return_value=config_path),
+                patch.dict(
+                    os.environ, {"CODE_EXTENSIONS_EDITOR": "code --wait"}, clear=True
+                ),
+                patch.object(
+                    ce.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(
+                        args=["code", "--wait", config_path], returncode=0
+                    ),
+                ) as mock_run,
+            ):
+                ce.handle_config(args, {})
+                mock_run.assert_called_once_with(
+                    ["code", "--wait", config_path], check=False, shell=False
+                )
+
+    def test_handle_config_edit_propagates_non_zero_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, "config.toml")
+            args = argparse.Namespace(action="edit", key=None, value=None)
+            with (
+                patch.object(ce, "get_default_config_path", return_value=config_path),
+                patch.dict(os.environ, {"EDITOR": "editor"}, clear=True),
+                patch.object(
+                    ce.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(
+                        args=["editor", config_path], returncode=42
+                    ),
+                ),
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    ce.handle_config(args, {})
+                self.assertEqual(cm.exception.code, 42)
+
+    def test_handle_config_edit_handles_launch_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, "config.toml")
+            args = argparse.Namespace(action="edit", key=None, value=None)
+            with (
+                patch.object(ce, "get_default_config_path", return_value=config_path),
+                patch.dict(os.environ, {"EDITOR": "nonexistent-editor"}, clear=True),
+                patch.object(
+                    ce.subprocess,
+                    "run",
+                    side_effect=FileNotFoundError("No such file"),
+                ),
+                contextlib.redirect_stderr(io.StringIO()) as err,
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    ce.handle_config(args, {})
+                self.assertEqual(cm.exception.code, 1)
+                self.assertIn("Failed to launch editor", err.getvalue())
+
+    def test_handle_config_edit_handles_invalid_command_syntax(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, "config.toml")
+            args = argparse.Namespace(action="edit", key=None, value=None)
+            with (
+                patch.object(ce, "get_default_config_path", return_value=config_path),
+                patch.dict(os.environ, {"EDITOR": '"unclosed quote'}, clear=True),
+                contextlib.redirect_stderr(io.StringIO()) as err,
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    ce.handle_config(args, {})
+                self.assertEqual(cm.exception.code, 1)
+                self.assertIn("Invalid editor command", err.getvalue())
+
+    def test_handle_config_edit_handles_empty_editor_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, "config.toml")
+            args = argparse.Namespace(action="edit", key=None, value=None)
+            with (
+                patch.object(ce, "get_default_config_path", return_value=config_path),
+                patch.object(ce, "resolve_editor", return_value=""),
+                contextlib.redirect_stderr(io.StringIO()) as err,
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    ce.handle_config(args, {})
+                self.assertEqual(cm.exception.code, 1)
+                self.assertIn("Editor command is empty", err.getvalue())
+
+
+class TestResolveEditor(unittest.TestCase):
+    def test_resolve_editor_code_extensions_editor_precedence(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "CODE_EXTENSIONS_EDITOR": "my-code-editor",
+                "VISUAL": "visual-editor",
+                "EDITOR": "editor",
+            },
+            clear=True,
+        ):
+            self.assertEqual(ce.resolve_editor(), "my-code-editor")
+
+    def test_resolve_editor_visual_precedence(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"VISUAL": "visual-editor", "EDITOR": "editor"},
+            clear=True,
+        ):
+            self.assertEqual(ce.resolve_editor(), "visual-editor")
+
+    def test_resolve_editor_editor_precedence(self) -> None:
+        with patch.dict(os.environ, {"EDITOR": "editor"}, clear=True):
+            self.assertEqual(ce.resolve_editor(), "editor")
+
+    def test_resolve_editor_skips_empty_or_whitespace_env(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "CODE_EXTENSIONS_EDITOR": "   ",
+                "VISUAL": "",
+                "EDITOR": "fallback-editor",
+            },
+            clear=True,
+        ):
+            self.assertEqual(ce.resolve_editor(), "fallback-editor")
+
+    def test_resolve_editor_windows_fallback(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(ce.os, "name", "nt"),
+        ):
+            self.assertEqual(ce.resolve_editor(), "notepad")
+
+    def test_resolve_editor_posix_fallback_with_which(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(ce.os, "name", "posix"),
+            patch.object(
+                ce.shutil,
+                "which",
+                side_effect=lambda c: "/usr/bin/" + c if c == "nano" else None,
+            ),
+        ):
+            self.assertEqual(ce.resolve_editor(), "nano")
+
+    def test_resolve_editor_posix_fallback_default_vi(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(ce.os, "name", "posix"),
+            patch.object(ce.shutil, "which", return_value=None),
+        ):
+            self.assertEqual(ce.resolve_editor(), "vi")
+
 
 # =====================================================================
 # CLI Integration Tests: handle_completion

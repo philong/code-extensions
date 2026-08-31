@@ -152,14 +152,16 @@ code-extensions clean
 ### 7. `config` Command
 
 ```bash
-code-extensions config [list|get|set|unset] [key] [value]
+code-extensions config [list|get|set|unset|edit] [key] [value]
 ```
 
-* View, set, or unset configuration settings and per-extension rules directly in `config.toml`.
+* View, set, unset, or edit configuration settings and per-extension rules directly in `config.toml`.
+* `config edit` opens the configuration file in your default editor (`$CODE_EXTENSIONS_EDITOR`, `$VISUAL`, `$EDITOR`, or system fallback).
 
 **Examples**:
 ```bash
 code-extensions config list
+code-extensions config edit
 code-extensions config set min_release_age 3d
 code-extensions config set code_binary codium
 code-extensions config set charliermarsh.ruff.min_release_age 12h

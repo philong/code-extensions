@@ -1296,6 +1296,24 @@ def get_default_config_path() -> str:
     return os.path.join(user_config_dir, "config.toml")
 
 
+def resolve_editor() -> str:
+    """Determine the text editor to use for opening the configuration file.
+
+    Follows the standard precedence: CODE_EXTENSIONS_EDITOR, VISUAL, EDITOR,
+    then platform-specific fallbacks (notepad on Windows; nano, vim, vi on POSIX).
+    """
+    for var in ("CODE_EXTENSIONS_EDITOR", "VISUAL", "EDITOR"):
+        val = os.environ.get(var)
+        if val and val.strip():
+            return val.strip()
+    if os.name == "nt":
+        return "notepad"
+    for candidate in ("nano", "vim", "vi"):
+        if shutil.which(candidate):
+            return candidate
+    return "vi"
+
+
 def toml_string(value: object) -> str:
     escaped = (
         str(value)
@@ -1795,6 +1813,45 @@ def handle_config(args: argparse.Namespace, config: dict[str, object]) -> None:
         for key, _type, desc in EXT_CONFIG_SCHEMA:
             print(f"  {Colors.CYAN}{key:<22}{Colors.ENDC} {desc}")
         print()
+        return
+
+    if action == "edit":
+        if not os.path.exists(config_path):
+            write_config_text("", config_path)
+        else:
+            restrict_to_owner(config_path, 0o600)
+
+        editor_cmd = resolve_editor()
+        try:
+            parts = shlex.split(editor_cmd, posix=(os.name != "nt"))
+        except ValueError as e:
+            print(
+                f"{Colors.RED}Error: Invalid editor command '{editor_cmd}': {e}{Colors.ENDC}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if not parts:
+            print(
+                f"{Colors.RED}Error: Editor command is empty.{Colors.ENDC}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        cmd = [*parts, config_path]
+        use_shell = os.name == "nt" and str(parts[0]).lower().endswith((".cmd", ".bat"))
+        try:
+            result = subprocess.run(cmd, check=False, shell=use_shell)
+            if os.path.exists(config_path):
+                restrict_to_owner(config_path, 0o600)
+            if result.returncode != 0:
+                sys.exit(result.returncode)
+        except (OSError, subprocess.SubprocessError) as e:
+            print(
+                f"{Colors.RED}Error: Failed to launch editor '{parts[0]}': {e}{Colors.ENDC}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         return
 
     if action == "get":
@@ -4366,6 +4423,7 @@ CONFIG_ACTIONS = (
     CliChoice("get", (), "Get a configuration key value"),
     CliChoice("set", (), "Set a configuration key value"),
     CliChoice("unset", ("delete",), "Unset a configuration key"),
+    CliChoice("edit", (), "Open configuration file in text editor"),
 )
 
 COMPLETION_SHELLS = ("bash", "fish", "powershell", "zsh")
@@ -5079,7 +5137,7 @@ def main() -> None:
         nargs="?",
         choices=CONFIG_ACTION_CHOICES,
         default="list",
-        help="Action to perform: list, get, set, unset",
+        help="Action to perform: list, get, set, unset, edit",
     )
     parser_config.add_argument(
         "key",
