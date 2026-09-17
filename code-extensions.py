@@ -4632,10 +4632,16 @@ SUBCOMMAND_OPTIONS = {
 
 
 def add_options(
-    parser: argparse.ArgumentParser, options: Sequence[CliOption]
+    parser: argparse.ArgumentParser,
+    options: Sequence[CliOption],
+    *,
+    suppress_defaults: bool = False,
 ) -> argparse.ArgumentParser:
     for opt in options:
-        parser.add_argument(*opt.flags, help=opt.help, **opt.kwargs)
+        kwargs = dict(opt.kwargs)
+        if suppress_defaults and "default" in kwargs:
+            kwargs["default"] = argparse.SUPPRESS
+        parser.add_argument(*opt.flags, help=opt.help, **kwargs)
     return parser
 
 
@@ -5029,18 +5035,22 @@ def main() -> None:
 
     # Options come from SUBCOMMAND_OPTIONS so the parser and the completion
     # scripts cannot disagree about what a subcommand accepts.
-    parent_parser = add_options(argparse.ArgumentParser(add_help=False), GLOBAL_OPTIONS)
+    root_parent = add_options(argparse.ArgumentParser(add_help=False), GLOBAL_OPTIONS)
+    sub_parent = add_options(
+        argparse.ArgumentParser(add_help=False), GLOBAL_OPTIONS, suppress_defaults=True
+    )
 
     parser = argparse.ArgumentParser(
         prog="code-extensions",
         description="VS Code Extension Manager: Install, update, list, search, and remove extensions with security controls.",
+        parents=[root_parent],
     )
     subparsers = parser.add_subparsers(dest="command", help="Subcommand to execute")
 
     # Install sub-parser
     parser_install = subparsers.add_parser(
         "install",
-        parents=[parent_parser],
+        parents=[sub_parent],
         help="Install VS Code extension(s) by ID (e.g. publisher.name or publisher.name@version)",
     )
     add_options(parser_install, SUBCOMMAND_OPTIONS["install"])
@@ -5055,7 +5065,7 @@ def main() -> None:
     parser_update = subparsers.add_parser(
         "update",
         aliases=SUBCOMMAND_ALIASES["update"],
-        parents=[parent_parser],
+        parents=[sub_parent],
         help="Check, download, and install updates for installed extensions",
     )
     add_options(parser_update, SUBCOMMAND_OPTIONS["update"])
@@ -5069,7 +5079,7 @@ def main() -> None:
     parser_remove = subparsers.add_parser(
         "remove",
         aliases=SUBCOMMAND_ALIASES["remove"],
-        parents=[parent_parser],
+        parents=[sub_parent],
         help="Remove installed extension(s)",
     )
     add_options(parser_remove, SUBCOMMAND_OPTIONS["remove"])
@@ -5084,7 +5094,7 @@ def main() -> None:
     parser_list = subparsers.add_parser(
         "list",
         aliases=SUBCOMMAND_ALIASES["list"],
-        parents=[parent_parser],
+        parents=[sub_parent],
         help="List installed extension(s)",
     )
     add_options(parser_list, SUBCOMMAND_OPTIONS["list"])
@@ -5098,7 +5108,7 @@ def main() -> None:
     # Search sub-parser
     parser_search = subparsers.add_parser(
         "search",
-        parents=[parent_parser],
+        parents=[sub_parent],
         help="Search VS Code Marketplace / Open VSX for extensions",
     )
     add_options(parser_search, SUBCOMMAND_OPTIONS["search"])
@@ -5111,7 +5121,7 @@ def main() -> None:
     parser_info = subparsers.add_parser(
         "info",
         aliases=SUBCOMMAND_ALIASES["info"],
-        parents=[parent_parser],
+        parents=[sub_parent],
         help="Show detailed metadata for an extension",
     )
     parser_info.add_argument(
@@ -5122,14 +5132,14 @@ def main() -> None:
     # Clean sub-parser
     subparsers.add_parser(
         "clean",
-        parents=[parent_parser],
+        parents=[sub_parent],
         help="Purge cached API response JSON files and temporary VSIX downloads",
     )
 
     # Config sub-parser
     parser_config = subparsers.add_parser(
         "config",
-        parents=[parent_parser],
+        parents=[sub_parent],
         help="View or modify configuration settings in config.toml",
     )
     parser_config.add_argument(
@@ -5155,7 +5165,7 @@ def main() -> None:
     # Completion sub-parser
     parser_completion = subparsers.add_parser(
         "completion",
-        parents=[parent_parser],
+        parents=[sub_parent],
         help=f"Generate shell completion script ({', '.join(COMPLETION_SHELLS)})",
     )
     parser_completion.add_argument(

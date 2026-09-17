@@ -3404,6 +3404,23 @@ class TestCliSurfaceTables(unittest.TestCase):
             with self.subTest(command=name):
                 self.assertEqual(_help_flags([name]), _table_flags(name))
 
+    def test_root_parser_offers_global_options(self) -> None:
+        expected = {flag for opt in (*ce.GLOBAL_OPTIONS, ce.HELP_OPTION) for flag in opt.flags}
+        self.assertEqual(_help_flags([]), expected)
+
+    def test_global_options_accepted_before_subcommand(self) -> None:
+        # Global options placed before the subcommand allow aliasing, e.g.:
+        # alias vscodium="code-extensions --code-binary codium"
+        with (
+            patch.object(ce.Colors, "_enabled", ce.Colors._enabled),
+            patch.object(ce, "get_installed_extensions", return_value=[]) as mock_get,
+            patch.object(sys, "argv", ["code-extensions", "--code-binary", "vscodium", "list"]),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.suppress(SystemExit),
+        ):
+            ce.main()
+        self.assertEqual(mock_get.call_args, call(["vscodium"]))
+
 
 class TestDocumentedCliSurface(unittest.TestCase):
     """README and dispatch table have to keep up with the tables too."""
