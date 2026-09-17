@@ -4638,7 +4638,7 @@ def add_options(
     suppress_defaults: bool = False,
 ) -> argparse.ArgumentParser:
     for opt in options:
-        kwargs = dict(opt.kwargs)
+        kwargs: AddArgumentKwargs = {**opt.kwargs}
         if suppress_defaults and "default" in kwargs:
             kwargs["default"] = argparse.SUPPRESS
         parser.add_argument(*opt.flags, help=opt.help, **kwargs)

@@ -3405,7 +3405,9 @@ class TestCliSurfaceTables(unittest.TestCase):
                 self.assertEqual(_help_flags([name]), _table_flags(name))
 
     def test_root_parser_offers_global_options(self) -> None:
-        expected = {flag for opt in (*ce.GLOBAL_OPTIONS, ce.HELP_OPTION) for flag in opt.flags}
+        expected = {
+            flag for opt in (*ce.GLOBAL_OPTIONS, ce.HELP_OPTION) for flag in opt.flags
+        }
         self.assertEqual(_help_flags([]), expected)
 
     def test_global_options_accepted_before_subcommand(self) -> None:
@@ -3414,7 +3416,9 @@ class TestCliSurfaceTables(unittest.TestCase):
         with (
             patch.object(ce.Colors, "_enabled", ce.Colors._enabled),
             patch.object(ce, "get_installed_extensions", return_value=[]) as mock_get,
-            patch.object(sys, "argv", ["code-extensions", "--code-binary", "vscodium", "list"]),
+            patch.object(
+                sys, "argv", ["code-extensions", "--code-binary", "vscodium", "list"]
+            ),
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.suppress(SystemExit),
         ):
