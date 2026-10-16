@@ -1899,7 +1899,9 @@ class TestDownloadAndInstallPipeline(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
-            return ce.download_and_install("code", jobs)
+            # ce is loaded from a path, so mypy only knows it as Any.
+            failures: list[str] = ce.download_and_install("code", jobs)
+        return failures
 
     def test_install_overlaps_the_next_download_but_downloads_do_not_overlap(
         self,
