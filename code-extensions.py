@@ -1869,6 +1869,8 @@ def handle_config(args: argparse.Namespace, config: dict[str, object]) -> None:
         cmd = [*parts, config_path]
         use_shell = os.name == "nt" and str(parts[0]).lower().endswith((".cmd", ".bat"))
         try:
+            if use_shell:
+                _assert_safe_for_cmd_shell(cmd)
             result = subprocess.run(cmd, check=False, shell=use_shell)
             if os.path.exists(config_path):
                 restrict_to_owner(config_path, 0o600)

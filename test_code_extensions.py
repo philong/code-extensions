@@ -3724,6 +3724,25 @@ class TestHandleConfigIntegration(unittest.TestCase):
                 self.assertEqual(cm.exception.code, 1)
                 self.assertIn("Failed to launch editor", err.getvalue())
 
+    def test_handle_config_edit_refuses_unsafe_cmd_editor_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, "config.toml")
+            args = argparse.Namespace(action="edit", key=None, value=None)
+            with (
+                patch.object(ce, "get_default_config_path", return_value=config_path),
+                patch.dict(
+                    os.environ, {"EDITOR": "notepad.cmd %USERPROFILE%"}, clear=True
+                ),
+                patch.object(ce.os, "name", "nt"),
+                patch.object(ce.subprocess, "run") as mock_run,
+                contextlib.redirect_stderr(io.StringIO()) as err,
+            ):
+                with self.assertRaises(SystemExit) as cm:
+                    ce.handle_config(args, {})
+                self.assertEqual(cm.exception.code, 1)
+                self.assertIn("cannot safely run via cmd.exe", err.getvalue())
+                mock_run.assert_not_called()
+
     def test_handle_config_edit_handles_invalid_command_syntax(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = os.path.join(tmp_dir, "config.toml")
