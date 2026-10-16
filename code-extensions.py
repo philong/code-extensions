@@ -1777,7 +1777,18 @@ def handle_config(args: argparse.Namespace, config: dict[str, object]) -> None:
     config_path = get_default_config_path()
     action = args.action or "list"
 
-    if action == "list" and not args.key:
+    # argparse fills key and value for every action, so an argument the action
+    # does not take would otherwise be dropped without a word.
+    max_args = {"list": 0, "edit": 0, "get": 1, "unset": 1, "delete": 1}.get(action, 2)
+    extra = [a for a in (args.key, args.value) if a is not None][max_args:]
+    if extra:
+        print(
+            f"{Colors.RED}Error: 'config {action}' got unexpected argument(s): {' '.join(extra)}.{Colors.ENDC}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if action == "list":
         print(f"{Colors.BOLD}Configuration file:{Colors.ENDC} {config_path}\n")
         print(f"{Colors.BOLD}Active Global Overrides:{Colors.ENDC}")
         globals_found = False

@@ -3412,6 +3412,30 @@ class TestHandleConfigIntegration(unittest.TestCase):
                 after_unset = ce.load_config()
                 self.assertNotIn("min_release_age", after_unset)
 
+    def test_handle_config_rejects_extra_arguments(self) -> None:
+        cases = [
+            ("list", "min_release_age", None),
+            ("edit", "min_release_age", None),
+            ("get", "min_release_age", "3d"),
+            ("unset", "min_release_age", "3d"),
+        ]
+        for action, key, value in cases:
+            with self.subTest(action=action):
+                args = argparse.Namespace(action=action, key=key, value=value)
+                with (
+                    patch.object(ce, "update_config_file") as mock_update,
+                    patch.object(subprocess, "run") as mock_run,
+                    contextlib.redirect_stdout(io.StringIO()) as out,
+                    contextlib.redirect_stderr(io.StringIO()) as err,
+                    self.assertRaises(SystemExit) as cm,
+                ):
+                    ce.handle_config(args, {"min_release_age": "1d"})
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("unexpected argument", err.getvalue())
+                self.assertEqual(out.getvalue(), "")
+                mock_update.assert_not_called()
+                mock_run.assert_not_called()
+
     def test_handle_config_list_hides_the_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = os.path.join(tmp_dir, "config.toml")
