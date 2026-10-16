@@ -4020,6 +4020,7 @@ def handle_remove(args: argparse.Namespace, config: Mapping[str, object]) -> Non
         print("Removal cancelled.")
         return
 
+    failures = 0
     for ext_id in targets:
         print(f"Removing {Colors.CYAN}{ext_id}{Colors.ENDC}...")
         try:
@@ -4030,9 +4031,18 @@ def handle_remove(args: argparse.Namespace, config: Mapping[str, object]) -> Non
                 f"  {Colors.RED}✗ Removal failed: {e.stderr.strip() or e}{Colors.ENDC}",
                 file=sys.stderr,
             )
+            failures += 1
         # run_code_cmd raises OSError when the binary is missing or unexecutable.
         except OSError as e:
             print(f"  {Colors.RED}✗ Removal failed: {e}{Colors.ENDC}", file=sys.stderr)
+            failures += 1
+
+    if failures:
+        print(
+            f"{Colors.RED}✗ {failures} of the selected extension(s) failed to be removed.{Colors.ENDC}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def print_outdated(

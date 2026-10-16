@@ -2875,6 +2875,36 @@ class TestHandleRemoveIntegration(unittest.TestCase):
     @patch.object(
         ce,
         "get_installed_extensions",
+        return_value={"ms-python.python": "2024.2.0", "redhat.java": "1.0.0"},
+    )
+    def test_handle_remove_exits_non_zero_when_a_removal_fails(
+        self, mock_installed: MagicMock, mock_run: MagicMock
+    ) -> None:
+        mock_run.side_effect = [
+            subprocess.CalledProcessError(1, "code", stderr="locked"),
+            None,
+        ]
+        args = argparse.Namespace(
+            code_binary="code",
+            yes=True,
+            extensions=["ms-python.python", "redhat.java"],
+        )
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+            self.assertRaises(SystemExit) as cm,
+        ):
+            ce.handle_remove(args, {})
+
+        self.assertEqual(cm.exception.code, 1)
+        # The failure does not stop the remaining removals.
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertIn("1 of the selected extension(s) failed", err.getvalue())
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
         return_value={"ms-python.python": "2024.2.0"},
     )
     def test_handle_remove_dedupes_repeated_targets(
