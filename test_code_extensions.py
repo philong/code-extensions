@@ -22,6 +22,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import zipfile
 import zlib
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar, Literal, Self
@@ -33,6 +34,28 @@ SPEC = importlib.util.spec_from_file_location("code_extensions", CODE_EXTENSIONS
 assert SPEC is not None and SPEC.loader is not None
 ce = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ce)
+
+
+_cache_home: tempfile.TemporaryDirectory[str] | None = None
+_saved_cache_home: str | None = None
+
+
+def setUpModule() -> None:
+    # Install and update now keep packages in the user's cache directory; point
+    # it somewhere disposable so a test never reuses, or prunes, a real one.
+    global _cache_home, _saved_cache_home
+    _cache_home = tempfile.TemporaryDirectory()
+    _saved_cache_home = os.environ.get("XDG_CACHE_HOME")
+    os.environ["XDG_CACHE_HOME"] = _cache_home.name
+
+
+def tearDownModule() -> None:
+    if _saved_cache_home is None:
+        os.environ.pop("XDG_CACHE_HOME", None)
+    else:
+        os.environ["XDG_CACHE_HOME"] = _saved_cache_home
+    if _cache_home is not None:
+        _cache_home.cleanup()
 
 
 # =====================================================================
@@ -286,13 +309,18 @@ class TestTOMLParserAndConfig(unittest.TestCase):
 
     def test_resolve_download_target_ignores_a_blank_directory(self) -> None:
         args = argparse.Namespace(download_dir="")
-        directory, is_temp = ce.resolve_download_target(args, {"download_dir": ""})
-        self.addCleanup(ce.discard_download_dir, directory, is_temp)
+        with patch.object(ce, "get_cache_dir", return_value=None):
+            target = ce.resolve_download_target(args, {"download_dir": ""})
+        self.addCleanup(
+            ce.discard_download_dir, target.directory, target.is_private_temp
+        )
 
         # A blank setting must not put .vsix files in the working directory,
         # where nothing would ever clean them up.
-        self.assertTrue(is_temp)
-        self.assertNotEqual(os.path.realpath(directory), os.path.realpath(os.getcwd()))
+        self.assertTrue(target.is_private_temp)
+        self.assertNotEqual(
+            os.path.realpath(target.directory), os.path.realpath(os.getcwd())
+        )
 
     def test_load_and_save_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1683,7 +1711,23 @@ class TestDownloadVsix(unittest.TestCase):
                 ),
                 "https://open-vsx.org/api/pub/ext/file.vsix",
             )
-        self.assertFalse(os.path.exists(self.filepath))
+        # Neither the package nor its partial download is left behind.
+        self.assertEqual(os.listdir(os.path.dirname(self.filepath)), [])
+
+    def test_download_appears_under_its_name_only_once_complete(self) -> None:
+        response = FakeDownloadResponse(b"PK\x03\x04payload")
+        seen_during_download = []
+
+        def read(size: int) -> bytes:
+            seen_during_download.append(os.path.exists(self.filepath))
+            return FakeDownloadResponse.read(response, size)
+
+        with patch.object(response, "read", side_effect=read):
+            self.download(response, "https://open-vsx.org/api/pub/ext/file.vsix")
+        # The cache reuses whatever is at the final name, so a killed run must
+        # not leave a truncated file there.
+        self.assertEqual(set(seen_during_download), {False})
+        self.assertEqual(os.listdir(os.path.dirname(self.filepath)), ["ext.vsix"])
 
     def test_download_decompresses_a_gzip_encoded_package(self) -> None:
         compressor = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
@@ -1706,6 +1750,132 @@ class TestDownloadVsix(unittest.TestCase):
         self.assertNotIn("200%", text)
         bar = text.split("[", 1)[1].split("]", 1)[0]
         self.assertEqual(len(bar), 30)
+
+
+class TestVsixCache(unittest.TestCase):
+    """Downloaded packages are kept per gallery and pruned by last use."""
+
+    root: str = ""
+
+    def setUp(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.root = tmpdir.name
+        patcher = patch.object(ce, "get_cache_dir", return_value=self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def touch(path: str, age_seconds: float = 0) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"payload")
+        if age_seconds:
+            when = time.time() - age_seconds
+            os.utime(path, (when, when))
+
+    def test_cache_is_split_per_gallery(self) -> None:
+        marketplace = ce.resolve_download_target(None, {}, ce.DEFAULT_SERVICE_URL)
+        open_vsx = ce.resolve_download_target(None, {}, ce.OPEN_VSX_SERVICE_URL)
+
+        self.assertTrue(marketplace.is_cache)
+        self.assertFalse(marketplace.is_private_temp)
+        self.assertTrue(os.path.isdir(marketplace.directory))
+        self.assertEqual(
+            os.path.dirname(marketplace.directory), os.path.join(self.root, "vsix")
+        )
+        self.assertNotEqual(marketplace.directory, open_vsx.directory)
+        self.assertEqual(
+            marketplace, ce.resolve_download_target(None, {}, ce.DEFAULT_SERVICE_URL)
+        )
+
+    def test_cache_folder_names_the_gallery_host(self) -> None:
+        self.assertEqual(
+            ce.vsix_cache_dir_name(ce.DEFAULT_SERVICE_URL),
+            "marketplace.visualstudio.com-8e527b29",
+        )
+        self.assertEqual(
+            ce.vsix_cache_dir_name(ce.OPEN_VSX_SERVICE_URL), "open-vsx.org-5fdd8bc8"
+        )
+        # Two galleries on one host still get folders of their own.
+        self.assertNotEqual(
+            ce.vsix_cache_dir_name("https://host.example/a/gallery"),
+            ce.vsix_cache_dir_name("https://host.example/b/gallery"),
+        )
+        self.assertTrue(ce.vsix_cache_dir_name("not a url").startswith("gallery-"))
+
+    def test_an_explicit_download_dir_bypasses_the_cache(self) -> None:
+        target = ce.resolve_download_target(
+            argparse.Namespace(download_dir="/srv/vsix"), {}, ce.DEFAULT_SERVICE_URL
+        )
+        self.assertEqual(target, ce.DownloadTarget("/srv/vsix", False, False))
+
+    def test_a_zero_max_age_disables_the_cache_and_empties_it(self) -> None:
+        cached = os.path.join(self.root, "vsix", "abc", "pub.ext-1.0.0.vsix")
+        self.touch(cached)
+
+        target = ce.resolve_download_target(
+            None, {"vsix_cache_max_age": "0"}, ce.DEFAULT_SERVICE_URL
+        )
+        self.addCleanup(
+            ce.discard_download_dir, target.directory, target.is_private_temp
+        )
+
+        self.assertFalse(target.is_cache)
+        self.assertTrue(target.is_private_temp)
+        self.assertFalse(os.path.exists(cached))
+
+    def test_an_invalid_max_age_falls_back_to_the_default(self) -> None:
+        self.assertEqual(
+            ce.resolve_vsix_cache_max_age({"vsix_cache_max_age": "soon"}),
+            ce.parse_age_threshold(ce.DEFAULT_VSIX_CACHE_MAX_AGE),
+        )
+
+    def test_prune_removes_only_packages_unused_for_the_max_age(self) -> None:
+        service_dir = os.path.join(self.root, "vsix", "abc")
+        old = os.path.join(service_dir, "pub.old-1.0.0.vsix")
+        fresh = os.path.join(service_dir, "pub.fresh-1.0.0.vsix")
+        stale_part = os.path.join(service_dir, "pub.x-1.0.0.vsix.1.part")
+        live_part = os.path.join(service_dir, "pub.y-1.0.0.vsix.2.part")
+        other = os.path.join(service_dir, "notes.txt")
+        self.touch(old, age_seconds=8 * 86400)
+        self.touch(fresh, age_seconds=86400)
+        self.touch(stale_part, age_seconds=7200)
+        # A young .part is a concurrent run still downloading it.
+        self.touch(live_part)
+        self.touch(other, age_seconds=30 * 86400)
+
+        removed, freed = ce.prune_vsix_cache(
+            os.path.join(self.root, "vsix"), datetime.timedelta(days=7)
+        )
+
+        self.assertEqual((removed, freed), (2, 2 * len(b"payload")))
+        self.assertEqual(
+            sorted(os.listdir(service_dir)),
+            sorted(os.path.basename(p) for p in (fresh, live_part, other)),
+        )
+
+    def test_prune_tolerates_a_missing_cache(self) -> None:
+        self.assertEqual(
+            ce.prune_vsix_cache(os.path.join(self.root, "nope"), datetime.timedelta(0)),
+            (0, 0),
+        )
+
+    def test_clean_empties_the_package_cache(self) -> None:
+        cached = os.path.join(self.root, "vsix", "abc", "pub.ext-1.0.0.vsix")
+        live_part = os.path.join(self.root, "vsix", "abc", "pub.ext-2.0.0.vsix.9.part")
+        self.touch(cached)
+        self.touch(live_part)
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(ce.tempfile, "gettempdir", return_value=temp_dir),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            ce.handle_clean(argparse.Namespace(), {})
+
+        self.assertFalse(os.path.exists(cached))
+        self.assertTrue(os.path.exists(live_part))
+        self.assertIn("Cleaned 1 file(s)", out.getvalue())
 
 
 class TestDownloadAndInstallPipeline(unittest.TestCase):
@@ -1874,6 +2044,80 @@ class TestDownloadAndInstallPipeline(unittest.TestCase):
         self.assertEqual(failures, [])
         mock_download.assert_called_once()
         mock_run.assert_called_once()
+
+    def test_a_cached_package_is_installed_without_downloading(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cached = os.path.join(tmp_dir, "a.vsix")
+            with zipfile.ZipFile(cached, "w") as zf:
+                zf.writestr("extension/package.json", "{}")
+            old = time.time() - 86400
+            os.utime(cached, (old, old))
+            damaged = os.path.join(tmp_dir, "b.vsix")
+            with open(damaged, "wb") as f:
+                f.write(b"PK\x03\x04trunc")
+            jobs = [
+                job._replace(filepath=path)
+                for job, path in zip(
+                    self.jobs("a", "b"), (cached, damaged), strict=True
+                )
+            ]
+            with (
+                patch.object(ce, "download_vsix") as mock_download,
+                patch.object(ce, "run_code_cmd") as mock_run,
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
+                failures = ce.download_and_install("code", jobs, reuse_existing=True)
+
+            self.assertEqual(failures, [])
+            # Only the file that is not a valid package is fetched again.
+            mock_download.assert_called_once()
+            self.assertEqual(mock_download.call_args.args[1], damaged)
+            self.assertEqual(mock_run.call_count, 2)
+            self.assertIn(
+                "Using cached pub.a v1.0.0", ce.ANSI_ESCAPE.sub("", out.getvalue())
+            )
+            # Reuse counts as use, so the cache keeps the package longer.
+            self.assertGreater(os.path.getmtime(cached), old + 3600)
+            # The cache keeps what it installed.
+            self.assertTrue(os.path.exists(cached))
+
+    def test_a_cached_package_that_fails_to_install_leaves_the_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cached = os.path.join(tmp_dir, "a.vsix")
+            with zipfile.ZipFile(cached, "w") as zf:
+                zf.writestr("extension/package.json", "{}")
+            jobs = [self.jobs("a")[0]._replace(filepath=cached)]
+            with (
+                patch.object(ce, "download_vsix") as mock_download,
+                patch.object(
+                    ce,
+                    "run_code_cmd",
+                    side_effect=subprocess.CalledProcessError(1, "code", stderr="bad"),
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                failures = ce.download_and_install("code", jobs, reuse_existing=True)
+
+            self.assertEqual(failures, ["pub.a"])
+            mock_download.assert_not_called()
+            # Reuse refreshes its age, so a package left behind would be
+            # reused, and fail, on every later run.
+            self.assertFalse(os.path.exists(cached))
+
+    def test_existing_files_are_downloaded_again_outside_the_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            existing = os.path.join(tmp_dir, "a.vsix")
+            with zipfile.ZipFile(existing, "w") as zf:
+                zf.writestr("extension/package.json", "{}")
+            jobs = [self.jobs("a")[0]._replace(filepath=existing)]
+            with (
+                patch.object(ce, "download_vsix") as mock_download,
+                patch.object(ce, "run_code_cmd"),
+            ):
+                self.run_pipeline(jobs)
+
+            mock_download.assert_called_once()
 
     def test_download_failure_names_the_extension(self) -> None:
         err = io.StringIO()
@@ -2645,7 +2889,11 @@ class TestHandleUpdateIntegration(unittest.TestCase):
         temp_dir = tempfile.mkdtemp(prefix="code-extensions-test-")
         self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
         with (
-            patch.object(ce, "resolve_download_target", return_value=(temp_dir, True)),
+            patch.object(
+                ce,
+                "resolve_download_target",
+                return_value=ce.DownloadTarget(temp_dir, True),
+            ),
             contextlib.redirect_stdout(io.StringIO()),
             self.assertRaises(RuntimeError),
         ):

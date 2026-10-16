@@ -37,6 +37,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 import zlib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import lru_cache
@@ -1054,7 +1055,13 @@ GLOBAL_CONFIG_SCHEMA = [
         "download_dir",
         str,
         "Custom directory path for downloaded .vsix files",
-        "system temp",
+        "package cache",
+    ),
+    (
+        "vsix_cache_max_age",
+        str,
+        "How long an unused downloaded .vsix is kept for reuse (e.g. '7d', '0' to disable)",
+        "7d",
     ),
     ("open_vsx", bool, "Use Open VSX registry by default (true/false)", "false"),
     (
@@ -1133,7 +1140,7 @@ def validate_config_value(
     """
     try:
         coerced = coerce_config_value(val, expected_type)
-        if norm_key == "min_release_age":
+        if norm_key in ("min_release_age", "vsix_cache_max_age"):
             parse_age_threshold(coerced)
         return coerced
     except ValueError as e:
@@ -2670,15 +2677,95 @@ def query_marketplace_search(
     return search_results
 
 
-def resolve_download_target(
-    args: object, config: Mapping[str, object] | None
-) -> tuple[str, bool]:
-    """Return (directory, is_private_temp) for .vsix downloads.
+DEFAULT_VSIX_CACHE_MAX_AGE = "7d"
 
-    Without an explicit --download-dir the files go into a fresh 0700 directory
-    rather than straight into the shared temp directory: the filenames are
-    predictable, so a local attacker could otherwise pre-plant a symlink or swap
-    the package between download and install.
+# A .part younger than this may be a concurrent run's download still in flight.
+PARTIAL_DOWNLOAD_GRACE_SECONDS = 3600
+
+
+class DownloadTarget(NamedTuple):
+    directory: str
+    is_private_temp: bool
+    # The persistent package cache, where a package already downloaded - for
+    # another editor, or by an earlier run - is installed again without a fetch.
+    is_cache: bool = False
+
+
+def vsix_cache_root() -> str | None:
+    cache_dir = get_cache_dir()
+    return os.path.join(cache_dir, "vsix") if cache_dir else None
+
+
+def vsix_cache_dir_name(service_url: str) -> str:
+    """Name a gallery's cache folder, e.g. 'open-vsx.org-5fdd8bc8'.
+
+    The host says which gallery it is; the hash of the full URL keeps two
+    galleries on one host apart, which the sanitized host alone could not.
+    """
+    digest = hashlib.sha256(service_url.encode("utf-8")).hexdigest()[:8]
+    return f"{safe_filename_part(url_host(service_url), 'gallery')}-{digest}"
+
+
+def resolve_vsix_cache_max_age(config: Mapping[str, object]) -> datetime.timedelta:
+    age = resolve_option(None, config, "vsix_cache_max_age", DEFAULT_VSIX_CACHE_MAX_AGE)
+    # A hand-edited junk value only costs the cache its custom lifetime; it is
+    # no reason to refuse an install.
+    try:
+        return parse_age_threshold(age)
+    except ValueError:
+        return parse_age_threshold(DEFAULT_VSIX_CACHE_MAX_AGE)
+
+
+def prune_vsix_cache(root: str, max_age: datetime.timedelta) -> tuple[int, int]:
+    """Remove cached packages unused for max_age; return (files, bytes) freed.
+
+    Reusing a package refreshes its mtime, so the age counts from last use and
+    a version still being rolled out to several editors stays cached.
+    """
+    now = time.time()
+    removed = 0
+    freed = 0
+    try:
+        service_dirs = os.listdir(root)
+    except OSError:
+        return 0, 0
+    for service in service_dirs:
+        service_dir = os.path.join(root, service)
+        if os.path.islink(service_dir) or not os.path.isdir(service_dir):
+            continue
+        try:
+            names = os.listdir(service_dir)
+        except OSError:
+            continue
+        for name in names:
+            if name.endswith(".part"):
+                keep_for = float(PARTIAL_DOWNLOAD_GRACE_SECONDS)
+            elif name.endswith(".vsix"):
+                keep_for = max_age.total_seconds()
+            else:
+                continue
+            path = os.path.join(service_dir, name)
+            with contextlib.suppress(OSError):
+                st = os.lstat(path)
+                if now - st.st_mtime < keep_for:
+                    continue
+                os.remove(path)
+                removed += 1
+                freed += st.st_size
+    return removed, freed
+
+
+def resolve_download_target(
+    args: object, config: Mapping[str, object] | None, service_url: str = ""
+) -> DownloadTarget:
+    """Pick the directory .vsix downloads go to.
+
+    Without an explicit --download-dir the files go into the private package
+    cache, or failing that a fresh 0700 directory, rather than straight into the
+    shared temp directory: the filenames are predictable, so a local attacker
+    could otherwise pre-plant a symlink or swap the package between download and
+    install. The cache is split per gallery, which can serve different files
+    under the same name and version.
     """
     cfg = config or {}
     download_dir = resolve_option(
@@ -2690,13 +2777,34 @@ def resolve_download_target(
     # A blank --download-dir would silently mean the working directory, which
     # then keeps the .vsix files nobody asked it to keep.
     if download_dir is not None and str(download_dir).strip():
-        return os.path.expanduser(str(download_dir)), False
-    return tempfile.mkdtemp(prefix="code-extensions-"), True
+        return DownloadTarget(os.path.expanduser(str(download_dir)), False)
+    root = vsix_cache_root()
+    if root:
+        max_age = resolve_vsix_cache_max_age(cfg)
+        prune_vsix_cache(root, max_age)
+        if max_age:
+            service_dir = os.path.join(root, vsix_cache_dir_name(service_url))
+            with contextlib.suppress(OSError):
+                os.makedirs(service_dir, mode=0o700, exist_ok=True)
+                return DownloadTarget(service_dir, False, is_cache=True)
+    return DownloadTarget(tempfile.mkdtemp(prefix="code-extensions-"), True)
 
 
 def discard_download_dir(directory: str, is_private_temp: bool) -> None:
     if is_private_temp:
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def is_reusable_package(filepath: str) -> bool:
+    """Whether a cached file is a complete package worth installing as is.
+
+    Downloads land under their final name only once complete, so this mainly
+    guards against a file damaged on disk: anything else is fetched again.
+    """
+    try:
+        return os.path.isfile(filepath) and zipfile.is_zipfile(filepath)
+    except OSError:
+        return False
 
 
 class InstallJob(NamedTuple):
@@ -2774,6 +2882,7 @@ def download_and_install(
     token: str | None = None,
     service_url: str | None = None,
     cleanup: bool = False,
+    reuse_existing: bool = False,
 ) -> list[str]:
     """Download each job's .vsix and install it with the code CLI.
 
@@ -2783,6 +2892,9 @@ def download_and_install(
     as it lands. Returns the display ids that failed to download or install. A
     failed download skips the install (the partial file is already removed by
     download_vsix); a failed install still removes the file when cleanup is set.
+    With reuse_existing, a valid package already at a job's path is installed
+    without downloading it again, and one that fails to install is removed so
+    the next run fetches it afresh.
     """
     # Accept a raw string as well as a parsed list, like the other code-CLI
     # helpers, so callers cannot pass "code" and unpack it into characters.
@@ -2796,6 +2908,11 @@ def download_and_install(
             while (job := ready.get()) is not None:
                 if not install_vsix(parsed_code_binary, job, cleanup):
                     failures.append(job.display_id)
+                    if reuse_existing:
+                        # Reusing a cached package refreshes its age, so one
+                        # that fails to install would never leave the cache.
+                        with contextlib.suppress(OSError):
+                            os.remove(job.filepath)
         except BaseException as e:  # noqa: BLE001 - re-raised on the main thread
             worker_errors.append(e)
 
@@ -2812,6 +2929,15 @@ def download_and_install(
             if job.filepath in queued:
                 continue
             queued.add(job.filepath)
+            if reuse_existing and is_reusable_package(job.filepath):
+                # Refresh the mtime the cache ages packages by.
+                with contextlib.suppress(OSError):
+                    os.utime(job.filepath)
+                console_print(
+                    f"Using cached {Colors.CYAN}{job.display_id}{Colors.ENDC} v{Colors.GREEN}{job.version}{Colors.ENDC} ({job.platform})."
+                )
+                ready.put(job)
+                continue
             console_print(
                 f"Downloading {Colors.CYAN}{job.display_id}{Colors.ENDC} v{Colors.GREEN}{job.version}{Colors.ENDC} ({job.platform})..."
             )
@@ -2916,7 +3042,10 @@ def download_vsix(
         chunk_size = 32768
         ok = False
 
-        fd = open_for_download(filepath)
+        # The package only appears under its final name once complete, so a
+        # killed run cannot leave a truncated file for the cache to reuse.
+        part_path = f"{filepath}.{os.getpid()}.part"
+        fd = open_for_download(part_path)
         try:
             with os.fdopen(fd, "wb") as f:
 
@@ -2941,6 +3070,7 @@ def download_vsix(
 
                 if decompressor:
                     emit(decompressor.flush())
+            os.replace(part_path, filepath)
             ok = True
         finally:
             # Close the progress line either way, so what follows - the next
@@ -2949,7 +3079,7 @@ def download_vsix(
             if not ok:
                 # Never leave a truncated package behind for `--install-extension`.
                 with contextlib.suppress(OSError):
-                    os.remove(filepath)
+                    os.remove(part_path)
 
 
 def report_download_progress(
@@ -3184,7 +3314,11 @@ def handle_install(args: argparse.Namespace, config: Mapping[str, object]) -> No
     )
     installed_exts = get_installed_extensions(ctx.code_binary)
 
-    download_dir_resolved, download_dir_is_temp = resolve_download_target(args, config)
+    target = resolve_download_target(args, config, ctx.service_url)
+    download_dir_resolved, download_dir_is_temp = (
+        target.directory,
+        target.is_private_temp,
+    )
 
     jobs: list[InstallJob] = []
     try:
@@ -3381,6 +3515,7 @@ def handle_install(args: argparse.Namespace, config: Mapping[str, object]) -> No
             token=ctx.token,
             service_url=ctx.service_url,
             cleanup=download_dir_is_temp,
+            reuse_existing=target.is_cache,
         )
     finally:
         # An exit or Ctrl-C mid-batch must not leak the private temp directory;
@@ -3915,7 +4050,11 @@ def update_extensions(
         )
         return
 
-    download_dir_resolved, download_dir_is_temp = resolve_download_target(args, config)
+    target = resolve_download_target(args, config, ctx.service_url)
+    download_dir_resolved, download_dir_is_temp = (
+        target.directory,
+        target.is_private_temp,
+    )
 
     try:
         jobs: list[InstallJob] = []
@@ -3943,6 +4082,7 @@ def update_extensions(
             token=ctx.token,
             service_url=ctx.service_url,
             cleanup=download_dir_is_temp,
+            reuse_existing=target.is_cache,
         )
     finally:
         # same as install: `clean` is a backstop, not the plan.
@@ -4605,6 +4745,14 @@ def handle_clean(_args: argparse.Namespace, _config: Mapping[str, object]) -> No
                 except OSError:
                     pass
 
+    # Every cached package, whatever its age; a young .part is a concurrent
+    # run's download, which the prune spares.
+    vsix_root = vsix_cache_root()
+    if vsix_root:
+        removed, freed = prune_vsix_cache(vsix_root, datetime.timedelta(0))
+        cleaned_files += removed
+        freed_bytes += freed
+
     # Download directories left behind by an interrupted run. Anything younger
     # than an hour may belong to a concurrent invocation, so leave it alone.
     if os.path.exists(temp_dir):
@@ -4656,7 +4804,7 @@ SUBCOMMANDS = (
     CliChoice("list", ("ls",), "List installed extensions"),
     CliChoice("search", (), "Search the extension gallery"),
     CliChoice("info", ("show",), "Show detailed metadata for an extension"),
-    CliChoice("clean", (), "Purge the API cache and temporary files"),
+    CliChoice("clean", (), "Purge the API and package caches and temporary files"),
     CliChoice("config", (), "View or modify configuration settings"),
     CliChoice("completion", (), "Generate a shell completion script"),
 )
@@ -5387,7 +5535,7 @@ def main() -> None:
     subparsers.add_parser(
         "clean",
         parents=[sub_parent],
-        help="Purge cached API response JSON files and temporary VSIX downloads",
+        help="Purge cached API responses, cached .vsix packages and temporary downloads",
     )
 
     # Config sub-parser

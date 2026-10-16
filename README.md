@@ -12,6 +12,7 @@ A Python script to install, update, list, search, and remove VS Code extensions 
 - **VS Code Version Compatibility Checks**: Verifies host VS Code version engine requirements so you never install incompatible extensions.
 - **Alternative VS Code Extension Registries & Open VSX**: Query extensions from Open VSX or custom self-hosted VS Code Extension Galleries.
 - **Alternative VS Code Forks Supported**: Works with alternative builds or forks (e.g. VSCodium, VS Code Insiders) via `--code-binary`.
+- **Package Cache**: Downloaded `.vsix` files are kept in `~/.cache/code-extensions/vsix/` (or under `$XDG_CACHE_HOME`), one folder per gallery (e.g. `marketplace.visualstudio.com-8e527b29`), so updating a second editor to the same versions installs them without downloading again. A package unused for `vsix-cache-max-age` (default `7d`) is removed by the next `install`, or `update` that has updates to apply; set it to `0` to disable the cache, or run `clean` to empty it. An explicit `--download-dir` bypasses the cache.
 
 ---
 
@@ -51,7 +52,7 @@ code-extensions <command> [options]
 * `list` (or `ls`): List installed extensions with optional filtering and update checks.
 * `search`: Search the VS Code Marketplace / Open VSX for extensions.
 * `info` (or `show`): Display detailed metadata and local installation status for an extension.
-* `clean`: Purge cached API response JSON files and temporary VSIX downloads.
+* `clean`: Purge cached API response JSON files, cached `.vsix` packages and temporary downloads.
 * `config`: View or modify global settings and extension-specific rules in `config.toml`.
 * `completion`: Generate a shell completion script for bash, fish, powershell or zsh.
 * `remove` (or `uninstall`, `rm`): Remove installed extension(s) by ID or interactively select extensions to remove.
@@ -147,7 +148,7 @@ code-extensions info <extension-id>
 code-extensions clean
 ```
 
-* Purges cached API response JSON files (`~/.cache/code-extensions/`) and removes temporary downloaded `.vsix` files.
+* Purges cached API response JSON files and cached `.vsix` packages (`~/.cache/code-extensions/`), and removes temporary downloaded `.vsix` files.
 
 ### 7. `config` Command
 
@@ -217,6 +218,7 @@ include-prerelease = false
 no-code-version-check = false
 code-binary = "code"           # Path to executable or fork (e.g., "codium")
 download-dir = "~/Downloads"
+vsix-cache-max-age = "7d"      # Keep downloaded .vsix files this long after last use (0 disables)
 yes = false
 open-vsx = false
 
