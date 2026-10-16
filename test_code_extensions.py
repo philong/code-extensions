@@ -2208,6 +2208,55 @@ class TestHandleInstallIntegration(unittest.TestCase):
 
     @patch.object(ce, "run_code_cmd")
     @patch.object(ce, "download_vsix")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.2.0"},
+    )
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_install_skips_pinned_version_already_installed(
+        self,
+        mock_query: MagicMock,
+        mock_vsver: MagicMock,
+        mock_installed: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        mock_query.return_value = {
+            "ms-python.python": make_mock_gallery_extension(
+                "ms-python", "python", "2024.2.0"
+            )
+        }
+        for force in (False, True):
+            mock_download.reset_mock()
+            args = argparse.Namespace(
+                code_binary="code",
+                service_url=None,
+                open_vsx=False,
+                open_vsx_token=None,
+                extensions=["ms-python.python@2024.2.0"],
+                file=None,
+                include_prerelease=False,
+                no_code_version_check=False,
+                yes=True,
+                min_release_age="0",
+                download_dir=None,
+                force=force,
+            )
+            with (
+                self.subTest(force=force),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
+                ce.handle_install(args, self.config)
+                if force:
+                    mock_download.assert_called_once()
+                else:
+                    mock_download.assert_not_called()
+                    self.assertIn("(requested version). Skipping.", out.getvalue())
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
     @patch.object(ce, "get_installed_extensions", return_value={})
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_extensions")

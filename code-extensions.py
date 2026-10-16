@@ -3316,15 +3316,19 @@ def handle_install(args: argparse.Namespace, config: Mapping[str, object]) -> No
             installed_ver = installed_exts.get(full_id)
             force = getattr(args, "force", False)
 
-            if installed_ver and not force and not req_ver:
+            if installed_ver and not force:
                 parsed_installed = parse_version(installed_ver)
                 parsed_target = parse_version(target_version)
+                # A pinned version that is already there needs no download
+                # either; --force still re-installs it.
                 if parsed_installed == parsed_target:
+                    reason = "requested" if req_ver else "latest eligible"
                     print(
-                        f"  {Colors.GREEN}✓ Extension '{full_id}' is already installed at version v{installed_ver} (latest eligible version). Skipping.{Colors.ENDC}"
+                        f"  {Colors.GREEN}✓ Extension '{full_id}' is already installed at version v{installed_ver} ({reason} version). Skipping.{Colors.ENDC}"
                     )
                     continue
-                elif parsed_installed > parsed_target:
+                # An older pinned version is a deliberate downgrade.
+                elif not req_ver and parsed_installed > parsed_target:
                     print(
                         f"  {Colors.GREEN}✓ Extension '{full_id}' is already installed at newer version v{installed_ver} (eligible version is v{target_version}). Skipping.{Colors.ENDC}"
                     )
