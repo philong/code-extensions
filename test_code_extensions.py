@@ -788,6 +788,92 @@ class TestGalleryPayloadHardening(unittest.TestCase):
         self.assertEqual(list(result), ["ms-python.python"])
 
     @patch.object(ce, "cleanup_stale_cache")
+    @patch.object(ce, "_post_extension_query", return_value=None)
+    def test_query_marketplace_extensions_raises_when_gallery_unreachable(
+        self, mock_post: MagicMock, mock_cleanup: MagicMock
+    ) -> None:
+        # An empty map would read as "nothing installed exists on the gallery",
+        # which update reports as "All extensions are up to date!".
+        with self.assertRaises(ce.GalleryQueryError):
+            ce.query_marketplace_extensions(["ms-python.python"])
+
+    @patch.object(ce, "cleanup_stale_cache")
+    @patch.object(ce, "_post_extension_query")
+    def test_query_marketplace_extensions_raises_when_one_batch_fails(
+        self, mock_post: MagicMock, mock_cleanup: MagicMock
+    ) -> None:
+        good = make_mock_gallery_extension("ms-python", "python")
+        mock_post.side_effect = [{"results": [{"extensions": [good]}]}, None]
+        ids = ["ms-python.python"] + [f"pub.ext{i}" for i in range(60)]
+        with self.assertRaises(ce.GalleryQueryError):
+            ce.query_marketplace_extensions(ids)
+        self.assertEqual(mock_post.call_count, 2)
+
+    @patch.object(ce, "cleanup_stale_cache")
+    @patch.object(ce, "_post_extension_query")
+    def test_query_marketplace_extensions_reports_failed_batches(
+        self, mock_post: MagicMock, mock_cleanup: MagicMock
+    ) -> None:
+        good = make_mock_gallery_extension("ms-python", "python")
+        mock_post.side_effect = [None, {"results": [{"extensions": [good]}]}]
+        ids = [f"pub.ext{i}" for i in range(50)] + ["ms-python.python"]
+        failed: list[str] = []
+        result = ce.query_marketplace_extensions(ids, failed_ids=failed)
+        self.assertEqual(list(result), ["ms-python.python"])
+        self.assertEqual(failed, ids[:50])
+
+    @patch.object(ce, "cleanup_stale_cache")
+    @patch.object(ce, "_post_extension_query")
+    def test_check_updates_checks_the_batches_that_answered(
+        self, mock_post: MagicMock, mock_cleanup: MagicMock
+    ) -> None:
+        good = make_mock_gallery_extension("ms-python", "python", "2024.2.0")
+        installed = {f"pub.ext{i}": "1.0.0" for i in range(50)}
+        installed["ms-python.python"] = "2024.1.0"
+
+        def check(unchecked: list[str]) -> Any:
+            return ce.check_updates(
+                installed,
+                "universal",
+                vscode_version="1.85.0",
+                min_release_age=datetime.timedelta(0),
+                unchecked=unchecked,
+            )
+
+        mock_post.side_effect = [None, {"results": [{"extensions": [good]}]}]
+        unchecked: list[str] = []
+        updates = check(unchecked)
+        self.assertEqual([u["id"] for u in updates], ["ms-python.python"])
+        self.assertEqual(len(unchecked), 50)
+
+        # Nothing checked at all is a failed query, not a partial answer.
+        mock_post.side_effect = [None, None]
+        with self.assertRaises(ce.GalleryQueryError):
+            check([])
+
+    @patch.object(ce, "cleanup_stale_cache")
+    @patch.object(ce, "_post_extension_query", return_value=None)
+    def test_search_raises_when_gallery_unreachable(
+        self, mock_post: MagicMock, mock_cleanup: MagicMock
+    ) -> None:
+        with self.assertRaises(ce.GalleryQueryError):
+            ce.query_marketplace_search(
+                "python", target_platform="universal", vscode_version="1.85.0"
+            )
+
+    @patch.object(ce, "cleanup_stale_cache")
+    @patch.object(ce, "_post_extension_query")
+    def test_search_falls_back_to_its_payload_when_details_fail(
+        self, mock_post: MagicMock, mock_cleanup: MagicMock
+    ) -> None:
+        good = make_mock_gallery_extension("ms-python", "python", "2024.2.0")
+        mock_post.side_effect = [{"results": [{"extensions": [good]}]}, None]
+        results = ce.query_marketplace_search(
+            "python", target_platform="universal", vscode_version="1.85.0"
+        )
+        self.assertEqual(results[0]["latest"], "2024.2.0")
+
+    @patch.object(ce, "cleanup_stale_cache")
     @patch.object(ce, "query_marketplace_extensions")
     @patch.object(ce, "_post_extension_query")
     def test_search_skips_unusable_entries(
@@ -2059,6 +2145,54 @@ class TestHandleInstallIntegration(unittest.TestCase):
     @patch.object(ce, "get_installed_extensions", return_value={})
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_install_installs_what_the_gallery_returned(
+        self,
+        mock_query: MagicMock,
+        mock_vsver: MagicMock,
+        mock_installed: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        def query(*args: Any, failed_ids: list[str], **kwargs: Any) -> Any:
+            failed_ids.append("redhat.java")
+            return {
+                "ms-python.python": make_mock_gallery_extension(
+                    "ms-python", "python", "2024.2.0"
+                )
+            }
+
+        mock_query.side_effect = query
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=["ms-python.python", "redhat.java"],
+            file=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            yes=True,
+            min_release_age="0",
+            download_dir=None,
+        )
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+            self.assertRaises(SystemExit) as cm,
+        ):
+            ce.handle_install(args, self.config)
+
+        self.assertEqual(cm.exception.code, 1)
+        mock_download.assert_called_once()
+        self.assertIn(
+            "Could not query extension gallery for 'redhat.java'", err.getvalue()
+        )
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_extensions")
     def test_handle_install_held_back_by_release_age_installs_older(
         self,
         mock_query: MagicMock,
@@ -2443,6 +2577,40 @@ class TestHandleUpdateIntegration(unittest.TestCase):
         mock_download.assert_called_once()
         mock_run.assert_called_once()
         self.assertIn("--install-extension", mock_run.call_args[0][0])
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.1.0", "redhat.java": "1.0.0"},
+    )
+    @patch.object(ce, "check_updates")
+    def test_handle_update_installs_what_it_could_check_then_exits_nonzero(
+        self,
+        mock_check: MagicMock,
+        mock_installed: MagicMock,
+        mock_vsver: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        def check(*args: Any, unchecked: list[str], **kwargs: Any) -> Any:
+            unchecked.append("redhat.java")
+            return [make_mock_update(installed="2024.1.0")]
+
+        mock_check.side_effect = check
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+            self.assertRaises(SystemExit) as cm,
+        ):
+            ce.handle_update(self.update_args(), self.config)
+
+        self.assertEqual(cm.exception.code, 1)
+        mock_run.assert_called_once()
+        self.assertIn("Could not check 1 extension(s)", err.getvalue())
+        self.assertIn("redhat.java", err.getvalue())
 
     @patch.object(ce, "run_code_cmd")
     @patch.object(ce, "download_vsix", side_effect=OSError("connection reset"))
@@ -2834,6 +3002,44 @@ class TestHandleListIntegration(unittest.TestCase):
         output = out.getvalue()
         self.assertIn("ms-python.python", output)
         self.assertNotIn("charliermarsh.ruff", output)
+
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "check_updates")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.1.0", "redhat.java": "1.0.0"},
+    )
+    def test_handle_list_outdated_reports_unchecked_extensions(
+        self, mock_installed: MagicMock, mock_updates: MagicMock, mock_vsver: MagicMock
+    ) -> None:
+        def check(*args: Any, unchecked: list[str], **kwargs: Any) -> Any:
+            unchecked.append("redhat.java")
+            return [{"id": "ms-python.python", "latest": "2024.2.0"}]
+
+        mock_updates.side_effect = check
+        args = argparse.Namespace(
+            code_binary="code",
+            query=None,
+            quiet=True,
+            outdated=True,
+            include_prerelease=False,
+            no_code_version_check=False,
+            min_release_age="24h",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+        )
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as out,
+            contextlib.redirect_stderr(io.StringIO()) as err,
+            self.assertRaises(SystemExit) as cm,
+        ):
+            ce.handle_list(args, {})
+
+        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(out.getvalue(), "ms-python.python\n")
+        self.assertIn("redhat.java", err.getvalue())
 
 
 # =====================================================================
@@ -3694,6 +3900,21 @@ class TestCliSurfaceTables(unittest.TestCase):
         ):
             ce.main()
         self.assertEqual(mock_get.call_args, call(["vscodium"]))
+
+    def test_gallery_failure_exits_non_zero(self) -> None:
+        def unreachable(args: argparse.Namespace, config: dict[str, object]) -> None:
+            raise ce.GalleryQueryError("Could not query extension gallery.")
+
+        with (
+            patch.object(ce.Colors, "_enabled", ce.Colors._enabled),
+            patch.dict(ce.HANDLERS, {"update": unreachable}),
+            patch.object(sys, "argv", ["code-extensions", "update"]),
+            contextlib.redirect_stderr(io.StringIO()) as err,
+            self.assertRaises(SystemExit) as cm,
+        ):
+            ce.main()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("Could not query extension gallery.", err.getvalue())
 
 
 class TestDocumentedCliSurface(unittest.TestCase):

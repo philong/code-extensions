@@ -2267,6 +2267,14 @@ class ExecutionContext:
 MAX_RETRY_AFTER_SECONDS = 60.0
 
 
+class GalleryQueryError(Exception):
+    """The extension gallery could not be queried, so no answer is known.
+
+    Raised instead of returning an empty result: callers would otherwise report
+    a dead network as "up to date" or "not found" and exit 0.
+    """
+
+
 def _post_extension_query(
     payload: Mapping[str, object], service_url: str, token: str | None = None
 ) -> dict[str, object] | None:
@@ -2416,13 +2424,21 @@ def query_marketplace_extensions(
     ext_ids: Sequence[str],
     service_url: str = DEFAULT_SERVICE_URL,
     token: str | None = None,
+    failed_ids: list[str] | None = None,
 ) -> dict[str, ExtensionMetadata]:
+    """Fetch gallery metadata for ext_ids, keyed by lowercase full ID.
+
+    Without failed_ids, any batch that cannot be fetched raises
+    GalleryQueryError. With it, the IDs of failed batches are appended there
+    and the rest are still returned.
+    """
     cleanup_stale_cache()
     if not ext_ids:
         return {}
 
     batch_size = 50
     extension_map: dict[str, ExtensionMetadata] = {}
+    batch_failed: list[str] = []
 
     for i in range(0, len(ext_ids), batch_size):
         batch = ext_ids[i : i + batch_size]
@@ -2445,7 +2461,14 @@ def query_marketplace_extensions(
         }
 
         resp_data = _post_extension_query(payload, service_url, token=token)
-        if not resp_data:
+        if resp_data is None:
+            # A silently skipped batch would read as "these extensions do not
+            # exist", so either the caller learns which IDs failed or it raises.
+            if failed_ids is None:
+                raise GalleryQueryError(
+                    f"Could not query extension gallery at {service_url}."
+                )
+            batch_failed.extend(batch)
             continue
 
         results = resp_data.get("results", [])
@@ -2463,7 +2486,16 @@ def query_marketplace_extensions(
                 continue
             extension_map[ident.full_id] = ext
 
+    if failed_ids is not None:
+        failed_ids.extend(batch_failed)
     return extension_map
+
+
+def report_unchecked(ext_ids: Sequence[str]) -> None:
+    print(
+        f"{Colors.RED}✗ Could not check {len(ext_ids)} extension(s) on the extension gallery: {', '.join(ext_ids)}{Colors.ENDC}",
+        file=sys.stderr,
+    )
 
 
 def query_marketplace_search(
@@ -2504,8 +2536,8 @@ def query_marketplace_search(
     }
 
     resp_data = _post_extension_query(payload, service_url, token=token)
-    if not resp_data:
-        return []
+    if resp_data is None:
+        raise GalleryQueryError(f"Could not query extension gallery at {service_url}.")
 
     results = resp_data.get("results", [])
     if not results or not isinstance(results, list) or not isinstance(results[0], dict):
@@ -2521,8 +2553,10 @@ def query_marketplace_search(
     # detail path is cached, batched, and identical to what install/update
     # consume, so eligibility filtering sees exactly the data those commands
     # see rather than whatever the search endpoint chose to include.
+    # A failed detail batch falls back to the search payload below, so the
+    # failed IDs are collected only to keep the query from raising.
     ext_details_map = query_marketplace_extensions(
-        ext_ids, service_url=service_url, token=token
+        ext_ids, service_url=service_url, token=token, failed_ids=[]
     )
 
     search_results: list[SearchResultItem] = []
@@ -3113,8 +3147,9 @@ def handle_install(args: argparse.Namespace, config: Mapping[str, object]) -> No
 
     ext_ids = [t[0] for t in parsed_targets]
     print(f"{Colors.BLUE}Querying extension gallery for installation...{Colors.ENDC}")
+    unchecked: list[str] = []
     marketplace_data = query_marketplace_extensions(
-        ext_ids, service_url=ctx.service_url, token=ctx.token
+        ext_ids, service_url=ctx.service_url, token=ctx.token, failed_ids=unchecked
     )
     installed_exts = get_installed_extensions(ctx.code_binary)
 
@@ -3123,6 +3158,13 @@ def handle_install(args: argparse.Namespace, config: Mapping[str, object]) -> No
     jobs: list[InstallJob] = []
     try:
         for ext_id, req_ver in parsed_targets:
+            if ext_id in unchecked:
+                print(
+                    f"{Colors.RED}✗ Could not query extension gallery for '{ext_id}'.{Colors.ENDC}",
+                    file=sys.stderr,
+                )
+                failures.append(ext_id)
+                continue
             ext_obj = marketplace_data.get(ext_id)
             if not ext_obj:
                 print(
@@ -3322,7 +3364,14 @@ def check_updates(
     cli_min_release_age_override: bool = False,
     service_url: str = DEFAULT_SERVICE_URL,
     token: str | None = None,
+    unchecked: list[str] | None = None,
 ) -> list[UpdateInfo]:
+    """List available updates.
+
+    With unchecked, extensions whose gallery batch failed are appended there
+    and the others are still checked; if none could be checked it raises
+    GalleryQueryError, like a call without it does for any failure.
+    """
     ext_ids = list(installed_exts.keys())
     if extensions_config:
         ext_ids = [
@@ -3334,9 +3383,18 @@ def check_updates(
             )
         ]
 
+    failed: list[str] = []
     marketplace_data = query_marketplace_extensions(
-        ext_ids, service_url=service_url, token=token
+        ext_ids,
+        service_url=service_url,
+        token=token,
+        failed_ids=failed if unchecked is not None else None,
     )
+    # With nothing checked there is no partial answer to report.
+    if failed and len(failed) == len(ext_ids):
+        raise GalleryQueryError(f"Could not query extension gallery at {service_url}.")
+    if unchecked is not None:
+        unchecked.extend(failed)
     updates: list[UpdateInfo] = []
 
     for full_id, ext in marketplace_data.items():
@@ -3707,6 +3765,17 @@ def resolve_installed_targets(
 
 
 def handle_update(args: argparse.Namespace, config: Mapping[str, object]) -> None:
+    unchecked: list[str] = []
+    update_extensions(args, config, unchecked)
+    # The extensions that could be checked were updated; the rest still make
+    # the run a failure.
+    if unchecked:
+        sys.exit(1)
+
+
+def update_extensions(
+    args: argparse.Namespace, config: Mapping[str, object], unchecked: list[str]
+) -> None:
     ctx = ExecutionContext(args, config)
     dry_run = bool(getattr(args, "dry_run", None))
 
@@ -3741,11 +3810,17 @@ def handle_update(args: argparse.Namespace, config: Mapping[str, object]) -> Non
         cli_min_release_age_override=cli_min_release_age_override,
         service_url=ctx.service_url,
         token=ctx.token,
+        unchecked=unchecked,
     )
 
     print()
+    if unchecked:
+        report_unchecked(unchecked)
     if not updates:
-        print(f"{Colors.GREEN}All extensions are up to date!{Colors.ENDC}")
+        if unchecked:
+            print("No updates for the extensions that could be checked.")
+        else:
+            print(f"{Colors.GREEN}All extensions are up to date!{Colors.ENDC}")
         return
 
     if ctx.yes:
@@ -3960,6 +4035,54 @@ def handle_remove(args: argparse.Namespace, config: Mapping[str, object]) -> Non
             print(f"  {Colors.RED}✗ Removal failed: {e}{Colors.ENDC}", file=sys.stderr)
 
 
+def print_outdated(
+    ctx: ExecutionContext,
+    args: argparse.Namespace,
+    ext_items: Sequence[tuple[str, str]],
+    unchecked: list[str],
+) -> None:
+    updates = check_updates(
+        dict(ext_items),
+        ctx.target_platform,
+        vscode_version=ctx.vscode_version,
+        include_prerelease=ctx.include_prerelease,
+        min_release_age=ctx.min_release_age,
+        extensions_config=ctx.extensions_config,
+        cli_include_prerelease_override=bool(getattr(args, "include_prerelease", None)),
+        cli_min_release_age_override=getattr(args, "min_release_age", None) is not None,
+        service_url=ctx.service_url,
+        token=ctx.token,
+        unchecked=unchecked,
+    )
+    if unchecked:
+        report_unchecked(unchecked)
+    update_ids = {u["id"]: u for u in updates}
+    ext_items = [item for item in ext_items if item[0] in update_ids]
+
+    if args.quiet:
+        for ext_id, _ in ext_items:
+            print(ext_id)
+        return
+
+    if not ext_items:
+        if unchecked:
+            print("No updates for the extensions that could be checked.")
+        else:
+            print(f"{Colors.GREEN}All extensions are up to date!{Colors.ENDC}")
+        return
+
+    print(
+        f"{Colors.BOLD}{fit_column('Extension ID', 45)} {fit_column('Installed', 15)} {fit_column('Latest', 15)}{Colors.ENDC}"
+    )
+    print("-" * 77)
+    for ext_id, installed_ver in ext_items:
+        up_info = update_ids[ext_id]
+        latest_str = up_info["latest"]
+        print(
+            f"{Colors.CYAN}{fit_column(ext_id, 45)}{Colors.ENDC} {Colors.YELLOW}{fit_column(installed_ver, 15)}{Colors.ENDC} {Colors.GREEN}{fit_column(latest_str, 15)}{Colors.ENDC}"
+        )
+
+
 def handle_list(args: argparse.Namespace, config: Mapping[str, object]) -> None:
     ctx = ExecutionContext(args, config)
     installed_exts = get_installed_extensions(ctx.code_binary)
@@ -3975,44 +4098,10 @@ def handle_list(args: argparse.Namespace, config: Mapping[str, object]) -> None:
         ext_items = [item for item in ext_items if q in item[0]]
 
     if args.outdated:
-        filtered_dict = dict(ext_items)
-        updates = check_updates(
-            filtered_dict,
-            ctx.target_platform,
-            vscode_version=ctx.vscode_version,
-            include_prerelease=ctx.include_prerelease,
-            min_release_age=ctx.min_release_age,
-            extensions_config=ctx.extensions_config,
-            cli_include_prerelease_override=bool(
-                getattr(args, "include_prerelease", None)
-            ),
-            cli_min_release_age_override=getattr(args, "min_release_age", None)
-            is not None,
-            service_url=ctx.service_url,
-            token=ctx.token,
-        )
-        update_ids = {u["id"]: u for u in updates}
-        ext_items = [item for item in ext_items if item[0] in update_ids]
-
-        if args.quiet:
-            for ext_id, _ in ext_items:
-                print(ext_id)
-            return
-
-        if not ext_items:
-            print(f"{Colors.GREEN}All extensions are up to date!{Colors.ENDC}")
-            return
-
-        print(
-            f"{Colors.BOLD}{fit_column('Extension ID', 45)} {fit_column('Installed', 15)} {fit_column('Latest', 15)}{Colors.ENDC}"
-        )
-        print("-" * 77)
-        for ext_id, installed_ver in ext_items:
-            up_info = update_ids[ext_id]
-            latest_str = up_info["latest"]
-            print(
-                f"{Colors.CYAN}{fit_column(ext_id, 45)}{Colors.ENDC} {Colors.YELLOW}{fit_column(installed_ver, 15)}{Colors.ENDC} {Colors.GREEN}{fit_column(latest_str, 15)}{Colors.ENDC}"
-            )
+        unchecked: list[str] = []
+        print_outdated(ctx, args, ext_items, unchecked)
+        if unchecked:
+            sys.exit(1)
         return
 
     if args.quiet:
@@ -5292,7 +5381,11 @@ def main() -> None:
         # subcommand from a successful run of one.
         sys.exit(2)
 
-    HANDLERS[args.command](args, config)
+    try:
+        HANDLERS[args.command](args, config)
+    except GalleryQueryError as e:
+        print(f"{Colors.RED}Error: {e}{Colors.ENDC}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
