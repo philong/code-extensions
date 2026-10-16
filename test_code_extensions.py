@@ -4089,6 +4089,23 @@ class TestCliSurfaceTables(unittest.TestCase):
             ce.main()
         self.assertEqual(mock_get.call_args, call(["vscodium"]))
 
+    def test_search_rejects_a_non_positive_max_results(self) -> None:
+        for value in ("0", "-3", "many"):
+            with (
+                self.subTest(value=value),
+                patch.object(ce.Colors, "_enabled", ce.Colors._enabled),
+                patch.object(ce, "query_marketplace_search") as mock_search,
+                patch.object(
+                    sys, "argv", ["code-extensions", "search", "python", "-n", value]
+                ),
+                contextlib.redirect_stderr(io.StringIO()) as err,
+                self.assertRaises(SystemExit) as cm,
+            ):
+                ce.main()
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("--max-results", err.getvalue())
+            mock_search.assert_not_called()
+
     def test_gallery_failure_exits_non_zero(self) -> None:
         def unreachable(args: argparse.Namespace, config: dict[str, object]) -> None:
             raise ce.GalleryQueryError("Could not query extension gallery.")

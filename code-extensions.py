@@ -4715,6 +4715,17 @@ def _switch(
     return CliOption(flags, help_text, summary, None, kwargs)
 
 
+def positive_int(value: str) -> int:
+    """argparse type for a count that has to be at least 1."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {number}")
+    return number
+
+
 def _valued(
     flags: tuple[str, ...],
     help_text: str,
@@ -4861,7 +4872,7 @@ SUBCOMMAND_OPTIONS = {
             "Maximum search results",
             ("number", ""),
             default=15,
-            type=int,
+            type=positive_int,
         ),
     ),
     "info": (),
