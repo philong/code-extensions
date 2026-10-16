@@ -13,9 +13,11 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -542,7 +544,7 @@ class TestReleaseAgeGating(unittest.TestCase):
             ce.parse_age_threshold("invalid_age")
 
     def test_released_long_enough(self) -> None:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         recent_ts = (now - datetime.timedelta(hours=5)).isoformat()
         old_ts = (now - datetime.timedelta(hours=48)).isoformat()
 
@@ -553,7 +555,7 @@ class TestReleaseAgeGating(unittest.TestCase):
         self.assertTrue(ce.released_long_enough({}, min_age))  # missing timestamp
 
     def test_first_eligible_version(self) -> None:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         v1_ts = (now - datetime.timedelta(hours=5)).isoformat()  # Too recent
         v2_ts = (now - datetime.timedelta(hours=30)).isoformat()  # Pass
         v3_ts = (now - datetime.timedelta(hours=60)).isoformat()  # Pass
@@ -625,7 +627,7 @@ class TestEffectiveExtOptions(unittest.TestCase):
     def test_search_honors_an_explicit_age_over_a_per_extension_rule(
         self, mock_post: MagicMock, mock_details: MagicMock, mock_cleanup: MagicMock
     ) -> None:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         ext_data = make_mock_gallery_extension(
             "ms-python",
             "python",
@@ -668,7 +670,7 @@ class TestEffectiveExtOptions(unittest.TestCase):
     def test_check_updates_honors_an_explicit_prerelease_flag(
         self, mock_query: MagicMock
     ) -> None:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         prerelease_props = [
             {"key": "Microsoft.VisualStudio.Code.Engine", "value": "^1.80.0"},
             {"key": "Microsoft.VisualStudio.Code.PreRelease", "value": "true"},
@@ -1201,7 +1203,7 @@ def make_mock_gallery_extension(
 ) -> dict[str, Any]:
     if last_updated is None:
         last_updated = (
-            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=7)
         ).isoformat()
     if versions_list is None:
         versions_list = [
@@ -1554,6 +1556,205 @@ class TestDownloadVsix(unittest.TestCase):
         self.assertEqual(len(bar), 30)
 
 
+class TestDownloadAndInstallPipeline(unittest.TestCase):
+    """Downloads run one at a time while a worker installs finished packages."""
+
+    @staticmethod
+    def jobs(*names: str) -> list[Any]:
+        return [
+            ce.InstallJob(
+                display_id=f"pub.{n}",
+                version="1.0.0",
+                platform="universal",
+                url=f"https://example.com/{n}.vsix",
+                filepath=f"/nonexistent/{n}.vsix",
+            )
+            for n in names
+        ]
+
+    def run_pipeline(self, jobs: list[Any]) -> list[str]:
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            return ce.download_and_install("code", jobs)
+
+    def test_install_overlaps_the_next_download_but_downloads_do_not_overlap(
+        self,
+    ) -> None:
+        first_install_started = threading.Event()
+        active_downloads = 0
+        max_active_downloads = 0
+        lock = threading.Lock()
+
+        def fake_download(url: str, filepath: str, **_kwargs: Any) -> None:
+            nonlocal active_downloads, max_active_downloads
+            with lock:
+                active_downloads += 1
+                max_active_downloads = max(max_active_downloads, active_downloads)
+            try:
+                # Sequential download-then-install would never get here with
+                # the first install already running.
+                if url.endswith("b.vsix"):
+                    self.assertTrue(first_install_started.wait(5))
+            finally:
+                with lock:
+                    active_downloads -= 1
+
+        def fake_install(cmd: Sequence[str], **_kwargs: Any) -> None:
+            if cmd[-1].endswith("a.vsix"):
+                first_install_started.set()
+
+        with (
+            patch.object(ce, "download_vsix", side_effect=fake_download),
+            patch.object(ce, "run_code_cmd", side_effect=fake_install) as mock_run,
+        ):
+            failures = self.run_pipeline(self.jobs("a", "b", "c"))
+
+        self.assertEqual(failures, [])
+        self.assertEqual(max_active_downloads, 1)
+        # One worker, so installs still happen in download order.
+        self.assertEqual(
+            [c.args[0][-1] for c in mock_run.call_args_list],
+            [f"/nonexistent/{n}.vsix" for n in "abc"],
+        )
+
+    def test_failed_download_skips_its_install_only(self) -> None:
+        def fake_download(url: str, filepath: str, **_kwargs: Any) -> None:
+            if url.endswith("b.vsix"):
+                raise OSError("connection reset")
+
+        with (
+            patch.object(ce, "download_vsix", side_effect=fake_download),
+            patch.object(ce, "run_code_cmd") as mock_run,
+        ):
+            failures = self.run_pipeline(self.jobs("a", "b", "c"))
+
+        self.assertEqual(failures, ["pub.b"])
+        self.assertEqual(mock_run.call_count, 2)
+
+    def test_failed_install_is_reported(self) -> None:
+        def fake_install(cmd: Sequence[str], **_kwargs: Any) -> None:
+            if cmd[-1].endswith("a.vsix"):
+                raise subprocess.CalledProcessError(1, cmd, stderr="bad package")
+
+        with (
+            patch.object(ce, "download_vsix"),
+            patch.object(ce, "run_code_cmd", side_effect=fake_install),
+        ):
+            failures = self.run_pipeline(self.jobs("a", "b"))
+
+        self.assertEqual(failures, ["pub.a"])
+
+    def test_interrupt_finishes_the_running_install_and_drops_queued_ones(
+        self,
+    ) -> None:
+        install_started = threading.Event()
+        release_install = threading.Event()
+
+        def fake_download(url: str, filepath: str, **_kwargs: Any) -> None:
+            if url.endswith("b.vsix"):
+                self.assertTrue(install_started.wait(5))
+            if url.endswith("c.vsix"):
+                # Let the blocked install finish shortly after the interrupt,
+                # by which time b has been dropped from the queue.
+                threading.Timer(0.2, release_install.set).start()
+                raise KeyboardInterrupt
+
+        def fake_install(cmd: Sequence[str], **_kwargs: Any) -> None:
+            install_started.set()
+            release_install.wait(5)
+
+        with (
+            patch.object(ce, "download_vsix", side_effect=fake_download),
+            patch.object(ce, "run_code_cmd", side_effect=fake_install) as mock_run,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.run_pipeline(self.jobs("a", "b", "c"))
+
+        # The caller deletes the download directory next, so nothing may
+        # still be installing from it once the interrupt propagates.
+        mock_run.assert_called_once()
+        self.assertTrue(mock_run.call_args.args[0][-1].endswith("a.vsix"))
+
+    def test_interrupt_while_waiting_on_installs_drops_queued_ones(self) -> None:
+        """Ctrl-C after the last download must still stop the worker."""
+        install_started = threading.Event()
+        release_install = threading.Event()
+        real_join = threading.Thread.join
+        interrupted = False
+
+        def fake_download(url: str, filepath: str, **_kwargs: Any) -> None:
+            if url.endswith("c.vsix"):
+                self.assertTrue(install_started.wait(5))
+
+        def fake_install(cmd: Sequence[str], **_kwargs: Any) -> None:
+            install_started.set()
+            release_install.wait(5)
+
+        def join(thread: threading.Thread, timeout: float | None = None) -> None:
+            nonlocal interrupted
+            if thread.name == "vsix-installer" and not interrupted:
+                interrupted = True
+                threading.Timer(0.2, release_install.set).start()
+                raise KeyboardInterrupt
+            real_join(thread, timeout)
+
+        with (
+            patch.object(ce, "download_vsix", side_effect=fake_download),
+            patch.object(ce, "run_code_cmd", side_effect=fake_install) as mock_run,
+            patch.object(threading.Thread, "join", autospec=True, side_effect=join),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self.run_pipeline(self.jobs("a", "b", "c"))
+
+        self.assertFalse(any(t.name == "vsix-installer" for t in threading.enumerate()))
+        mock_run.assert_called_once()
+
+    def test_jobs_sharing_a_file_are_downloaded_once(self) -> None:
+        jobs = self.jobs("a", "a")
+        with (
+            patch.object(ce, "download_vsix") as mock_download,
+            patch.object(ce, "run_code_cmd") as mock_run,
+        ):
+            failures = self.run_pipeline(jobs)
+
+        self.assertEqual(failures, [])
+        mock_download.assert_called_once()
+        mock_run.assert_called_once()
+
+    def test_download_failure_names_the_extension(self) -> None:
+        err = io.StringIO()
+        with (
+            patch.object(ce, "download_vsix", side_effect=OSError("reset")),
+            patch.object(ce, "run_code_cmd"),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(err),
+        ):
+            ce.download_and_install("code", self.jobs("a"))
+
+        self.assertIn("Download of pub.a failed: reset", err.getvalue())
+
+    def test_unexpected_worker_error_is_raised_on_the_caller(self) -> None:
+        with (
+            patch.object(ce, "download_vsix"),
+            patch.object(ce, "run_code_cmd", side_effect=RuntimeError("boom")),
+            self.assertRaisesRegex(RuntimeError, "boom"),
+        ):
+            self.run_pipeline(self.jobs("a", "b"))
+
+    def test_messages_are_printed_above_the_progress_line(self) -> None:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ce.set_progress_line("  [==] 50%")
+            ce.console_print("installed")
+            ce.set_progress_line(None)
+        # Blank the bar, print the message, then redraw the bar below it.
+        self.assertEqual(
+            buf.getvalue(), "\r  [==] 50%\r          \rinstalled\n  [==] 50%\n"
+        )
+
+
 # =====================================================================
 # CLI Integration Tests: handle_install
 # =====================================================================
@@ -1605,6 +1806,46 @@ class TestHandleInstallIntegration(unittest.TestCase):
         mock_download.assert_called_once()
         mock_run.assert_called_once()
         self.assertIn("--install-extension", mock_run.call_args[0][0])
+
+    @patch.object(ce, "run_code_cmd")
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_installed_extensions", return_value={})
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_handle_install_ignores_a_repeated_extension(
+        self,
+        mock_query: MagicMock,
+        mock_vsver: MagicMock,
+        mock_installed: MagicMock,
+        mock_download: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        mock_query.return_value = {
+            "ms-python.python": make_mock_gallery_extension(
+                "ms-python", "python", "2024.2.0"
+            )
+        }
+        args = argparse.Namespace(
+            code_binary="code",
+            service_url=None,
+            open_vsx=False,
+            open_vsx_token=None,
+            extensions=["ms-python.python", "MS-Python.Python@2024.2.0"],
+            file=None,
+            include_prerelease=False,
+            no_code_version_check=False,
+            yes=True,
+            min_release_age="0",
+            download_dir=None,
+            force=False,
+        )
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.handle_install(args, self.config)
+
+        # Two jobs would race on one .vsix path once installs overlap downloads.
+        mock_download.assert_called_once()
+        mock_run.assert_called_once()
+        self.assertIn("Ignoring 'MS-Python.Python@2024.2.0'", out.getvalue())
 
     @patch.object(ce, "run_code_cmd")
     @patch.object(ce, "download_vsix")
@@ -1826,7 +2067,7 @@ class TestHandleInstallIntegration(unittest.TestCase):
         mock_download: MagicMock,
         mock_run: MagicMock,
     ) -> None:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         ext_data = make_mock_gallery_extension(
             "ms-python",
             "python",
@@ -1934,7 +2175,7 @@ class TestHandleInstallIntegration(unittest.TestCase):
         # A rejected package is a reported failure, not a traceback, and it
         # has to be distinguishable from a successful install.
         self.assertEqual(exit_ctx.exception.code, 1)
-        self.assertIn("Download failed", err.getvalue())
+        self.assertIn("Download of ms-python.python failed", err.getvalue())
         mock_run.assert_not_called()
 
     @patch.object(ce, "run_code_cmd")
@@ -2092,6 +2333,35 @@ class TestHandleUpdateIntegration(unittest.TestCase):
         }
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
+
+    @patch.object(ce, "download_vsix")
+    @patch.object(ce, "get_vscode_version", return_value="1.85.0")
+    @patch.object(
+        ce,
+        "get_installed_extensions",
+        return_value={"ms-python.python": "2024.1.0"},
+    )
+    @patch.object(ce, "check_updates", return_value=[make_mock_update()])
+    @patch.object(ce, "eligible_update_version", side_effect=RuntimeError("unresolved"))
+    def test_handle_update_removes_temp_dir_when_building_jobs_fails(
+        self,
+        mock_eligible: MagicMock,
+        mock_check: MagicMock,
+        mock_installed: MagicMock,
+        mock_vsver: MagicMock,
+        mock_download: MagicMock,
+    ) -> None:
+        temp_dir = tempfile.mkdtemp(prefix="code-extensions-test-")
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        with (
+            patch.object(ce, "resolve_download_target", return_value=(temp_dir, True)),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaises(RuntimeError),
+        ):
+            ce.handle_update(self.update_args(), self.config)
+
+        self.assertFalse(os.path.exists(temp_dir))
+        mock_download.assert_not_called()
 
     @patch.object(ce, "get_vscode_version", return_value="1.85.0")
     @patch.object(ce, "check_updates", return_value=[])

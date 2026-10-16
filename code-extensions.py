@@ -24,12 +24,14 @@ import importlib.util
 import json
 import os
 import platform
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -2635,61 +2637,151 @@ def discard_download_dir(directory: str, is_private_temp: bool) -> None:
         shutil.rmtree(directory, ignore_errors=True)
 
 
-def download_and_install(
-    code_binary: str | Sequence[str],
-    url: str,
-    filepath: str,
-    display_id: str,
-    version: str,
-    platform_name: str,
-    token: str | None = None,
-    service_url: str | None = None,
-    force: bool = False,
-    cleanup: bool = False,
-) -> bool:
-    """Download a .vsix from url and install it with the code CLI.
+class InstallJob(NamedTuple):
+    display_id: str
+    version: str
+    platform: str
+    url: str
+    filepath: str
+    force: bool = False
 
-    Shared by `install` and `update` so the two cannot drift. Returns True
-    when the package was installed. A failed download skips the install
-    (the partial file is already removed by download_vsix); a failed install
-    still removes the file when cleanup is set.
-    """
-    # Accept a raw string as well as a parsed list, like the other code-CLI
-    # helpers, so callers cannot pass "code" and unpack it into characters.
-    parsed_code_binary = parse_code_binary(code_binary)
-    print(
-        f"Downloading {Colors.CYAN}{display_id}{Colors.ENDC} v{Colors.GREEN}{version}{Colors.ENDC} ({platform_name})..."
-    )
-    try:
-        download_vsix(url, filepath, token=token, service_url=service_url)
-    except DOWNLOAD_ERRORS as e:
-        print(f"{Colors.RED}✗ Download failed: {e}{Colors.ENDC}", file=sys.stderr)
-        return False
 
-    print(
-        f"Installing {Colors.CYAN}{display_id}{Colors.ENDC} v{Colors.GREEN}{version}{Colors.ENDC}..."
-    )
+# Downloads run on the main thread while a worker installs finished packages, so
+# both write to the terminal at once. Every line goes through console_print,
+# which lifts the progress line out of the way and redraws it underneath.
+_console_lock = threading.Lock()
+_progress_line: str | None = None
+
+
+def console_print(message: str, file: TextIO | None = None) -> None:
+    with _console_lock:
+        if _progress_line is not None:
+            sys.stdout.write("\r" + " " * display_width(_progress_line) + "\r")
+            sys.stdout.flush()
+        print(message, file=file or sys.stdout, flush=True)
+        if _progress_line is not None:
+            sys.stdout.write(_progress_line)
+            sys.stdout.flush()
+
+
+def set_progress_line(text: str | None) -> None:
+    """Draw text as the live progress line, or end it with a newline (None)."""
+    global _progress_line
+    with _console_lock:
+        if text is None:
+            if _progress_line is not None:
+                sys.stdout.write("\n")
+        else:
+            sys.stdout.write("\r" + text)
+        sys.stdout.flush()
+        _progress_line = text
+
+
+def install_vsix(code_binary: Sequence[str], job: InstallJob, cleanup: bool) -> bool:
+    """Install a downloaded .vsix with the code CLI; True on success."""
+    label = f"{Colors.CYAN}{job.display_id}{Colors.ENDC} v{Colors.GREEN}{job.version}{Colors.ENDC}"
     installed = False
     try:
-        cmd = [*parsed_code_binary, "--install-extension", filepath]
-        if force:
+        cmd = [*code_binary, "--install-extension", job.filepath]
+        if job.force:
             cmd.append("--force")
         run_code_cmd(cmd, retries=0)
-        print(f"  {Colors.GREEN}✓{Colors.ENDC} Installed successfully.")
+        console_print(f"  {Colors.GREEN}✓{Colors.ENDC} Installed {label}.")
         installed = True
     except subprocess.CalledProcessError as e:
-        print(
-            f"  {Colors.RED}✗ Installation failed: {e.stderr.strip() or e}{Colors.ENDC}",
+        console_print(
+            f"  {Colors.RED}✗ Installation of {job.display_id} failed: {e.stderr.strip() or e}{Colors.ENDC}",
             file=sys.stderr,
         )
     # run_code_cmd raises OSError when the binary is missing or unexecutable.
     except OSError as e:
-        print(f"  {Colors.RED}✗ Installation failed: {e}{Colors.ENDC}", file=sys.stderr)
+        console_print(
+            f"  {Colors.RED}✗ Installation of {job.display_id} failed: {e}{Colors.ENDC}",
+            file=sys.stderr,
+        )
 
-    if cleanup and os.path.exists(filepath):
+    if cleanup and os.path.exists(job.filepath):
         with contextlib.suppress(OSError):
-            os.remove(filepath)
+            os.remove(job.filepath)
     return installed
+
+
+def download_and_install(
+    code_binary: str | Sequence[str],
+    jobs: Iterable[InstallJob],
+    token: str | None = None,
+    service_url: str | None = None,
+    cleanup: bool = False,
+) -> list[str]:
+    """Download each job's .vsix and install it with the code CLI.
+
+    Shared by `install` and `update` so the two cannot drift. Downloads run one
+    at a time on this thread - a single gallery host, so parallel requests would
+    only invite throttling - while a worker thread installs each package as soon
+    as it lands. Returns the display ids that failed to download or install. A
+    failed download skips the install (the partial file is already removed by
+    download_vsix); a failed install still removes the file when cleanup is set.
+    """
+    # Accept a raw string as well as a parsed list, like the other code-CLI
+    # helpers, so callers cannot pass "code" and unpack it into characters.
+    parsed_code_binary = parse_code_binary(code_binary)
+    failures: list[str] = []
+    worker_errors: list[BaseException] = []
+    ready: queue.Queue[InstallJob | None] = queue.Queue()
+
+    def installer() -> None:
+        try:
+            while (job := ready.get()) is not None:
+                if not install_vsix(parsed_code_binary, job, cleanup):
+                    failures.append(job.display_id)
+        except BaseException as e:  # noqa: BLE001 - re-raised on the main thread
+            worker_errors.append(e)
+
+    # Daemon, so a second Ctrl-C while waiting on an install still exits.
+    worker = threading.Thread(target=installer, name="vsix-installer", daemon=True)
+    worker.start()
+    queued: set[str] = set()
+    try:
+        for job in jobs:
+            if not worker.is_alive():
+                break
+            # A second job for the same file would truncate it while the worker
+            # installs it, or find it already removed by cleanup.
+            if job.filepath in queued:
+                continue
+            queued.add(job.filepath)
+            console_print(
+                f"Downloading {Colors.CYAN}{job.display_id}{Colors.ENDC} v{Colors.GREEN}{job.version}{Colors.ENDC} ({job.platform})..."
+            )
+            try:
+                download_vsix(
+                    job.url, job.filepath, token=token, service_url=service_url
+                )
+            except DOWNLOAD_ERRORS as e:
+                console_print(
+                    f"{Colors.RED}✗ Download of {job.display_id} failed: {e}{Colors.ENDC}",
+                    file=sys.stderr,
+                )
+                failures.append(job.display_id)
+                continue
+            ready.put(job)
+        ready.put(None)
+        worker.join()
+    except BaseException:
+        # Interrupted, possibly while waiting on the last installs: drop the
+        # queued ones and wait for the worker, since the caller is about to
+        # delete the download directory. The same Ctrl-C reaches the running
+        # `code` child, so that install is cut short and reported as failed.
+        with contextlib.suppress(queue.Empty):
+            while True:
+                ready.get_nowait()
+        ready.put(None)
+        worker.join()
+        raise
+
+    if worker_errors:
+        raise worker_errors[0]
+    return failures
 
 
 def open_for_download(filepath: str) -> int:
@@ -2789,14 +2881,13 @@ def download_vsix(
                     emit(decompressor.flush())
             ok = True
         finally:
+            # Close the progress line either way, so what follows - the next
+            # download or an error - starts on a line of its own.
+            set_progress_line(None)
             if not ok:
                 # Never leave a truncated package behind for `--install-extension`.
                 with contextlib.suppress(OSError):
                     os.remove(filepath)
-
-        if show_progress and (total_size or bytes_read > 0):
-            sys.stdout.write("\n")
-            sys.stdout.flush()
 
 
 def report_download_progress(
@@ -2814,10 +2905,9 @@ def report_download_progress(
         filled_len = min(bar_len, round(bar_len * bytes_read / float(total_size)))
         bar = "=" * filled_len + " " * (bar_len - filled_len)
         total_mb = total_size / (1024 * 1024)
-        sys.stdout.write(f"\r  [{bar}] {percent}% ({read_mb:.2f}MB / {total_mb:.2f}MB)")
+        set_progress_line(f"  [{bar}] {percent}% ({read_mb:.2f}MB / {total_mb:.2f}MB)")
     else:
-        sys.stdout.write(f"\r  Downloaded: {read_mb:.2f}MB")
-    sys.stdout.flush()
+        set_progress_line(f"  Downloaded: {read_mb:.2f}MB")
 
 
 # Final byte of a CSI escape sequence (ESC '[' <byte>) for the arrow keys.
@@ -2986,6 +3076,7 @@ def handle_install(args: argparse.Namespace, config: Mapping[str, object]) -> No
 
     parsed_targets: list[tuple[str, str | None]] = []
     failures: list[str] = []
+    seen_ids: set[str] = set()
     for spec in target_specs:
         spec = spec.strip()
         if "@" in spec:
@@ -3004,6 +3095,14 @@ def handle_install(args: argparse.Namespace, config: Mapping[str, object]) -> No
             )
             failures.append(ext_id_lower)
             continue
+        # One job per extension: two would download to the same file, the
+        # second truncating it while the first is being installed.
+        if ext_id_lower in seen_ids:
+            print(
+                f"{Colors.YELLOW}Ignoring '{spec}': '{ext_id_lower}' is already requested.{Colors.ENDC}"
+            )
+            continue
+        seen_ids.add(ext_id_lower)
         parsed_targets.append((ext_id_lower, req_ver))
 
     if not parsed_targets:
@@ -3021,6 +3120,7 @@ def handle_install(args: argparse.Namespace, config: Mapping[str, object]) -> No
 
     download_dir_resolved, download_dir_is_temp = resolve_download_target(args, config)
 
+    jobs: list[InstallJob] = []
     try:
         for ext_id, req_ver in parsed_targets:
             ext_obj = marketplace_data.get(ext_id)
@@ -3175,25 +3275,30 @@ def handle_install(args: argparse.Namespace, config: Mapping[str, object]) -> No
 
             # Downgrading to an older version needs --force, just like a
             # re-install of the same version does.
-            installed_ok = download_and_install(
-                ctx.code_binary,
-                url,
-                filepath,
-                full_id,
-                target_version,
-                target_plat,
-                token=ctx.token,
-                service_url=ctx.service_url,
-                force=force
-                or bool(
-                    installed_ver
-                    and parse_version(installed_ver) > parse_version(target_version)
-                ),
-                cleanup=download_dir_is_temp,
+            jobs.append(
+                InstallJob(
+                    display_id=full_id,
+                    version=target_version,
+                    platform=target_plat,
+                    url=url,
+                    filepath=filepath,
+                    force=force
+                    or bool(
+                        installed_ver
+                        and parse_version(installed_ver) > parse_version(target_version)
+                    ),
+                )
             )
-            if not installed_ok:
-                failures.append(full_id)
 
+        # Every prompt above is answered before the first download starts, so
+        # the installer thread never prints over a question.
+        failures += download_and_install(
+            ctx.code_binary,
+            jobs,
+            token=ctx.token,
+            service_url=ctx.service_url,
+            cleanup=download_dir_is_temp,
+        )
     finally:
         # An exit or Ctrl-C mid-batch must not leak the private temp directory;
         discard_download_dir(download_dir_resolved, download_dir_is_temp)
@@ -3698,33 +3803,33 @@ def handle_update(args: argparse.Namespace, config: Mapping[str, object]) -> Non
 
     download_dir_resolved, download_dir_is_temp = resolve_download_target(args, config)
 
-    failures = []
     try:
+        jobs: list[InstallJob] = []
         for update in selected_updates:
-            pub_name = update["publisher"]
-            ext_name = update["name"]
             version = eligible_update_version(update)
             platform = update["eligible_platform"]
-            url = resolve_update_url(update, ctx.service_url)
-            filepath = os.path.join(
-                download_dir_resolved,
-                vsix_filename(pub_name, ext_name, version, platform),
+            jobs.append(
+                InstallJob(
+                    display_id=update["id"],
+                    version=version,
+                    platform=platform,
+                    url=resolve_update_url(update, ctx.service_url),
+                    filepath=os.path.join(
+                        download_dir_resolved,
+                        vsix_filename(
+                            update["publisher"], update["name"], version, platform
+                        ),
+                    ),
+                )
             )
 
-            installed_ok = download_and_install(
-                ctx.code_binary,
-                url,
-                filepath,
-                update["id"],
-                version,
-                platform,
-                token=ctx.token,
-                service_url=ctx.service_url,
-                cleanup=download_dir_is_temp,
-            )
-            if not installed_ok:
-                failures.append(update["id"])
-
+        failures = download_and_install(
+            ctx.code_binary,
+            jobs,
+            token=ctx.token,
+            service_url=ctx.service_url,
+            cleanup=download_dir_is_temp,
+        )
     finally:
         # same as install: `clean` is a backstop, not the plan.
         discard_download_dir(download_dir_resolved, download_dir_is_temp)
