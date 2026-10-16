@@ -3473,69 +3473,66 @@ def check_updates(
         latest_ver_obj = compatible_versions[0]
         latest_version = latest_ver_obj["version"]
 
-        if parse_version(latest_version) > parse_version(installed_ver):
-            eligible_ver_obj = first_eligible_version(compatible_versions, eff_min_age)
+        # filter_versions(newer_than=...) kept only versions above the installed
+        # one, so the latest and any eligible version are both newer than it.
+        eligible_ver_obj = first_eligible_version(compatible_versions, eff_min_age)
 
-            last_updated = latest_ver_obj.get("lastUpdated", "")
-            latest_release_date = (
-                last_updated[:10] if len(last_updated) >= 10 else last_updated
+        last_updated = latest_ver_obj.get("lastUpdated", "")
+        latest_release_date = (
+            last_updated[:10] if len(last_updated) >= 10 else last_updated
+        )
+
+        eligible_version: str | None = None
+        eligible_release_date = ""
+        # Empty while held back, so the table falls back to latest_platform.
+        eligible_platform = ""
+
+        if eligible_ver_obj:
+            eligible_version = eligible_ver_obj["version"]
+            el_updated = eligible_ver_obj.get("lastUpdated", "")
+            eligible_release_date = (
+                el_updated[:10] if len(el_updated) >= 10 else el_updated
             )
+            eligible_platform = eligible_ver_obj.get("targetPlatform") or "universal"
 
-            eligible_version: str | None = None
-            eligible_release_date = ""
-            # Empty while held back, so the table falls back to latest_platform.
-            eligible_platform = ""
-
-            if eligible_ver_obj:
-                el_ver = eligible_ver_obj["version"]
-                if parse_version(el_ver) > parse_version(installed_ver):
-                    eligible_version = el_ver
-                    el_updated = eligible_ver_obj.get("lastUpdated", "")
-                    eligible_release_date = (
-                        el_updated[:10] if len(el_updated) >= 10 else el_updated
-                    )
-                    eligible_platform = (
-                        eligible_ver_obj.get("targetPlatform") or "universal"
-                    )
-
-            latest_platform = latest_ver_obj.get("targetPlatform")
-            latest_download_url = get_vsix_download_url(
-                latest_ver_obj,
+        latest_platform = latest_ver_obj.get("targetPlatform")
+        latest_download_url = get_vsix_download_url(
+            latest_ver_obj,
+            ident.publisher,
+            ident.name,
+            latest_version,
+            latest_platform,
+            service_url,
+        )
+        eligible_download_url = (
+            get_vsix_download_url(
+                eligible_ver_obj,
                 ident.publisher,
                 ident.name,
-                latest_version,
-                latest_platform,
+                eligible_version,
+                eligible_platform,
                 service_url,
             )
-            eligible_download_url = (
-                get_vsix_download_url(
-                    eligible_ver_obj,
-                    ident.publisher,
-                    ident.name,
-                    eligible_version,
-                    eligible_platform,
-                    service_url,
-                )
-                if (eligible_ver_obj and eligible_version)
-                else None
-            )
+            if (eligible_ver_obj and eligible_version)
+            else None
+        )
 
-            updates.append(
-                {
-                    "id": full_id,
-                    "publisher": ident.publisher,
-                    "name": ident.name,
-                    "installed": installed_ver,
-                    "latest": latest_version,
-                    "latest_release_date": latest_release_date,
-                    "latest_platform": latest_platform or "universal",
-                    "latest_download_url": latest_download_url,
-                    "eligible": eligible_version,
-                    "eligible_release_date": eligible_release_date,
-                    "eligible_platform": eligible_platform,
-                    "eligible_download_url": eligible_download_url,
-                }
-            )
+        updates.append(
+            {
+                "id": full_id,
+                "publisher": ident.publisher,
+                "name": ident.name,
+                "installed": installed_ver,
+                "latest": latest_version,
+                "latest_release_date": latest_release_date,
+                "latest_platform": latest_platform or "universal",
+                "latest_download_url": latest_download_url,
+                "eligible": eligible_version,
+                "eligible_release_date": eligible_release_date,
+                "eligible_platform": eligible_platform,
+                "eligible_download_url": eligible_download_url,
+            }
+        )
 
     updates.sort(key=lambda u: u["id"])
     return updates
