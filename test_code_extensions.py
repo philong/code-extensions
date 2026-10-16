@@ -1209,6 +1209,24 @@ class TestCLIAndBinaryParsing(unittest.TestCase):
         )
         self.assertEqual((action, selected, cursor, top), ("quit", [], 0, 0))
 
+    @unittest.skipUnless(ce.HAS_TTY, "get_key reads a POSIX terminal")
+    def test_get_key_reports_backspace(self) -> None:
+        import select
+        import termios
+        import tty
+
+        for raw in (b"\x7f", b"\x08"):
+            with (
+                self.subTest(raw=raw),
+                patch.object(sys.stdin, "fileno", return_value=0),
+                patch.object(termios, "tcgetattr", return_value=[]),
+                patch.object(termios, "tcsetattr"),
+                patch.object(tty, "setraw"),
+                patch.object(select, "select", return_value=([0], [], [])),
+                patch.object(os, "read", return_value=raw),
+            ):
+                self.assertEqual(ce.get_key(), "backspace")
+
     def test_run_list_picker_hands_back_the_scroll_offset(self) -> None:
         """The caller resumes with it, so leaving the list must not reset the
         window to wherever the cursor happens to sit."""

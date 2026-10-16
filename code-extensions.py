@@ -3016,6 +3016,9 @@ def get_key() -> str | None:
             return "space"
         elif ch == "\x03":
             return "ctrl+c"
+        # Terminals send DEL for Backspace; some (and Ctrl-H) send BS.
+        elif ch in ("\x7f", "\x08"):
+            return "backspace"
         else:
             return ch
     finally:
