@@ -709,6 +709,31 @@ class TestEffectiveExtOptions(unittest.TestCase):
             check(cli_include_prerelease_override=True)[0]["latest"], "2024.3.0"
         )
 
+    @patch.object(ce, "query_marketplace_extensions")
+    def test_held_back_update_shows_the_latest_platform(
+        self, mock_query: MagicMock
+    ) -> None:
+        ext_data = make_mock_gallery_extension(
+            "ms-python",
+            "python",
+            last_updated=datetime.datetime.now(datetime.UTC).isoformat(),
+            target_platform="linux-x64",
+        )
+        mock_query.return_value = {"ms-python.python": ext_data}
+        updates = ce.check_updates(
+            {"ms-python.python": "2024.1.0"},
+            "linux-x64",
+            vscode_version="1.85.0",
+            min_release_age=datetime.timedelta(days=30),
+        )
+        self.assertIsNone(updates[0]["eligible"])
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ce.print_updates_table(updates)
+        row = out.getvalue().splitlines()[-1]
+        self.assertIn("linux-x64", row)
+        self.assertNotIn("universal", row)
+
 
 # =====================================================================
 # Malformed Gallery Payload Tests

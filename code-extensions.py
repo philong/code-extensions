@@ -3453,7 +3453,8 @@ def check_updates(
 
             eligible_version: str | None = None
             eligible_release_date = ""
-            eligible_platform = "universal"
+            # Empty while held back, so the table falls back to latest_platform.
+            eligible_platform = ""
 
             if eligible_ver_obj:
                 el_ver = eligible_ver_obj["version"]
