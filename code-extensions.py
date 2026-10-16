@@ -151,8 +151,20 @@ def url_host(url: str) -> str:
         return ""
 
 
+def url_origin(url: str) -> tuple[str, str, int] | None:
+    """Return a URL's (scheme, host, port), with the scheme's default port filled
+    in, or None when it cannot be parsed."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme.lower()
+        port = parts.port or {"http": 80, "https": 443}.get(scheme, 0)
+    except ValueError:
+        return None
+    return scheme, (parts.hostname or "").lower(), port
+
+
 class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Strip Authorization headers whenever a redirect leaves the original host.
+    """Strip Authorization headers whenever a redirect leaves the original origin.
 
     urllib copies every header except Content-* onto the redirected request, so
     without this the access token would be handed to whatever CDN host the
@@ -171,7 +183,10 @@ class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
         new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new_req is None:
             return None
-        if url_host(req.full_url) != url_host(new_req.full_url):
+        # The scheme and port count too: a same-host redirect from https to
+        # http would otherwise send the token in clear text.
+        origin = url_origin(req.full_url)
+        if origin is None or origin != url_origin(new_req.full_url):
             # Request.add_header() capitalizes header names.
             new_req.headers.pop("Authorization", None)
             new_req.unredirected_hdrs.pop("Authorization", None)

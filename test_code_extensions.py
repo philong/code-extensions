@@ -1050,6 +1050,29 @@ class TestSecurityAndHostValidation(unittest.TestCase):
 
         self.assertEqual(result.headers.get("Authorization"), "Bearer secret_token")
 
+    def test_auth_stripping_redirect_handler_scheme_or_port_change(self) -> None:
+        handler = ce._AuthStrippingRedirectHandler()
+        cases = {
+            "http://marketplace.visualstudio.com/final_download": False,
+            "https://marketplace.visualstudio.com:8443/final_download": False,
+            "https://marketplace.visualstudio.com:443/final_download": True,
+        }
+        for new_url, keeps_token in cases.items():
+            with self.subTest(new_url=new_url):
+                orig_req = urllib.request.Request(
+                    "https://marketplace.visualstudio.com/download",
+                    headers={"Authorization": "Bearer secret_token"},
+                )
+                result = handler.redirect_request(
+                    orig_req,
+                    None,
+                    302,
+                    "Found",
+                    email.message_from_string(""),
+                    new_url,
+                )
+                self.assertEqual("Authorization" in result.headers, keeps_token)
+
     def test_safe_filename_part(self) -> None:
         self.assertEqual(ce.safe_filename_part("ms-python.python"), "ms-python.python")
         self.assertEqual(ce.safe_filename_part("../../../etc/passwd"), "etc_passwd")
