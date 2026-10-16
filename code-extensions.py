@@ -3250,11 +3250,13 @@ def handle_install(args: argparse.Namespace, config: Mapping[str, object]) -> No
             if not compatible_versions:
                 if req_ver:
                     print(
-                        f"{Colors.RED}✗ Version '{req_ver}' for '{full_id}' not found or incompatible with host platform/VS Code.{Colors.ENDC}"
+                        f"{Colors.RED}✗ Version '{req_ver}' for '{full_id}' not found or incompatible with host platform/VS Code.{Colors.ENDC}",
+                        file=sys.stderr,
                     )
                 else:
                     print(
-                        f"{Colors.RED}✗ No compatible version of '{full_id}' found.{Colors.ENDC}"
+                        f"{Colors.RED}✗ No compatible version of '{full_id}' found.{Colors.ENDC}",
+                        file=sys.stderr,
                     )
                 failures.append(full_id)
                 continue
@@ -3274,7 +3276,10 @@ def handle_install(args: argparse.Namespace, config: Mapping[str, object]) -> No
                         if not sys.stdin.isatty():
                             # Nobody to ask, so the age gate stands: that is a
                             # failure for whoever scripted the install.
-                            print(f"Skipping installation of '{full_id}@{req_ver}'.")
+                            print(
+                                f"Skipping installation of '{full_id}@{req_ver}'.",
+                                file=sys.stderr,
+                            )
                             failures.append(full_id)
                             continue
                         if not prompt_yes_no(
@@ -3309,7 +3314,8 @@ def handle_install(args: argparse.Namespace, config: Mapping[str, object]) -> No
                             continue
                     else:
                         print(
-                            f"{Colors.RED}Skipping '{full_id}' (held back by release age requirement). Use --min-release-age 0 to override.{Colors.ENDC}"
+                            f"{Colors.RED}Skipping '{full_id}' (held back by release age requirement). Use --min-release-age 0 to override.{Colors.ENDC}",
+                            file=sys.stderr,
                         )
                         failures.append(full_id)
                         continue
