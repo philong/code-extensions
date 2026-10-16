@@ -26,7 +26,7 @@ import zipfile
 import zlib
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar, Literal, Self
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, call, mock_open, patch
 
 # Dynamically import code-extensions.py module (since filename contains a hyphen)
 CODE_EXTENSIONS_PATH = os.path.join(os.path.dirname(__file__), "code-extensions.py")
@@ -4144,6 +4144,89 @@ class TestHandleCompletionIntegration(unittest.TestCase):
                 self.assertIn("code-extensions", output)
                 self.assertIn("install", output)
                 self.assertIn("update", output)
+
+    def test_handle_completion_without_shell_uses_detected_one(self) -> None:
+        args = argparse.Namespace(shell=None)
+        with (
+            patch.object(ce, "detect_shell", return_value="fish"),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            ce.handle_completion(args, {})
+        self.assertEqual(out.getvalue(), ce.FISH_COMPLETION_SCRIPT.strip() + "\n")
+
+    def test_handle_completion_fails_when_shell_undetectable(self) -> None:
+        args = argparse.Namespace(shell=None)
+        with (
+            patch.object(ce, "detect_shell", return_value=None),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+            contextlib.redirect_stderr(io.StringIO()) as err,
+            self.assertRaises(SystemExit) as cm,
+        ):
+            ce.handle_completion(args, {})
+        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("Could not detect the current shell", err.getvalue())
+
+
+class TestDetectShell(unittest.TestCase):
+    def _detect(
+        self, tree: Mapping[int, tuple[int, str]], shell_env: str | None = None
+    ) -> str | None:
+        env = {} if shell_env is None else {"SHELL": shell_env}
+        with (
+            patch.object(ce.os, "getppid", return_value=100),
+            patch.object(ce, "_process_parent_and_name", side_effect=tree.get),
+            patch.dict(os.environ, env, clear=True),
+        ):
+            shell: str | None = ce.detect_shell()
+        return shell
+
+    def test_returns_parent_shell(self) -> None:
+        self.assertEqual(self._detect({100: (1, "zsh")}, "/bin/bash"), "zsh")
+
+    def test_skips_non_shell_ancestors(self) -> None:
+        tree = {100: (50, "uv"), 50: (10, "-fish"), 10: (1, "bash")}
+        self.assertEqual(self._detect(tree), "fish")
+
+    def test_recognises_both_powershell_executables(self) -> None:
+        for name in ("pwsh", "powershell.exe", "/usr/local/bin/pwsh"):
+            with self.subTest(name=name):
+                self.assertEqual(self._detect({100: (1, name)}), "powershell")
+
+    def test_falls_back_to_shell_env_when_tree_unreadable(self) -> None:
+        self.assertEqual(self._detect({}, "/usr/bin/zsh"), "zsh")
+
+    def test_falls_back_to_shell_env_when_no_shell_ancestor(self) -> None:
+        self.assertEqual(self._detect({100: (1, "sshd")}, "/bin/bash"), "bash")
+
+    def test_returns_none_when_nothing_matches(self) -> None:
+        self.assertIsNone(self._detect({100: (1, "sshd")}, "/bin/tcsh"))
+        self.assertIsNone(self._detect({}))
+
+    def test_stops_after_max_depth(self) -> None:
+        # A cycle must not loop forever.
+        self.assertIsNone(self._detect({100: (100, "python3")}))
+
+    def test_parses_proc_stat_with_parentheses_in_name(self) -> None:
+        stat = "4242 (odd) name) S 77 4242 4242 0 -1 4194560\n"
+        with patch("builtins.open", mock_open(read_data=stat)):
+            self.assertEqual(ce._process_parent_and_name(4242), (77, "odd) name"))
+
+    def test_falls_back_to_ps_without_proc(self) -> None:
+        ps = subprocess.CompletedProcess([], 0, stdout="  77 /bin/zsh\n", stderr="")
+        with (
+            patch("builtins.open", side_effect=FileNotFoundError),
+            patch.object(ce.subprocess, "run", return_value=ps) as run,
+        ):
+            self.assertEqual(ce._process_parent_and_name(4242), (77, "/bin/zsh"))
+        self.assertEqual(run.call_args.args[0][-1], "4242")
+
+    @unittest.skipIf(sys.platform == "win32", "needs /proc or ps")
+    def test_reads_own_process(self) -> None:
+        info = ce._process_parent_and_name(os.getpid())
+        assert info is not None
+        self.assertEqual(info[0], os.getppid())
+        self.assertTrue(info[1])
 
 
 # =====================================================================

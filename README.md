@@ -174,10 +174,11 @@ code-extensions config unset charliermarsh.ruff.min_release_age
 ### 8. `completion` Command
 
 ```bash
-code-extensions completion <shell>
+code-extensions completion [shell]
 ```
 
 * Generates tab completion scripts for **bash**, **fish**, **powershell**, or **zsh**.
+* Without `shell`, uses the shell it is run from (falling back to `$SHELL`). On Windows, pass the shell explicitly.
 
 **Usage**:
 ```bash

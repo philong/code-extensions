@@ -5402,8 +5402,91 @@ SHELL_COMPLETION_SCRIPTS = {
 }
 
 
+# Executable names of the supported shells. Windows PowerShell and PowerShell 7
+# run as different executables.
+_SHELL_PROCESS_NAMES = {
+    "bash": "bash",
+    "fish": "fish",
+    "zsh": "zsh",
+    "powershell": "powershell",
+    "pwsh": "powershell",
+}
+
+# How many ancestors to inspect before giving up, enough to see past a wrapper
+# such as `uv run` without wandering up to the session manager.
+_SHELL_DETECT_MAX_DEPTH = 8
+
+
+def _shell_from_process_name(name: str) -> str | None:
+    """The supported shell a process or $SHELL name refers to, if any."""
+    # A login shell is reported as "-bash", ps on macOS gives full paths and
+    # Windows names end in ".exe".
+    base = os.path.basename(name.strip()).lstrip("-").lower()
+    base = base.removesuffix(".exe")
+    return _SHELL_PROCESS_NAMES.get(base)
+
+
+def _process_parent_and_name(pid: int) -> tuple[int, str] | None:
+    """The parent pid and executable name of a process, or None if unknown."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            stat = f.read()
+    except OSError:
+        pass
+    else:
+        # "pid (comm) state ppid ...": comm may itself contain spaces and
+        # parentheses, so split on the last closing one.
+        head, _, rest = stat.rpartition(")")
+        fields = rest.split()
+        if "(" not in head or len(fields) < 2 or not fields[1].isdigit():
+            return None
+        return int(fields[1]), head.partition("(")[2]
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    ppid, _, name = result.stdout.strip().partition(" ")
+    if result.returncode != 0 or not ppid.isdigit():
+        return None
+    return int(ppid), name.strip()
+
+
+def detect_shell() -> str | None:
+    """The supported shell this command was run from, or None if unknown.
+
+    Looks for the nearest shell among the parent processes, since $SHELL names
+    the login shell rather than the one in use, and falls back to $SHELL when
+    the process tree cannot be read.
+    """
+    pid = os.getppid()
+    for _ in range(_SHELL_DETECT_MAX_DEPTH):
+        if pid <= 1:
+            break
+        info = _process_parent_and_name(pid)
+        if info is None:
+            break
+        pid, name = info
+        shell = _shell_from_process_name(name)
+        if shell is not None:
+            return shell
+    return _shell_from_process_name(os.environ.get("SHELL", ""))
+
+
 def handle_completion(args: argparse.Namespace, _config: Mapping[str, object]) -> None:
-    shell = args.shell.lower().strip()
+    requested = args.shell if args.shell is not None else detect_shell()
+    if requested is None:
+        print(
+            f"{Colors.RED}Error: Could not detect the current shell. "
+            f"Pass one of: {', '.join(COMPLETION_SHELLS)}{Colors.ENDC}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    shell = requested.lower().strip()
     script = SHELL_COMPLETION_SCRIPTS.get(shell)
     if script is None:
         print(
@@ -5572,8 +5655,10 @@ def main() -> None:
     )
     parser_completion.add_argument(
         "shell",
+        nargs="?",
+        default=None,
         choices=COMPLETION_SHELLS,
-        help="Target shell environment",
+        help="Target shell environment (default: the current shell)",
     )
 
     # Exclude aliases from the usage and positional argument list in help output.
